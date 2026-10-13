@@ -10,6 +10,7 @@ below it. game_loop.py imports from here; this file never imports from game_loop
 """
 
 import ast
+import copy
 import ctypes
 import json
 import math
@@ -17,6 +18,8 @@ import os
 import random
 import re
 import subprocess
+import time
+import traceback
 import uuid
 
 import pygame
@@ -29,6 +32,7 @@ import pygame
 # paths (they resolve against the process's working dir, not the script).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 NODES_FILE = os.path.join(SCRIPT_DIR, "Nodes.json")
+ERRORS_FILE = os.path.join(SCRIPT_DIR, "errors.log")   # the app has no console: errors go here
 
 # Scene
 BG_COLOR = (25, 25, 30)
@@ -68,17 +72,93 @@ def new_id():
     return "n_" + uuid.uuid4().hex[:8]
 
 
+_reported = set()
+
+
+def report_error(where, exc=None):
+    """Append an error's traceback to errors.log — once per distinct
+    (where, error) — since the app runs without a console."""
+    key = (where, repr(exc))
+    if key in _reported:
+        return
+    _reported.add(key)
+    try:
+        with open(ERRORS_FILE, "a", encoding="utf-8") as f:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            trace = ("".join(traceback.format_exception(exc)) if exc is not None
+                     else traceback.format_exc())
+            f.write(f"--- {stamp}  {where}\n{trace}\n")
+    except OSError:
+        pass
+
+
 # ============================================================================
 # FONTS — cached pygame fonts so per-frame re-rendering doesn't rebuild them
 # ============================================================================
 _font_cache = {}
 
 
-def get_font(size):
+FONT_CACHE_MAX = 300        # zooming makes a font per size; past this, the least recently used go
+FONT_EXACT_MAX = 30         # sizes up to this are exact; above, they're snapped to ~5% steps
+TEXT_CACHE_MAX = 128        # remembered renders per font
+TEXT_CACHE_MAX_PIXELS = 600_000   # don't keep huge renders (deep zoom) — just redraw those
+
+
+class CachedFont(pygame.font.Font):
+    """A Font that remembers what it rendered and measured. Most text on the
+    canvas is the same frame after frame (labels, readouts, the inspector), so
+    this turns per-frame text rendering into a dictionary lookup. Every font
+    from get_font is one of these; callers must not draw onto what render()
+    returns (blitting it elsewhere is fine)."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self._renders = {}
+        self._sizes = {}
+
+    def render(self, text, antialias, color, bgcolor=None):
+        key = (text, antialias, tuple(color), None if bgcolor is None else tuple(bgcolor))
+        surf = self._renders.get(key)
+        if surf is None:
+            surf = super().render(text, antialias, color, bgcolor)
+            if surf.get_width() * surf.get_height() <= TEXT_CACHE_MAX_PIXELS:
+                if len(self._renders) >= TEXT_CACHE_MAX:
+                    self._renders.clear()
+                self._renders[key] = surf
+        return surf
+
+    def size(self, text):
+        found = self._sizes.get(text)
+        if found is None:
+            if len(self._sizes) >= TEXT_CACHE_MAX * 4:
+                self._sizes.clear()
+            found = self._sizes[text] = super().size(text)
+        return found
+
+
+def _make_cached_font(path, size, bold, italic):
+    font = CachedFont(path, size)
+    font.set_bold(bool(bold))
+    font.set_italic(bool(italic))
+    return font
+
+
+def get_font(size, name=None, bold=False):
+    """A cached font: pygame's default, or a system font by name ("georgia",
+    "bahnschrift", …). A name that isn't installed falls back to the default.
+    Fonts remember their renders (see CachedFont)."""
     size = max(1, int(size))
-    if size not in _font_cache:
-        _font_cache[size] = pygame.font.SysFont(None, size)
-    return _font_cache[size]
+    if size > FONT_EXACT_MAX:               # big text (zoomed in): snap to ~5% steps, so a
+        step = 1.05                         # zoom reuses fonts + renders instead of making new ones
+        size = round(FONT_EXACT_MAX * step ** round(math.log(size / FONT_EXACT_MAX, step)))
+    key = (size, name, bold)
+    font = _font_cache.pop(key, None)       # re-inserted below: the dict stays in use order
+    if font is None:
+        if len(_font_cache) >= FONT_CACHE_MAX:
+            del _font_cache[next(iter(_font_cache))]     # drop the least recently used
+        font = pygame.font.SysFont(name, key[0], bold=bold, constructor=_make_cached_font)
+    _font_cache[key] = font
+    return font
 
 
 def read_clipboard():
@@ -240,14 +320,16 @@ class Prop:
     as a clickable row: a text box for numbers / text / colors, a toggle for a
     bool, a cycle for a choice. After an edit, obj.on_prop_changed(key) runs.
 
-    kind: "float", "int", "str", "bool", "color" (r, g, b), or "choice"
-    (needs choices=[...]). min/max clamp numbers. editable=False shows it
-    read-only. unit is appended when displayed ("700 units/sec")."""
+    kind: "float", "int", "str", "bool", "color" (r, g, b), "choice"
+    (needs choices=[...]), or "data" (any JSON — a dict/list; use with
+    hidden=True, it can't be typed in). min/max clamp numbers. editable=False shows it
+    read-only; hidden=True saves it without showing it at all (e.g. a link's
+    target id). unit is appended when displayed ("700 units/sec")."""
 
-    KINDS = ("float", "int", "str", "bool", "color", "choice")
+    KINDS = ("float", "int", "str", "bool", "color", "choice", "data")
 
     def __init__(self, key, label=None, kind="float", default=0.0, *, min=None,
-                 max=None, choices=None, editable=True, unit="", prompt=None):
+                 max=None, choices=None, editable=True, unit="", prompt=None, hidden=False):
         if kind not in self.KINDS:
             raise ValueError(f"Prop {key!r}: unknown kind {kind!r}")
         if kind == "choice" and not choices:
@@ -261,6 +343,7 @@ class Prop:
         self.editable = editable
         self.unit = unit
         self.prompt = prompt or f"{self.label}:"
+        self.hidden = hidden            # saved, but not shown in the inspector
 
     def parse(self, text):
         """Text typed into the edit box -> a value. Raises ValueError."""
@@ -275,6 +358,8 @@ class Prop:
             if text.lower() in ("0", "false", "no", "off"):
                 return False
             raise ValueError("expected on/off")
+        if self.kind == "data":
+            raise ValueError("data props aren't typed in")
         if self.kind == "choice":
             if text not in self.choices:
                 raise ValueError("not one of the choices")
@@ -430,6 +515,7 @@ class CanvasObject:
     selectable = False
     movable = False    # can arrow keys move it? (see move())
     copyable = False   # can Edit ▸ Copy / the C key duplicate it?
+    SINGLETON = False  # only one allowed on the canvas (its create() should find the existing one)
     scene = None       # back-ref set by Scene, so connectors can resolve nodes
     is_selected = False
 
@@ -443,7 +529,7 @@ class CanvasObject:
     def __init__(self, id=None):
         self.id = id or new_id()
         for p in self.props():
-            setattr(self, p.key, p.default)
+            setattr(self, p.key, copy.deepcopy(p.default))   # own copy: never share a dict/list default
 
     @classmethod
     def props(cls):
@@ -511,6 +597,10 @@ class CanvasObject:
         """Runs after a Prop is edited in the inspector."""
         pass
 
+    def on_removed(self):
+        """Runs after this object is deleted from the scene."""
+        pass
+
     def update(self, mouse_pos, mouse_pressed, camera, dt):
         pass
 
@@ -535,6 +625,22 @@ class CanvasObject:
     def draw(self, surface, camera):
         raise NotImplementedError
 
+    def screen_bounds(self, camera):
+        """Roughly where this object is on screen (a Rect), so Scene.draw can
+        skip it when it's off-screen. None = always draw it. Glows, halos and
+        selection rings may spill past it — Scene.draw allows a wide margin."""
+        return None
+
+    def draw_links(self, surface, camera):
+        """Draw this object's connections (wires) — called for every object
+        before any object is drawn, so wires sit underneath."""
+        pass
+
+    def outputs(self):
+        """Live values other objects can read from this one (e.g. a Readout
+        linked to it): {name: number}. Default: none."""
+        return {}
+
     # --- Inspector -------------------------------------------------------------
     def inspector(self, app):
         """Rows for the inspector panel, top to bottom. Default: the name (if
@@ -548,7 +654,7 @@ class CanvasObject:
         """One clickable Row per Prop — for use in a custom inspector()."""
         return [Row(p.label, p.format(getattr(self, p.key)),
                     on_click=(lambda app, p=p: p.edit(self, app)) if p.editable else None)
-                for p in self.props()]
+                for p in self.props() if not p.hidden]
 
     def buttons(self, app):
         """Buttons at the bottom of the inspector, top to bottom. Default: every
@@ -693,6 +799,9 @@ class Node(CanvasObject):
 
     def screen_rect(self, camera):
         raise NotImplementedError
+
+    def screen_bounds(self, camera):
+        return self.screen_rect(camera)
 
     def update(self, mouse_pos, mouse_pressed, camera, dt):
         rect = self.screen_rect(camera)
@@ -981,6 +1090,15 @@ class Train(CanvasObject):
                                      round(abs(x2 - x1) + 2 * half), round(abs(y2 - y1) + 2 * half)))
         return rects
 
+    def screen_bounds(self, camera):
+        pts = [camera.world_to_screen(p) for p in self.world_points()]
+        if not pts:
+            return None
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        arrow = TRAIN_ARROW_WORLD * camera.zoom          # arrows stick out past the ends
+        return pygame.Rect(min(xs) - arrow, min(ys) - arrow,
+                           max(xs) - min(xs) + 2 * arrow, max(ys) - min(ys) + 2 * arrow)
+
     def hit(self, pos, camera):
         if any(rect.collidepoint(pos) for rect, _d, _t in self._arrows(camera)):
             return True
@@ -1136,6 +1254,11 @@ class Wall(CanvasObject):
         rect.bottomleft = tuple(round(v) for v in camera.world_to_screen((self.x, self.y)))
         return rect
 
+    def screen_bounds(self, camera):
+        rect = self.screen_rect(camera)
+        title = self._title_rect(camera)
+        return rect.union(title) if title is not None else rect
+
     def hit(self, pos, camera):
         r = self.screen_rect(camera)
         band = max(3, round(WALL_WORLD_BORDER * camera.zoom)) + 4
@@ -1211,7 +1334,7 @@ class Thing(Node):
         rect = self.screen_rect(camera)
         if self.is_selected:
             pygame.draw.rect(surface, SELECTION_COLOR, rect.inflate(12, 12),
-                             width=3, border_radius=max(2, rect.width // 8) + 4)
+                             width=3, border_radius=max(2, min(rect.size) // 8) + 4)
         if max(rect.size) <= THING_DOT_PX:
             pygame.draw.rect(surface, self.DOT_COLOR, rect)
             return
@@ -1430,6 +1553,10 @@ class Neuron(Agent):
         (while it's drawn yellow). Gates this neuron's W's into others' input."""
         return self._fire_frames > 0
 
+    def outputs(self):
+        return {"firing": 1.0 if self.is_firing else 0.0, "clock t": self.t,
+                "input W": self.input_w()}
+
     def input_w(self):
         """Sum over every other neuron of (its W to this one) × (is it firing
         right now). Only neurons mid-spike contribute, so it's 0 between spikes."""
@@ -1625,31 +1752,75 @@ NEURON_LINK_COLOR = (48, 48, 56)    # barely lighter than BG_COLOR — meant to 
 class NeuronMesh:
     """Every neuron is linked to every other. The links aren't stored anywhere —
     they follow entirely from neuron positions: one thin line per pair (i < j,
-    so no pair is drawn twice). That's n(n-1)/2 lines, so the result is cached
-    on a layer and only redrawn when a neuron's on-screen spot (pan, zoom,
-    move, add/delete) or the window size changes. Drawn before the objects so
-    the lines sit underneath the neurons."""
+    so no pair is drawn twice). That's n(n-1)/2 lines, so they're drawn onto a
+    cached layer covering the network (cut to the window plus a margin), and
+    panning just moves it. It's redrawn when the zoom changes, a neuron moves /
+    comes / goes, or a pan runs past the margin. The layer's memory is reused
+    between redraws. Drawn before the objects, so lines sit under the neurons."""
+
+    MARGIN = 0.5                # extra layer around the window, in window sizes (cheap panning)
 
     def __init__(self):
         self._key = None
-        self._layer = None
+        self._buffer = None      # reused pixel memory; the layer is its top-left w x h
+        self._size = (0, 0)
+        self._world_tl = (0.0, 0.0)   # world point at the layer's top-left
+        self._world_box = None        # the network's world bounds (minx, miny, maxx, maxy)
 
     def draw(self, surface, camera, neurons):
         if len(neurons) < 2:
             return
-        points = [(round(p[0]), round(p[1]))
-                  for p in (camera.world_to_screen(n.world_center) for n in neurons)]
-        key = (surface.get_size(), tuple(points))
-        if key != self._key:
-            if self._layer is None or self._layer.get_size() != surface.get_size():
-                self._layer = pygame.Surface(surface.get_size())
-                self._layer.set_colorkey((0, 0, 0))     # black = see-through
-            self._layer.fill((0, 0, 0))
-            for i, a in enumerate(points):
-                for b in points[i + 1:]:
-                    pygame.draw.line(self._layer, NEURON_LINK_COLOR, a, b)
-            self._key = key
-        surface.blit(self._layer, (0, 0))
+        key = (camera.zoom, surface.get_size(),
+               tuple((n.world_center.x, n.world_center.y) for n in neurons))
+        if key != self._key or not self._covers_visible(surface, camera):
+            self._rebuild(surface, camera, neurons, key)
+        tl = camera.world_to_screen(self._world_tl)
+        w, h = self._size
+        if w > 0 and h > 0:
+            surface.blit(self._buffer, (round(tl[0]), round(tl[1])), pygame.Rect(0, 0, w, h))
+
+    def _covers_visible(self, surface, camera):
+        """Does the layer still hold every part of the network that's on screen?
+        (Panning past its margin means a redraw.)"""
+        x0, y0 = camera.world_to_screen(self._world_box[:2])
+        x1, y1 = camera.world_to_screen(self._world_box[2:])
+        needed = pygame.Rect(math.floor(x0), math.floor(y0), math.ceil(x1 - x0) + 1,
+                             math.ceil(y1 - y0) + 1).clip(surface.get_rect())
+        tl = camera.world_to_screen(self._world_tl)
+        layer = pygame.Rect(round(tl[0]), round(tl[1]), *self._size)
+        return needed.width == 0 or needed.height == 0 or layer.contains(needed)
+
+    def _rebuild(self, surface, camera, neurons, key):
+        sw, sh = surface.get_size()
+        points = [camera.world_to_screen(n.world_center) for n in neurons]
+        xs, ys = [p[0] for p in points], [p[1] for p in points]
+        # The network's box, cut to the window plus a margin on every side.
+        mx, my = sw * self.MARGIN, sh * self.MARGIN
+        left = math.floor(max(min(xs), -mx)) - 1
+        top = math.floor(max(min(ys), -my)) - 1
+        right = math.ceil(min(max(xs), sw + mx)) + 2
+        bottom = math.ceil(min(max(ys), sh + my)) + 2
+        w, h = max(0, right - left), max(0, bottom - top)
+        if self._buffer is None or self._buffer.get_width() < w or self._buffer.get_height() < h:
+            bw = max(w, self._buffer.get_width() if self._buffer else 0)
+            bh = max(h, self._buffer.get_height() if self._buffer else 0)
+            self._buffer = pygame.Surface((bw, bh))
+            self._buffer.set_colorkey((0, 0, 0))            # black = see-through
+        area = pygame.Rect(0, 0, w, h)
+        self._buffer.fill((0, 0, 0), area)
+        prev_clip = self._buffer.get_clip()
+        self._buffer.set_clip(area)
+        local = [(p[0] - left, p[1] - top) for p in points]
+        for i, a in enumerate(local):
+            for b in local[i + 1:]:
+                pygame.draw.line(self._buffer, NEURON_LINK_COLOR, a, b)
+        self._buffer.set_clip(prev_clip)
+        self._size = (w, h)
+        self._world_tl = camera.screen_to_world((left, top))
+        wx = [n.world_center.x for n in neurons]
+        wy = [n.world_center.y for n in neurons]
+        self._world_box = (min(wx), min(wy), max(wx), max(wy))
+        self._key = key
 
 
 # (The type registry, OBJECT_TYPES, fills itself: CanvasObject.__init_subclass__
@@ -1879,19 +2050,60 @@ class Scene:
             if obj in self.objects:
                 self.objects.remove(obj)
                 self.by_id.pop(obj.id, None)
+                obj.on_removed()
                 removed = True
         if removed:
             self.sync_weights()
             self.save()
 
+    # Each object's update/draw is guarded: one object's bug (say, at an odd
+    # zoom) is logged to errors.log and marked on screen instead of crashing
+    # the whole app.
     def update(self, mouse_pos, mouse_pressed, camera, dt):
         for o in self.objects:
-            o.update(mouse_pos, mouse_pressed, camera, dt)
+            try:
+                o.update(mouse_pos, mouse_pressed, camera, dt)
+            except Exception as e:
+                report_error(f"{o.TYPE}.update", e)
 
     def draw(self, surface, camera):
         self.mesh.draw(surface, camera, self.neurons)
+        for o in self.objects:
+            try:
+                o.draw_links(surface, camera)
+            except Exception as e:
+                report_error(f"{o.TYPE}.draw_links", e)
+        view = surface.get_rect()
         for o in sorted(self.objects, key=lambda o: o.draw_layer):
-            o.draw(surface, camera)
+            try:
+                if not self._on_screen(o, camera, view):
+                    continue                    # off-screen: skip the (costly) drawing
+                o.draw(surface, camera)
+            except Exception as e:
+                report_error(f"{o.TYPE}.draw", e)
+                self._draw_broken(surface, camera, o)
+
+    @staticmethod
+    def _on_screen(obj, camera, view):
+        """Is obj (plus a margin of its own size + 40px, for glows / halos /
+        selection rings) touching the window? Objects without bounds always draw."""
+        bounds = obj.screen_bounds(camera)
+        if bounds is None:
+            return True
+        return bounds.inflate(bounds.width + 40, bounds.height + 40).colliderect(view)
+
+    @staticmethod
+    def _draw_broken(surface, camera, obj):
+        """A red box with an X where an object failed to draw (see errors.log)."""
+        try:
+            rect = obj.screen_rect(camera).inflate(4, 4)
+        except Exception:
+            return
+        if rect.width > 4000 or rect.height > 4000:
+            return
+        pygame.draw.rect(surface, (220, 60, 60), rect, width=2)
+        pygame.draw.line(surface, (220, 60, 60), rect.topleft, rect.bottomright, 2)
+        pygame.draw.line(surface, (220, 60, 60), rect.topright, rect.bottomleft, 2)
 
 
 # ---- Copying ----------------------------------------------------------------
@@ -2414,7 +2626,7 @@ class PlaceMode:
         self.follow(world)
         obj = self.obj
         scene.add(obj)
-        if keep_going:
+        if keep_going and not obj.SINGLETON:
             self.obj = self.factory(*world)
         else:
             self.cancel()
@@ -2432,6 +2644,54 @@ class PlaceMode:
         surface.blit(self._layer, (0, 0))
         draw_hint(surface, f"Place {self.obj.type_name().lower()} — click to drop     "
                            "Shift+click: keep placing     Esc: cancel")
+
+
+class PickMode:
+    """Waiting for a click on an object — e.g. choosing what a readout reads.
+    accept(obj) says which objects count; a valid click calls on_pick(obj),
+    anything else (or Esc) cancels. Draws a hint, a rubber-band line from
+    `origin` to the cursor, and a ring around a pickable object under it."""
+
+    def __init__(self):
+        self.prompt = ""
+        self.on_pick = None
+        self.accept = None
+        self.origin = None       # world point the rubber band starts from, or None
+
+    @property
+    def active(self):
+        return self.on_pick is not None
+
+    def begin(self, prompt, on_pick, accept, origin=None):
+        self.prompt, self.on_pick, self.accept, self.origin = prompt, on_pick, accept, origin
+
+    def cancel(self):
+        self.__init__()
+
+    def target(self, scene, pos, camera):
+        obj = scene.hit_test(pos, camera)
+        return obj if obj is not None and self.accept(obj) else None
+
+    def click(self, scene, pos, camera):
+        """Pick what's under pos (if allowed), then end the mode either way."""
+        obj = self.target(scene, pos, camera)
+        on_pick = self.on_pick
+        self.cancel()
+        if obj is not None:
+            on_pick(obj)
+
+    def draw(self, surface, camera, scene, mouse):
+        if not self.active:
+            return
+        obj = self.target(scene, mouse, camera)
+        if self.origin is not None:
+            start = camera.world_to_screen(self.origin)
+            end = camera.world_to_screen(obj.center) if obj is not None and obj.center is not None else mouse
+            pygame.draw.line(surface, (120, 220, 150), start, end, 2)
+        if obj is not None and hasattr(obj, "screen_rect"):
+            pygame.draw.rect(surface, (120, 220, 150), obj.screen_rect(camera).inflate(14, 14),
+                             width=3, border_radius=10)
+        draw_hint(surface, f"{self.prompt}     Esc: cancel")
 
 
 class TrainBuilder:
@@ -2842,17 +3102,27 @@ class App:
         self.train_builder = TrainBuilder()
         self.wall_builder = WallBuilder()
         self.placer = PlaceMode()
+        self.picker = PickMode()
         self.inventory = InventoryPanel(on_pick=lambda cls: cls.create(self))
 
     @property
     def building(self):
         """True while a mode (train / wall / placing) is claiming the mouse."""
-        return self.train_builder.active or self.wall_builder.active or self.placer.active
+        return (self.train_builder.active or self.wall_builder.active
+                or self.placer.active or self.picker.active)
 
     def cancel_modes(self):
         self.train_builder.cancel()
         self.wall_builder.cancel()
         self.placer.cancel()
+        self.picker.cancel()
+
+    def start_picking(self, prompt, on_pick, accept=lambda obj: True, origin=None):
+        """Wait for a click on an object that accept(obj) allows, then call
+        on_pick(obj). Esc or a click elsewhere cancels. `origin` (a world
+        point) draws a line from there to the cursor while picking."""
+        self.cancel_modes()
+        self.picker.begin(prompt, on_pick, accept, origin)
 
     def open_inventory(self):
         """Show the E menu (dropping whatever mode was active)."""

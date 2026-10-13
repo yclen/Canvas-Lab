@@ -1,0 +1,11 @@
+{
+  "devices": [
+    {
+      "name": "arduino",
+      "driver": "fake_arduino",
+      "options": {
+        "port": "COM3"
+      }
+    }
+  ]
+}

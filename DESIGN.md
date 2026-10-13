@@ -51,6 +51,29 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   `App.confirm`, the `Thing` base for simple drawn objects, and the `things.py` catalog
   (examples: Rock, Lamp). Clicks hit the topmost object; a saved object whose type no
   longer exists is kept as an inert `UnknownObject` (written back unchanged)
+- **Off-screen culling**: `Scene.draw` skips objects whose `screen_bounds(camera)` (padded by
+  their own size + 40px, for glows / halos / selection rings) doesn't touch the window. Nodes
+  return their `screen_rect`, walls include their title tag, trains their route + arrows;
+  `None` (the default) means always draw. Updates still run for everything (neurons keep
+  firing off-screen). Measured: 3,000 objects zoomed in went from ~100 ms to ~11 ms a frame
+  (the rest is per-object `update`); drawing everything zoomed-out is unchanged (~24 ms).
+  Next steps if needed: cache rendered text / per-frame surfaces, a spatial grid, then GPU
+  compositing of cached per-object textures
+- **Pan / zoom speed-ups**: every font from `get_font` is a `CachedFont` that remembers its
+  renders and text measurements (most text is identical frame to frame), with an LRU cap on
+  fonts; big text (> 30 px, i.e. zoomed in) snaps to ~5% size steps so zooming reuses fonts.
+  The neuron mesh is drawn once per zoom onto a layer covering the visible network (+ half a
+  window of margin) and just moved when panning. Measured at 2560×1440: panning near devices
+  / the server ~5–7 ms → 3–4 ms a frame; zooming near a device ~24 ms → ~16 ms. What's left
+  while zooming is re-rendering big shapes and text at every new size — a software-rendering
+  limit; the real fix is GPU drawing (see above)
+- **Error safety net**: the app runs without a console, so errors go to `errors.log` (git-
+  ignored) via `report_error` — once per distinct error. Each object's `update` / `draw` /
+  `draw_links` is guarded in `Scene`: a failing object is logged and drawn as a red X box
+  instead of crashing the app. Anything else uncaught is logged by `sys.excepthook` (in
+  `game_loop.py`), which also saves the canvas before the app closes. (Found via a Readout
+  crash at ~4% zoom: its glass-shine strip got a negative width. Objects drawn at tiny sizes
+  should bail out to a simple shape, as Thing's LOD dot and the Readout now do.)
 - **E menu (inventory)**: **E** (or *Objects (E)* in the menu bar) opens a window with a
   tile per placeable type — its icon + name — wheel-scrollable for a long catalog, with
   tabs ("All" + one per `CATEGORY` any type sets). Icons draw themselves: the default
@@ -71,6 +94,27 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   with color below the cap and a readout shows the value. Drag is handled in the object's own
   `update()` (it gets the mouse + camera), saving once on release. Size, length, min, max,
   step, value, color editable. `value` is the parameter other objects will read later
+- **Outputs + links**: any object can publish live values with `outputs()` → `{name: number}`
+  (Slider `value`, Switch `on`/`flips`, PushButton `pressed`/`presses`, Lamp `on`, Neuron
+  `firing` / `clock t` / `input W`). The `Output` base (E menu ▸ Outputs) links to one source
+  — *Link to source…*, then click it (`App.start_picking` / `PickMode`: green ring + rubber
+  band, Esc cancels) — and reads `source.outputs()[source_key]` into `reading` every frame.
+  *Reads* cycles which value; *Unlink* clears it. The link is saved as hidden Props
+  (`Prop(..., hidden=True)`: saved, not shown). A wire with flowing dots is drawn via the
+  `draw_links` hook (all objects' links are drawn before any object, so wires sit under them).
+  First output: **Readout**, an LED display — seven-segment digits with unlit "ghost" segments,
+  a unit beside them (free text: mW, ms, V, …), decimals, digit slots, color, size, and the
+  object's name printed on the bezel. Dashes when unlinked
+- **Label** (E menu ▸ Annotations): a world-space title for a region — scales with zoom like a
+  node (unlike a NameTag), with **Size** and a width that follows its text. Two independent
+  looks to click through — frame **Style** (`LABEL_STYLES`, each with its own padding): *plate*
+  (nameplate + accent bar), *bevel* (raised 3D block like a button cap), *inset* (sunk in an
+  input-style housing), *ribbon* (swallowtail banner), *neon* (glowing tube), *brackets* (HUD
+  corners), *double*, *outline*, *underline* — and text **Effect** (`LABEL_EFFECTS`): flat,
+  shadow, raised (emboss), engraved, 3D (extruded in the accent color), glow (blurred copy
+  added onto the canvas); fonts Bahnschrift / Segoe UI / Georgia / Consolas / default (`get_font` now takes a
+  system font name, falling back to the default); spaced capitals on by default. Rendered
+  text is cached per (text, px, font, …), and very small/huge zooms draw just the shape
 - **Place mode**: picking a point type (E menu or Add menu) puts a see-through copy on the
   cursor — click drops it there and selects it, **Shift+click** keeps placing more, **Esc**
   cancels. Pan/zoom stay live. Button/NameTag ask for their text first, then place
@@ -128,6 +172,46 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   switched on only while a text box is open, so held keys don't repeat on the canvas
 - **Copy** (Edit menu) for buttons/name tags/walls; **C** key drops a copy of the selection
   centered at the mouse cursor (works for any node type + walls); clipboard paste (**q** or Ctrl+V) in text fields
+
+- **Devices (instrument server)** — real hardware, run outside the canvas:
+  - `instrument_server.py` (launched by the Instrument server object, or by hand) opens
+    every device in `devices.json` through its driver in `drivers/`, keeps the connections
+    open (so restarting the canvas never resets an Arduino, and devices **hold their last
+    value** when the canvas closes), and serves JSON-lines over a socket. One worker thread per
+    device applies the *newest* requested value per param, then polls `read()` at the driver's
+    `poll_hz`; a failing driver shows "error" and is retried (module re-imported) every 3 s.
+  - **Local only, by design:** it listens on `127.0.0.1:47800` — the devices are plugged into
+    this PC, and only programs on this PC can reach the server.
+  - Drivers (`drivers/base.py`): `params` (things you set: `Param(min, max, unit, default)`,
+    clamped by the server before `set_<name>` is called), `readings` (things you read:
+    `Reading(unit)`), `open` / `read` / `close`. `drivers/fake_arduino.py` simulates a servo
+    (`angle` → `position`, which travels at ~120°/s) and a light sensor, for testing without
+    hardware. Each module names its class with `DRIVER = …`.
+  - `instruments.py` is the canvas's side: a background thread that (re)connects every second,
+    sends only the newest value per (device, param) at most 30×/s (a dragged slider can't
+    flood a serial line), and keeps the latest catalog / readings / statuses for the canvas
+    (`client.device(name)` returns a snapshot). `start_server()` opens the server in a console.
+  - **Device** object (E menu ▸ Devices): name + status light (green connected, amber starting,
+    red error / not on the server, grey server offline) + a screen of params (orange, what it's
+    set to) and readings (green, what it reports). Inspector: cycle which server device it is,
+    set a param by hand, or link it (*follows* → click a source, e.g. a slider); its params and
+    readings are `outputs()`, so a Readout can show e.g. the servo's actual position. Links are
+    saved as a hidden `"data"` Prop (`Prop(kind="data")` holds any JSON; defaults are deep-copied
+    per object). When offline it offers *Connect instrument server* (or *Place* one, if none).
+  - **Instrument server object** (E menu ▸ Devices, one only — `SINGLETON`, picking it again
+    goes to it): a radio with an antenna (signal waves while connected, blinking amber while
+    connecting). It's the on/off switch for the hardware side: `instruments.client` only
+    connects while its saved `connect` flag is on. **Connect** launches `instrument_server.py`
+    in its own console if nothing is listening yet (also after a canvas restart, if it was left
+    connected), **Disconnect** drops the link but leaves the server (and devices) running,
+    **Stop server** sends `shutdown`. Deleting it disconnects (`on_removed` hook). Its panel
+    lists the server's **devices** (click: place a Device object for it, or go to the one
+    already placed) and **drivers** (click: name + port → `add_device`, which the server
+    writes to devices.json, then place its object). A Device can *Remove from server*.
+  - **Per-driver canvas objects:** a `Device` subclass that sets `DRIVER = "<module>"` is used
+    for that driver's devices (`device_class_for`) — the place for custom looks / controls.
+  - Note: the installed `serial` package is **not pyserial** — a real serial driver needs
+    `pip install pyserial` (and may need the other `serial` package removed).
 
 **Not built yet:** E-menu search / hotbar · more object types (Chest, freeform region, …) ·
 richer agent behaviour · animated *connectors* · inline editing of description in the panel ·
@@ -372,6 +456,8 @@ the selection ring, hover, zoom-out dot and the rest.
 - **Prop kinds:** `"float"`, `"int"` (min/max clamp), `"str"`, `"bool"` (click toggles),
   `"color"` (`r, g, b` or `#rrggbb`), `"choice"` (`choices=[…]`, click cycles). Extra
   `unit=`, `prompt=`, `editable=False`.
+- **Values:** return `{name: number}` from `outputs()` and any Output (e.g. a Readout) can
+  link to it and show it live. Subclass `Output` to make a new kind of display.
 - **Resizable:** every Thing has `scale` (world size = `SIZE × scale`). List
   `Prop("scale", "Size", "float", 1.0, min=…, unit="×")` to make it editable + saved
   (the Inputs family does).

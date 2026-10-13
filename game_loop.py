@@ -10,10 +10,12 @@ here should mention a specific object type.
 import ctypes
 import os
 import platform
+import sys
 
 import pygame
 
 import canvas  # all the classes/helpers live here
+import instruments  # the link to the instrument server (devices)
 import things  # noqa: F401 — defining the catalog's classes registers them
 
 
@@ -24,6 +26,19 @@ if platform.system() == "Windows":
         "Yaakov.CanvasApp"
     )
 
+
+def _on_crash(exc_type, exc, tb):
+    """Uncaught error: log it to errors.log (there's no console) and save the
+    canvas before the app closes."""
+    canvas.report_error("crash", exc)
+    try:
+        scene.save()
+    except Exception:
+        pass
+    sys.__excepthook__(exc_type, exc, tb)
+
+
+sys.excepthook = _on_crash
 pygame.init()
 
 icon = pygame.image.load(os.path.join(canvas.SCRIPT_DIR, "icon.ico"))
@@ -38,9 +53,11 @@ scene = canvas.Scene.load()
 camera = scene.camera
 scene.restore_view(screen.get_size())   # reopen where you were at last close
 app = canvas.App(scene, screen.get_size())   # what object hooks / callbacks receive
+instruments.client.start()          # connects to instrument_server.py in the background
 builder = app.train_builder         # interactive train placement mode
 wall_builder = app.wall_builder     # drag-to-draw wall placement mode
 placer = app.placer                 # holding a picked object, to drop with a click
+picker = app.picker                 # waiting for a click on an object (e.g. a readout's source)
 menubar = canvas.MenuBar()
 inspector = canvas.InspectorPanel()
 marquee = canvas.MarqueeSelect()    # left-drag on empty canvas selects many
@@ -134,6 +151,19 @@ while running:
         if event.type == pygame.KEYDOWN and event.key == pygame.K_e:
             app.open_inventory()
             continue
+
+        # Pick mode: the next left-click chooses an object (or cancels); Esc cancels.
+        if picker.active:
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                picker.cancel()
+                continue
+            if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                    and event.pos[1] > canvas.MENU_BAR_HEIGHT and not menubar.open_menu):
+                if scene.selected is not None and inspector.contains(event.pos, screen.get_size()):
+                    picker.cancel()               # a click on the panel isn't a pick
+                else:
+                    picker.click(scene, event.pos, camera)
+                continue
 
         # Place mode: left-click drops the held object (Shift = keep placing),
         # Esc puts it back. Clicks on the menu bar and pan/zoom fall through.
@@ -290,6 +320,7 @@ while running:
     wall_builder.draw(screen, camera)
     marquee.draw(screen, camera)
     placer.draw(screen, camera)
+    picker.draw(screen, camera, scene, mouse_pos)
     menubar.draw(screen)
     inspector.draw(screen, scene.selected, app)
     if app.modal is not None:

@@ -3,3 +3,6 @@ __pycache__/
 
 # personal canvas data (the app recreates it if missing)
 Nodes.json
+
+# error log the app writes (it has no console)
+errors.log
