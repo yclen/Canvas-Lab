@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+
+# personal canvas data (the app recreates it if missing)
+Nodes.json
