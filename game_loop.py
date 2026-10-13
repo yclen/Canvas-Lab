@@ -2,18 +2,19 @@
 
 Just wiring: pygame/window setup, then the main loop that pumps events into the
 scene, updates, and draws. No app logic lives here — every class and helper comes
-from canvas.py. If you find yourself writing real behavior in this file, it belongs
-in canvas.py instead.
+from canvas.py (and the object catalog in things.py). If you find yourself
+writing real behavior in this file, it belongs in canvas.py instead; and nothing
+here should mention a specific object type.
 """
 
 import ctypes
-import math
 import os
 import platform
 
 import pygame
 
 import canvas  # all the classes/helpers live here
+import things  # noqa: F401 — defining the catalog's classes registers them
 
 
 # ---- Setup -----------------------------------------------------------------
@@ -36,12 +37,13 @@ clock = pygame.time.Clock()
 scene = canvas.Scene.load()
 camera = scene.camera
 scene.restore_view(screen.get_size())   # reopen where you were at last close
+app = canvas.App(scene, screen.get_size())   # what object hooks / callbacks receive
+builder = app.train_builder         # interactive train placement mode
+wall_builder = app.wall_builder     # drag-to-draw wall placement mode
+placer = app.placer                 # holding a picked object, to drop with a click
 menubar = canvas.MenuBar()
 inspector = canvas.InspectorPanel()
-builder = canvas.TrainBuilder()     # interactive train placement mode
-wall_builder = canvas.WallBuilder() # drag-to-draw wall placement mode
 marquee = canvas.MarqueeSelect()    # left-drag on empty canvas selects many
-active_modal = None         # a TextInputModal / ConfirmModal, or None
 
 panning = False
 dt = 0.0
@@ -49,112 +51,37 @@ was_moving = False          # tracks arrow-key movement so we save on release
 last_click_time = 0         # for hand-rolled double-click detection
 last_click_shape = None
 key_repeat_on = False       # held keys repeat only while a text box is open
+held = None                 # object that took the last left-click: gets drag/release until the button's up
 
 
 def handle_menu_command(command):
-    """Turn a menu selection into an app action (opening a modal or jumping)."""
-    global active_modal
-    if command == "add_button":
-        active_modal = canvas.TextInputModal("New button text:", purpose="add_button")
-    elif command == "add_nametag":
-        active_modal = canvas.TextInputModal("New name tag text:", purpose="add_nametag")
+    """Turn a menu selection into an app action."""
+    sel = scene.selected
+    if command.startswith("add:"):              # Add ▸ <type>: the type decides how
+        canvas.OBJECT_TYPES[command[4:]].create(app)
+    elif command == "inventory":
+        app.open_inventory()
     elif command == "edit_name":
-        sel = scene.selected
-        if isinstance(sel, (canvas.Node, canvas.Wall)):   # things with a name
-            active_modal = canvas.TextInputModal("Edit text:", purpose="edit",
-                                                 target=sel, value=sel.text)
+        if sel is not None and getattr(sel, "text", None) is not None:   # things with a name
+            def rename(text, obj=sel):
+                if text.strip():
+                    obj.text = text.strip()
+                    scene.save()
+            app.ask("Edit text:", rename, value=sel.text)
     elif command == "copy":
-        new = canvas.copy_object(scene.selected)   # None for trains / nothing selected
+        new = canvas.copy_object(sel)           # None for trains / nothing selected
         if new is not None:
-            scene.add(new)
-            scene.select_only(new)
+            app.place(new)
     elif command == "delete_node":
-        sel = scene.selection                   # works for any object (incl. trains)
-        if sel:
-            title = (f"Delete '{sel[0].display_name}'?" if len(sel) == 1
-                     else f"Delete {len(sel)} objects?")
-            active_modal = canvas.ConfirmModal(title, "Are you sure you want to delete?",
-                                               target=sel)
-    elif command == "add_train":
-        scene.select_only(None)     # nothing selected while drawing a route
-        builder.begin()
-    elif command == "add_wall":
-        scene.select_only(None)
-        wall_builder.begin()
-    elif command == "add_agent":
-        agent = canvas.spawn_agent(camera, screen.get_size())
-        scene.add(agent)
-        scene.select_only(agent)
-    elif command == "add_neuron":
-        neuron = canvas.spawn_neuron(camera, screen.get_size())
-        scene.add(neuron)
-        scene.select_only(neuron)
+        objs = scene.selection                  # works for any object (incl. trains)
+        if objs:
+            title = (f"Delete '{objs[0].display_name}'?" if len(objs) == 1
+                     else f"Delete {len(objs)} objects?")
+            app.confirm(title, "Are you sure you want to delete?",
+                        lambda: scene.delete_many(objs))
     elif command == "goto":
-        sel = scene.selected
-        if isinstance(sel, canvas.Node):        # goto centers on a node's position
-            camera.look_at(sel.world_center, canvas.GOTO_ZOOM, screen.get_size())
-
-
-def apply_text_modal(modal):
-    """Commit a TextInputModal on submit, per its purpose."""
-    if modal.purpose == "add_button":
-        scene.add(canvas.spawn_button(modal.value, camera, screen.get_size()))
-    elif modal.purpose == "add_nametag":
-        scene.add(canvas.spawn_nametag(modal.value, camera, screen.get_size()))
-    elif modal.purpose == "add_wall":
-        rect = getattr(modal, "wall_rect", None)
-        if rect is not None:
-            x, y, w, h = rect
-            scene.add(canvas.Wall(x, y, w, h, modal.value.strip() or "Wall"))
-    elif modal.purpose == "edit":
-        new_text = modal.value.strip()
-        if new_text:
-            modal.target.text = new_text
-            scene.save()
-    elif modal.purpose == "set_command":
-        target = modal.target
-        command = modal.value.strip()
-        if command:
-            target.action = "run_command"
-            target.params = dict(target.params, command=command)
-        else:                       # cleared: node no longer launches anything
-            target.action = None
-            target.params = {}
-        scene.save()
-    elif modal.purpose == "set_firing":
-        modal.target.set_equation(modal.value)   # restarts the neuron's clock at t = 0
-        scene.save()
-    elif modal.purpose == "set_weight":
-        try:
-            value = float(modal.value.strip())
-        except ValueError:
-            value = None                         # not a number: leave the W unchanged
-        if value is not None and math.isfinite(value) and modal.weight_id in modal.target.weights:
-            modal.target.weights[modal.weight_id] = value
-            scene.save()
-    elif modal.purpose == "set_trigger":
-        modal.target.set_trigger(modal.value)    # resets the clock; waits for the trigger
-        scene.save()
-    elif modal.purpose == "set_t_end":
-        text = modal.value.strip().lower()
-        if text in ("", "inf", "infinity"):
-            value = math.inf
-        else:
-            try:
-                value = float(text)
-            except ValueError:
-                value = None                     # not a number: leave it unchanged
-        if value is not None and value >= 0 and not math.isnan(value):
-            modal.target.t_end = value           # raising it past t resumes the clock
-            scene.save()
-    elif modal.purpose == "set_train_speed":
-        try:
-            value = float(modal.value.strip())
-        except ValueError:
-            value = None
-        if value and value > 0:
-            modal.target.speed = value
-            scene.save()
+        if sel is not None and sel.center is not None:
+            camera.look_at(sel.center, canvas.GOTO_ZOOM, screen.get_size())
 
 
 # ---- Main loop -------------------------------------------------------------
@@ -162,10 +89,11 @@ running = True
 while running:
     mouse_pos = pygame.mouse.get_pos()
     mouse_pressed = pygame.mouse.get_pressed()[0]
+    app.screen_size = screen.get_size()
 
     # Key-repeat on while typing (held Backspace / arrows keep going), off on
     # the canvas (so holding C or Delete doesn't fire over and over).
-    want_repeat = isinstance(active_modal, canvas.TextInputModal)
+    want_repeat = isinstance(app.modal, canvas.TextInputModal)
     if want_repeat != key_repeat_on:
         pygame.key.set_repeat(*(canvas.TEXT_KEY_REPEAT if want_repeat else ()))
         key_repeat_on = want_repeat
@@ -176,21 +104,48 @@ while running:
             continue
         if event.type == pygame.VIDEORESIZE:
             screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
+            app.screen_size = screen.get_size()
             continue
 
+        # An object that handled a left-click holds the mouse until release:
+        # motion goes to its on_drag (a slider follows the cursor), and the
+        # release to on_release. Driven by events, so it's exact and immediate.
+        if held is not None:
+            if event.type == pygame.MOUSEMOTION:
+                held.on_drag(event.pos, app)
+                continue
+            if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                obj, held = held, None
+                obj.on_release(event.pos, app)
+                continue
+
         # A modal, while open, swallows every other event.
-        if active_modal is not None:
-            result = active_modal.handle_event(event, screen.get_size())
-            if result == "submit":
-                apply_text_modal(active_modal)
-                active_modal = None
-            elif result == "confirm":
-                target = active_modal.target
-                active_modal = None
-                scene.delete_many(target)
+        if app.modal is not None:
+            modal = app.modal
+            result = modal.handle_event(event, screen.get_size())
+            if result in ("submit", "confirm"):
+                app.modal = None
+                modal.commit()        # runs its callback (which may open another modal)
             elif result == "cancel":
-                active_modal = None
+                app.modal = None
             continue
+
+        # E opens the object menu from anywhere (it drops any active mode).
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_e:
+            app.open_inventory()
+            continue
+
+        # Place mode: left-click drops the held object (Shift = keep placing),
+        # Esc puts it back. Clicks on the menu bar and pan/zoom fall through.
+        if placer.active:
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                placer.cancel()
+                continue
+            if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                    and event.pos[1] > canvas.MENU_BAR_HEIGHT and not menubar.open_menu):
+                keep_going = bool(pygame.key.get_mods() & pygame.KMOD_SHIFT)
+                placer.place(camera.screen_to_world(event.pos), scene, keep_going)
+                continue
 
         # Train build mode: claims left-click / mouse-move / Esc / Backspace,
         # but lets wheel-zoom and right-drag-pan fall through so the camera
@@ -235,8 +190,8 @@ while running:
                 box = wall_builder.rect()
                 wall_builder.cancel()
                 if box is not None:
-                    active_modal = canvas.TextInputModal("Wall name:", purpose="add_wall")
-                    active_modal.wall_rect = box
+                    app.ask("Wall name:",
+                            lambda text, box=box: scene.add(canvas.Wall(*box, text.strip() or "Wall")))
                 continue
             # wheel-zoom falls through so you can zoom while sizing a box
 
@@ -255,21 +210,18 @@ while running:
 
         if event.type == pygame.MOUSEWHEEL:
             if inspector.scroll_list(mouse_pos, event.y):
-                pass          # wheel over the neuron's W list scrolls it instead of zooming
+                pass          # wheel over the inspector's list scrolls it instead of zooming
             else:
                 # LOD lives in each object's draw(), so no post-zoom sync needed.
                 camera.zoom_at(getattr(event, "pos", mouse_pos), 1 + event.y * canvas.SCROLL_STEP)
 
-        elif (event.type == pygame.KEYDOWN and event.key == pygame.K_c
-                and not builder.active and not wall_builder.active):
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_c and not app.building:
             # C: drop a copy of the selection at the mouse cursor.
             new = canvas.copy_object(scene.selected, at=camera.screen_to_world(mouse_pos))
             if new is not None:
-                scene.add(new)
-                scene.select_only(new)
+                app.place(new)
 
-        elif (event.type == pygame.KEYDOWN and event.key == pygame.K_DELETE
-                and not builder.active and not wall_builder.active):
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_DELETE and not app.building:
             handle_menu_command("delete_node")   # same confirm as Edit ▸ Delete
 
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
@@ -280,57 +232,21 @@ while running:
             camera.pan(*event.rel)
 
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            consumed, command = menubar.handle_click(event.pos)
+            consumed, command = menubar.handle_click(event.pos, screen.get_size())
             if command:
                 handle_menu_command(command)
             if not consumed:
-                selected = scene.selected
-                if (isinstance(selected, (canvas.Node, canvas.Train))
-                        and inspector.contains(event.pos, screen.get_size())):
+                if scene.selected is not None and inspector.contains(event.pos, screen.get_size()):
                     # Click landed on the inspector overlay — never the canvas.
-                    panel_action = inspector.handle_click(event.pos, selected, screen.get_size())
-                    if panel_action == "activate":
-                        canvas.run_action(selected,
-                                          canvas.ActionContext(scene, camera, screen.get_size()))
-                    elif panel_action == "set_command":
-                        active_modal = canvas.TextInputModal(
-                            "Command to run:", purpose="set_command",
-                            target=selected, value=selected.params.get("command", ""))
-                    elif panel_action == "set_firing":
-                        active_modal = canvas.TextInputModal(
-                            "Firing equation (e.g. every(1), poisson(0.5)):",
-                            purpose="set_firing", target=selected, value=selected.equation,
-                            q_pastes=False)          # so 'sqrt' can be typed
-                    elif panel_action == "edit_weight":
-                        other_id = inspector.clicked_weight
-                        other = scene.by_id.get(other_id)
-                        name = other.text if other is not None and other.text else other_id
-                        active_modal = canvas.TextInputModal(
-                            f"W to {name}:", purpose="set_weight", target=selected,
-                            value=f"{selected.weights.get(other_id, 0.0):g}")
-                        active_modal.weight_id = other_id
-                    elif panel_action == "set_trigger":
-                        active_modal = canvas.TextInputModal(
-                            "Clock trigger, e.g. W > 3 (empty = none):", purpose="set_trigger",
-                            target=selected, value=selected.trigger, q_pastes=False)
-                    elif panel_action == "edit_t_end":
-                        t_end = selected.t_end
-                        active_modal = canvas.TextInputModal(
-                            "Clock end, in seconds (or INF for never):", purpose="set_t_end",
-                            target=selected, value="INF" if math.isinf(t_end) else f"{t_end:g}")
-                    elif panel_action in ("spike_down", "spike_up"):
-                        step = 1 if panel_action == "spike_up" else -1
-                        selected.spike_frames = max(1, selected.spike_frames + step)
-                        scene.save()
-                    elif panel_action == "adjust_speed":
-                        active_modal = canvas.TextInputModal(
-                            "Train speed (units/sec):", purpose="set_train_speed",
-                            target=selected, value=str(int(selected.speed)))
+                    callback = inspector.handle_click(event.pos)
+                    if callback is not None:
+                        callback(app)
                 else:
-                    clicked = next((o for o in scene.objects if o.hit(event.pos, camera)), None)
-                    ctx = canvas.ActionContext(scene, camera, screen.get_size())
-                    if clicked is not None and clicked.on_click(event.pos, ctx):
-                        pass          # object handled it (e.g. train arrow teleport)
+                    clicked = scene.hit_test(event.pos, camera)
+                    # Ctrl+click just selects — e.g. an input you'd otherwise press.
+                    interact = not pygame.key.get_mods() & pygame.KMOD_CTRL
+                    if clicked is not None and interact and clicked.on_click(event.pos, app):
+                        held = clicked    # it handled the click (e.g. a press): it gets drag/release
                     else:
                         scene.select_only(clicked)   # deselects all if clicked is None
                         if clicked is None:
@@ -340,15 +256,15 @@ while running:
                         double = (clicked is not None and clicked is last_click_shape
                                   and now - last_click_time <= canvas.DOUBLE_CLICK_MS)
                         if double:
-                            if isinstance(clicked, canvas.Node):    # Go To centers on a node
-                                camera.look_at(clicked.world_center, canvas.GOTO_ZOOM, screen.get_size())
+                            if clicked.center is not None:    # Go To centers on it
+                                camera.look_at(clicked.center, canvas.GOTO_ZOOM, screen.get_size())
                             last_click_time, last_click_shape = 0, None
                         else:
                             last_click_time, last_click_shape = now, clicked
 
     # Arrow keys move every selected object (screen-space speed, so /zoom).
-    # Suspended while a modal is capturing keystrokes or a train is being drawn.
-    if active_modal is None and not builder.active and not wall_builder.active:
+    # Suspended while a modal is capturing keystrokes or a build mode is on.
+    if app.modal is None and not app.building:
         keys = pygame.key.get_pressed()
         move_dx = keys[pygame.K_RIGHT] - keys[pygame.K_LEFT]
         move_dy = keys[pygame.K_DOWN] - keys[pygame.K_UP]
@@ -364,6 +280,8 @@ while running:
         was_moving = is_moving
 
     camera.update_ride(dt, screen.get_size())   # advance an in-progress ride
+    if placer.active:                           # held object sticks to the cursor (even mid-zoom)
+        placer.follow(camera.screen_to_world(mouse_pos))
     scene.update(mouse_pos, mouse_pressed, camera, dt)
 
     screen.fill(canvas.BG_COLOR)
@@ -371,11 +289,11 @@ while running:
     builder.draw(screen, camera, scene)
     wall_builder.draw(screen, camera)
     marquee.draw(screen, camera)
+    placer.draw(screen, camera)
     menubar.draw(screen)
-    sel = scene.selected
-    inspector.draw(screen, sel if isinstance(sel, (canvas.Node, canvas.Train)) else None, screen.get_size())
-    if active_modal is not None:
-        active_modal.draw(screen)
+    inspector.draw(screen, scene.selected, app)
+    if app.modal is not None:
+        app.modal.draw(screen)
     pygame.display.flip()
     dt = clock.tick(60) / 1000.0
 

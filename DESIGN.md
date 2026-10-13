@@ -22,12 +22,14 @@ each looking and behaving very differently, but all living on the same canvas. T
 design question is: *how do we keep adding new kinds of objects without the code turning
 to spaghetti?*
 
-**Structure: two files, split by concern, not by construct.**
+**Structure: split by concern, not by construct.**
 - `canvas.py` — everything about the world and the app: all the classes (canvas objects,
   camera, scene, UI) plus the helper functions that serve them (fonts, actions,
-  persistence).
+  persistence), and the object toolkit (`Prop`, inspector rows, `Thing`, `App`).
+- `things.py` — the **catalog**: the many simple object types, one small class each.
+  Imports from `canvas.py`; `canvas.py` never imports it.
 - `game_loop.py` — the thin runner: pygame/window setup + the main-loop wiring, nothing
-  else. It imports from `canvas.py`; `canvas.py` never imports back.
+  else, and nothing that names a specific object type. It imports `canvas` and `things`.
 
 We considered splitting "all classes in one file, all non-class glue in the loop," but
 that cuts across concerns — it would exile actions/persistence into the loop file and turn
@@ -42,6 +44,36 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
 **Built and working:**
 - Camera (pan / wheel-zoom / `look_at`); Scene state container with an id index
 - `CanvasObject` thin master → `Node` → `Button` / `NameTag`; `OBJECT_TYPES` registry
+- **Object toolkit** — a new type is one class, no loop/menu/inspector edits (see *Adding an
+  object type*): self-registering types, an Add menu built from the registry, `Prop`
+  (saved + inspector-editable fields), inspector rows returned by the object
+  (`inspector()` / `buttons()` / `@panel_button`), callback dialogs via `App.ask` /
+  `App.confirm`, the `Thing` base for simple drawn objects, and the `things.py` catalog
+  (examples: Rock, Lamp). Clicks hit the topmost object; a saved object whose type no
+  longer exists is kept as an inert `UnknownObject` (written back unchanged)
+- **E menu (inventory)**: **E** (or *Objects (E)* in the menu bar) opens a window with a
+  tile per placeable type — its icon + name — wheel-scrollable for a long catalog, with
+  tabs ("All" + one per `CATEGORY` any type sets). Icons draw themselves: the default
+  `draw_icon` draws a sample object (`icon_sample()`) scaled to fit, so a new type gets an
+  icon for free (Train/Wall hand-draw theirs; a crashing icon shows a "?" tile instead).
+  Picking a tile runs the type's `create`. Remembers its tab + scroll
+- **Inputs** (E menu ▸ Inputs, in `things.py`): an `Input` base — a click *presses* it
+  (`press(app)`, default: run its command) instead of selecting it; it tracks hover /
+  held / a short press flash for drawing and draws the shared housing; subclasses draw
+  `draw_face`. First member: **PushButton**, an arcade-style square cap that brightens +
+  glows on hover and sinks into its housing when pressed (cap color + name-on-cap).
+  **Ctrl+click** selects any object without interacting with it (drag-box works too)
+- **Switch** (Inputs): an on/off slide switch — each click flips it (saved `on`), the knob
+  slides across (`SLIDE_TIME`) and the track fills with its color; ON/OFF shows beside the
+  knob when it fits. Size, color, and the On row are editable; a flip also runs its command
+- **Slider** (Inputs): a vertical fader — drag the cap (or click the track to jump) to set a
+  saved `value` between `min` (bottom) and `max` (top), snapped to `step`; the slot fills
+  with color below the cap and a readout shows the value. Drag is handled in the object's own
+  `update()` (it gets the mouse + camera), saving once on release. Size, length, min, max,
+  step, value, color editable. `value` is the parameter other objects will read later
+- **Place mode**: picking a point type (E menu or Add menu) puts a see-through copy on the
+  cursor — click drops it there and selects it, **Shift+click** keeps placing more, **Esc**
+  cancels. Pan/zoom stay live. Button/NameTag ask for their text first, then place
 - Level-of-detail draw (buttons shrink to a dot; no Button↔Rectangle swap machinery)
 - JSON persistence (`{"objects": [...]}`) behind `load_objects`/`save_objects`; stable ids, backfilled
 - Menu bar (Add / Edit / Go To) + unified modal slot (text input, confirm delete)
@@ -97,7 +129,7 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
 - **Copy** (Edit menu) for buttons/name tags/walls; **C** key drops a copy of the selection
   centered at the mouse cursor (works for any node type + walls); clipboard paste (**q** or Ctrl+V) in text fields
 
-**Not built yet:** left-side palette · more object types (Chest, freeform region, …) ·
+**Not built yet:** E-menu search / hotbar · more object types (Chest, freeform region, …) ·
 richer agent behaviour · animated *connectors* · inline editing of description in the panel ·
 wall resize handles · wall→node containment.
 
@@ -150,14 +182,16 @@ genuinely share substance (a `world_center`, boxed rendering, selection, an `act
 
 ```
 CanvasObject (thin master)
-├── Node            ← point-launcher family: world_center, action/params, activate
-│   ├── Button
+├── Node            ← point family: world_center, select / move / copy, action/params
+│   ├── Button       ← launchers (LAUNCHER = True): command + Activate
 │   ├── NameTag
-│   └── Agent        ← point object, but wanders on its own (not a launcher)
-│       └── Neuron   ← Agent look-alike, stationary: white body, one oval spot
+│   └── Thing        ← the easy base for simple drawn objects: SIZE + draw_shape + tick
+│       ├── Agent    ← wanders on its own (not a launcher)
+│       │   └── Neuron ← Agent look-alike, stationary: white body, one oval spot
+│       └── (things.py: Rock, Lamp, … — the catalog)
 ├── Train           ← connector: two node ids + waypoints, no single center
-└── Wall            ← area zone: rectangle (x, y, w, h), no single center
-   (future siblings: Chest, freeform region, …)
+├── Wall            ← area zone: rectangle (x, y, w, h), no single center
+└── UnknownObject   ← placeholder for a saved type whose class is gone (inert, preserved)
 ```
 
 Rule: add an intermediate layer *only when* two subclasses clearly duplicate. Two levels
@@ -166,8 +200,25 @@ branches (e.g. both a Node and a future Chest being activatable) — when that s
 fix is a small flag/mixin for just that capability, added reactively. Not built yet.
 
 **The type registry** (`OBJECT_TYPES`, a `{type-string: class}` dict) is what keeps it
-open-ended: the loader reads it (JSON `"type"` → class) and a future palette will too.
-Register a class and it's placeable + loadable with no loop changes.
+open-ended: the loader reads it (JSON `"type"` → class), the Add menu reads it, and a
+future palette will too. It **fills itself** — `CanvasObject.__init_subclass__` registers
+any class that sets a `TYPE` — so defining the class is the whole registration.
+
+**Everything type-specific lives on the class.** The thin master grew *defaults*, not
+requirements: each hook below has a working default, and a subclass overrides only what's
+different about it. The loop, menu and inspector just call the hooks.
+
+| Hook | What it's for | Default |
+|---|---|---|
+| `TYPE`, `MENU_LABEL` | saved type name; Add-menu + E-menu entry | not in menus |
+| `NAME`, `CATEGORY` | E-menu tile name; E-menu tab | label minus "Add "; just "All" |
+| `draw_icon(surface)`, `icon_sample()` | E-menu icon | draw a sample object, scaled |
+| `create(app)` | what picking it does | `app.start_placing(...)`: drop with the mouse |
+| `PROPS` | saved, inspector-editable fields | none (inherited lists merge) |
+| `inspector(app)` | rows for the panel | name + every Prop |
+| `buttons(app)` / `@panel_button` | panel buttons | every `@panel_button` method |
+| `center`, `in_box`, `copyable`, `COPY_SKIP` | Go To, drag-box select, copy | per family |
+| `on_prop_changed(key)` | react to an inspector edit | nothing |
 
 ---
 
@@ -192,11 +243,18 @@ Two-step, so a stray click can never fire a terminal command:
 - **Single click a node** → selects it and opens the **inspector panel** (right overlay).
 - **Activate** in the panel → runs the node's action.
 
-The panel is **data-driven**: it shows whatever fields the selected node carries
-(type, name, live position, id, description, command) and has **Set command…** (a text
-modal that sets `action=run_command` + `params.command`) and **Activate** (green when the
-node has a command). A new object type or action needs no panel changes. Double-click a node
-is a shortcut for Go To.
+The panel is **object-driven**: it shows whatever rows the selected object returns from
+`inspector(app)` — `Field` (label over value), `Row` (label left, value right), `Stepper`
+(◀ value ▶), `Gap`, `ScrollList` (wheel-scrolled, fills to the buttons) — each optionally
+clickable with an `on_click(app)` callback, then the object's `buttons(app)` stacked at
+the bottom. The panel knows no types; the loop just runs whichever callback was clicked.
+Launchers (Button / NameTag) show name, position, id, description, command, with
+**Set command…** and **Activate** (green when the node has a command). Double-click any
+object with a `center` is a shortcut for Go To.
+
+**Dialogs are callbacks.** `app.ask(prompt, on_submit)` opens a text box and calls
+`on_submit(text)` on Enter; `app.confirm(message, sub, on_confirm)` is the delete dialog.
+That replaced a `purpose`-string switch in the loop that every new prompt had to extend.
 
 ---
 
@@ -277,6 +335,61 @@ animation plumbing the design had flagged as missing; animated *connectors* can 
 
 ---
 
+## Adding an object type (the recipe)
+
+The goal is lots of variety cheaply: most new objects are a drawing with a few properties
+and maybe an action or two. So the common case is one small class in `things.py`:
+
+```python
+class Lamp(Thing):
+    TYPE = "lamp"                  # saved type name — don't rename once you've placed some
+    MENU_LABEL = "Add lamp"        # Add-menu entry (leave out to hide it)
+    SIZE = (50, 50)                # world units
+    DOT_COLOR = (255, 220, 120)    # what it shows as when zoomed far out
+    PROPS = [Prop("on", "On", "bool", False),              # → self.on, saved, click toggles
+             Prop("color", "Light color", "color", (255, 220, 120))]
+
+    def draw_shape(self, surface, rect, camera):           # rect: on-screen box, zoomed
+        pygame.draw.ellipse(surface, self.color if self.on else (70, 70, 78), rect)
+
+    def tick(self, dt):                                    # optional: animate (dt in seconds)
+        ...
+
+    @panel_button("Switch on / off")                       # optional: an inspector button
+    def toggle(self, app):
+        self.on = not self.on
+        app.save()
+```
+
+That's in the E menu (with an icon drawn from `draw_shape`), placeable, saved, loaded,
+selectable, movable, copyable and inspectable — nothing else to touch. `Thing` supplies
+the selection ring, hover, zoom-out dot and the rest.
+
+- **E menu:** `CATEGORY = "Lights"` adds a tab; `NAME` overrides the tile name;
+  override `icon_sample()` (e.g. return one switched on) or `draw_icon(surface)` for a
+  custom icon.
+
+- **Prop kinds:** `"float"`, `"int"` (min/max clamp), `"str"`, `"bool"` (click toggles),
+  `"color"` (`r, g, b` or `#rrggbb`), `"choice"` (`choices=[…]`, click cycles). Extra
+  `unit=`, `prompt=`, `editable=False`.
+- **Resizable:** every Thing has `scale` (world size = `SIZE × scale`). List
+  `Prop("scale", "Size", "float", 1.0, min=…, unit="×")` to make it editable + saved
+  (the Inputs family does).
+- **Live state** that shouldn't be saved (an animation phase) is a plain attribute set in
+  `__init__` after `super().__init__`.
+- **Families:** subclass another Thing to share its look/props/behavior; add props with a
+  `PROPS` list of its own (lists merge down the hierarchy; same key overrides).
+- **Custom panel:** override `inspector(app)` / `buttons(app)` (Neuron is the full example:
+  compact rows, clickable rows, a stepper, a scroll list). `self.prop_rows()` gives the
+  default Prop rows to mix in.
+- **Not a point object?** Subclass `CanvasObject` directly (like Wall or Train) and
+  implement `draw`, `hit`, `to_dict` / `from_dict`, plus `center` / `in_box` / `move` if
+  it should Go To / drag-select / move.
+- **Renaming or deleting a type** never loses data: saved objects of an unknown type load
+  as invisible `UnknownObject`s and are written back as they were.
+
+---
+
 ## Level of detail (built)
 
 Instead of swapping a `Button` object for a `Rectangle` when zoomed out, each type just
@@ -298,10 +411,11 @@ to `{"objects": [...]}`).
 
 ## What's next (open threads)
 
-- **Left-side palette** — the Factorio "toolbar" of placeable object types (reads
-  `OBJECT_TYPES`). Right side is inspect; left side is place.
-- **New object types** — Wall/Region (area-anchored, a list of points), or others. The
-  thin-master + registry means whatever they are, they drop in if they can `draw` and `hit`.
+- **E menu extras** — a search box (type to filter), a hotbar of recent picks, and
+  categories on the catalog classes once there are enough to group.
+- **New object types** — the catalog in `things.py` (see the recipe above). Once it's long,
+  give classes a category so the Add menu / palette can group them, and split `things.py`
+  into a folder of themed modules.
 - **Animated connectors** — would need time passed into `draw`/`update` (flowing route,
   marching ants). Not plumbed yet.
 - **Inspector editing** — edit description (and maybe params) inline; a collapse/close control.
