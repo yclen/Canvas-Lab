@@ -210,8 +210,31 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
     writes to devices.json, then place its object). A Device can *Remove from server*.
   - **Per-driver canvas objects:** a `Device` subclass that sets `DRIVER = "<module>"` is used
     for that driver's devices (`device_class_for`) — the place for custom looks / controls.
-  - Note: the installed `serial` package is **not pyserial** — a real serial driver needs
-    `pip install pyserial` (and may need the other `serial` package removed).
+  - **Connecting is per object now.** `instruments.client.want(key, on)`: the link is open while
+    anything wants it (a Device's **Connect**, or the Instrument server's), and the client itself
+    launches `instrument_server.py` once if nothing is listening. A driver-specific Device
+    (`DRIVER` set) **provisions its own device**: it picks a free name (`servo`, `servo2`, …),
+    owns its options (`device_options()` — e.g. the servo's Port / Baud props), and asks the
+    server to `add_device` / `configure_device` until the server's copy matches. Status: off →
+    connecting → starting → connected (or error, with the driver's message). The generic Device
+    is no longer in the E menu (placed from the Instrument server's device list). The Instrument
+    server object is optional; its *Disconnect all* / *Stop server* turn every device off.
+    devices.json starts empty — the fake Arduino device was removed (its driver stays, for tests).
+  - **Arduino servo** (`drivers/arduino_servo.py`, canvas object *Arduino servo*): writes the
+    angle as text + newline (`b"90
+"` — what typing 90 + Enter in the Serial Monitor sends) at
+    the configured baud (9600), rounded, skipping repeats. One-way, so no readings: the status
+    light shows whether the port is open. `port` can be `"auto"` — only boards with Arduino's
+    own USB vendor ids (0x2341 / 0x2A03) are matched, never the PC's other serial equipment.
+    Opening the port resets an Uno, so `open()` waits 2 s, then re-sends the current angle.
+    The server keeps param values across driver restarts (reconnects, port changes), so a
+    replugged servo returns to where it was rather than to the default. A Device's panel has a
+    **Port** row (only Arduino ports are suggested) → `configure_device`, which restarts it.
+    Only one program can hold a COM port: close the Arduino IDE's Serial Monitor first.
+    The canvas object draws the servo from above — blue case with ears, a 0–180° scale, and a
+    white horn that swings to the set angle — over the generic Device's panel.
+  - pyserial is required (`pip install pyserial`); the unrelated `serial` package (a JSON/YAML
+    library, same import name) was removed from this PC's miniconda for that reason.
 
 **Not built yet:** E-menu search / hotbar · more object types (Chest, freeform region, …) ·
 richer agent behaviour · animated *connectors* · inline editing of description in the panel ·

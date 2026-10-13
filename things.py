@@ -35,6 +35,7 @@ See "Adding an object type" in DESIGN.md.
 """
 
 import math
+import time
 
 import numpy as np
 import pygame
@@ -1075,13 +1076,18 @@ class Label(Thing):
 # ============================================================================
 # The drivers live in another process (instrument_server.py); instruments.py
 # is the canvas's link to it. A Device object stands for one device the server
-# runs (by name, from devices.json): its params can be set by hand or linked
-# to any object's output (a slider's value), and its readings are outputs that
-# readouts (or anything else) can link to.
-DEVICE_STATUS_COLORS = {"ok": (90, 220, 120), "starting": (240, 190, 60),
-                        "error": (235, 80, 80), "missing": (235, 80, 80), "offline": (110, 110, 120)}
-DEVICE_STATUS_TEXT = {"ok": "connected", "starting": "starting…", "error": "error",
-                      "missing": "not on the server", "offline": "server offline"}
+# runs (by name): its params can be set by hand or linked to any object's
+# output (a slider's value), and its readings are outputs that readouts (or
+# anything else) can link to. Its Connect button opens the link (launching the
+# server if needed); a driver-specific object (DRIVER set, e.g. ArduinoServo)
+# also sets up its own device on the server, with its own options (port …).
+DEVICE_STATUS_COLORS = {"ok": (90, 220, 120), "starting": (240, 190, 60), "connecting": (240, 190, 60),
+                        "error": (235, 80, 80), "missing": (235, 80, 80), "offline": (110, 110, 120),
+                        "off": (110, 110, 120)}
+DEVICE_STATUS_TEXT = {"ok": "connected", "starting": "starting…", "connecting": "connecting…",
+                      "error": "error", "missing": "not on the server", "offline": "server offline",
+                      "off": "not connected"}
+DEVICE_RETRY_SECONDS = 3.0      # how often a driver-specific object re-asks the server to set it up
 
 
 class Device(Thing):
@@ -1093,34 +1099,87 @@ class Device(Thing):
     keeps running (and holds its last values) when the canvas closes."""
 
     TYPE = "device"
-    MENU_LABEL = "Add device"
+    MENU_LABEL = None             # not in the menus: placed from the Instrument server's device list
     NAME = "Device"
     CATEGORY = "Devices"
     DRIVER = None                 # a subclass for one driver sets its module name (e.g. "fake_arduino")
+    DEFAULT_DEVICE = ""           # server device name to use when none of that driver is found
     SIZE = (230, 132)
     DOT_COLOR = (90, 220, 120)
     PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
                   prompt="Size (1 = normal, 2 = twice as big):"),
              Prop("device", kind="str", default="", hidden=True),     # name on the server
+             Prop("connect", kind="bool", default=False, hidden=True),  # Connect pressed (saved)
              Prop("links", kind="data", default={}, hidden=True)]     # param -> {"id", "key"}
     WIRE_COLOR = (120, 220, 150)
 
     @classmethod
     def create(cls, app):
+        client = instruments.client
+
         def make(x, y):
             obj = cls(x, y)
             used = {o.device for o in app.scene.objects if isinstance(o, Device)}
-            names = instruments.client.device_names()
-            obj.device = next((n for n in names if n not in used), names[0] if names else "")
+            base = cls.DEFAULT_DEVICE or "device"           # a name no other object here uses
+            obj.device = next(n for n in [base] + [f"{base}{i}" for i in range(2, 1000)] if n not in used)
             return obj
         app.start_placing(make)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._next_request = 0.0    # when to (re)ask the server to set this device up
 
     # --- The server's view of this device ----------------------------------------
     def info(self):
         return instruments.client.device(self.device) if self.device else None
 
     def status(self):
-        return instruments.client.status(self.device) if self.device else "missing"
+        """off (not connected) / connecting / starting / ok / error / missing."""
+        if not self.connect or not self.device:
+            return "off"
+        status = instruments.client.status(self.device)
+        if status == "offline":
+            return "connecting"
+        if status == "missing" and self.DRIVER:
+            return "starting"            # being set up on the server
+        return status
+
+    def device_options(self):
+        """Options this object wants its device run with (e.g. {"port": "COM11"})."""
+        return {}
+
+    def _provision(self):
+        """Driver-specific objects set up their own device: add it to the
+        server if it isn't there, or reconfigure it if its options changed."""
+        client = instruments.client
+        if not (self.DRIVER and self.connect and self.device and client.connected):
+            return
+        now = time.monotonic()
+        if now < self._next_request:
+            return
+        info = client.device(self.device)
+        options = self.device_options()
+        if info is None:
+            client.send({"op": "add_device", "name": self.device, "driver": self.DRIVER,
+                         "options": options})
+            self._next_request = now + DEVICE_RETRY_SECONDS
+        elif any(info.get("options", {}).get(k) != v for k, v in options.items()):
+            client.send({"op": "configure_device", "name": self.device, "options": options})
+            self._next_request = now + DEVICE_RETRY_SECONDS
+
+    def connect_now(self, app):
+        self.connect = True
+        instruments.client.want(self.id, True)
+        instruments.client.retry_launch()
+        self._next_request = 0.0
+        app.save()
+
+    def disconnect(self, app):
+        self.connect = False
+        app.save()
+
+    def on_removed(self):
+        instruments.client.want(self.id, False)
 
     def outputs(self):
         info = self.info()
@@ -1131,10 +1190,13 @@ class Device(Thing):
         return out
 
     def tick(self, dt):
-        """Push each linked param's source value to the server (the client
-        skips repeats and caps the rate)."""
-        if not self.device or self.scene is None:
+        """Keep the connection wanted (while Connect is on), set up the device
+        if needed, and push each linked param's source value to the server
+        (the client skips repeats and caps the rate)."""
+        instruments.client.want(self.id, self.connect)
+        if not self.connect or not self.device or self.scene is None:
             return
+        self._provision()
         for param, link in self.links.items():
             src = self.scene.by_id.get(link.get("id"))
             value = src.outputs().get(link.get("key")) if src is not None else None
@@ -1159,6 +1221,20 @@ class Device(Thing):
         span = f" ({lo:g}–{hi:g} {spec.get('unit', '')})" if lo is not None and hi is not None else ""
         app.ask(f"Set {param}{span}:", submit, value=f"{spec.get('value', 0):g}")
 
+    def change_port(self, app):
+        """Type a new port (or "auto"); the server restarts the device on it.
+        Only Arduino ports are suggested, so other serial equipment isn't hit by mistake."""
+        info = self.info() or {}
+        arduinos = [p["device"] for p in instruments.client.ports if p.get("arduino")]
+        hint = f"Arduino on {', '.join(arduinos)}" if arduinos else "no Arduino detected"
+        def submit(text):
+            port = text.strip()
+            if port:
+                instruments.client.send({"op": "configure_device", "name": self.device,
+                                         "options": {"port": port}})
+        app.ask(f"Port, or auto ({hint}):", submit,
+                value=str(info.get("options", {}).get("port", "auto")))
+
     def pick_source(self, app, param):
         def link(src):
             keys = list(src.outputs())
@@ -1174,12 +1250,15 @@ class Device(Thing):
 
     def inspector(self, app):
         status = self.status()
-        rows = [Row("Device", self.device or "— (none)", on_click=self.next_device),
+        rows = [Row("Device", self.device or "— (none)",
+                    on_click=None if self.DRIVER else self.next_device),
                 Row("Status", DEVICE_STATUS_TEXT.get(status, status),
                     color=DEVICE_STATUS_COLORS.get(status))]
-        info = self.info()
+        info = self.info() if self.connect else None
         if info is not None:
             rows.append(Row("Driver", info["driver"]))
+            if not self.DRIVER and "port" in info.get("options", {}):
+                rows.append(Row("Port", info["options"]["port"], on_click=self.change_port))
             if info.get("message"):
                 rows.append(Field("Message", info["message"], color=WARN_COLOR))
             for param, spec in info["params"].items():
@@ -1198,13 +1277,6 @@ class Device(Thing):
                 rows.append(Row(name, "—" if value is None else f"{value:g} {spec.get('unit', '')}"))
         return rows + [Gap(6)] + self.prop_rows()
 
-    def connect(self, app):
-        server = server_object(app.scene)
-        if server is not None:
-            server.connect_now(app)
-        else:
-            InstrumentServer.create(app)            # none yet: pick one up to place
-
     def remove_from_server(self, app):
         def remove():
             instruments.client.send({"op": "remove_device", "name": self.device})
@@ -1213,14 +1285,12 @@ class Device(Thing):
 
     def buttons(self, app):
         out = []
-        if not instruments.client.connected:
-            label = ("Connect instrument server" if server_object(app.scene) is not None
-                     else "Place instrument server")
-            out.append(Btn(label, self.connect))
         if self.links:
             out.append(Btn("Unlink all", self.unlink_all))
-        if instruments.client.connected and self.info() is not None:
+        if not self.DRIVER and self.connect and instruments.client.connected and self.info() is not None:
             out.append(Btn("Remove from server", self.remove_from_server))
+        out.append(Btn("Disconnect", self.disconnect) if self.connect
+                   else Btn("Connect", self.connect_now, style="go"))
         return out
 
     # --- Drawing ----------------------------------------------------------------------
@@ -1267,8 +1337,8 @@ class Device(Thing):
                              rect.width - 2 * pad, rect.bottom - pad - (rect.y + pad + header_h + pad // 2))
         draw_rect(surface, (12, 14, 16), screen, border_radius=max(2, radius - 2))
         draw_rect(surface, (6, 6, 8), screen, width=1, border_radius=max(2, radius - 2))
-        info = self.info()
-        if info is None or status in ("offline", "missing"):
+        info = self.info() if self.connect else None
+        if info is None or status in ("offline", "missing", "off", "connecting"):
             lines = [(DEVICE_STATUS_TEXT.get(status, status), "", (130, 130, 142))]
         else:
             lines = []
@@ -1291,6 +1361,151 @@ class Device(Thing):
                     rs = font.render(right, True, color)
                     surface.blit(rs, (screen.right - pad - rs.get_width(), round(y)))
                 y += line_h
+
+
+
+# ---- Arduino servo: a Device with its own look ------------------------------
+SERVO_BLUE = (40, 110, 215)
+SERVO_HORN = (238, 238, 242)
+SERVO_SWING = 420.0          # deg/sec the drawn horn swings toward the set angle
+
+
+class ArduinoServo(Device):
+    """A hobby servo on an Arduino (driver: arduino_servo), drawn from above:
+    a blue servo body with mounting ears, and a white horn that swings to the
+    angle it's set to, over a 0–180° scale. Link its angle to a slider (0–180)
+    and the horn — and the real servo — follow. The status light shows whether
+    the server has the serial port open."""
+
+    TYPE = "arduino_servo"
+    MENU_LABEL = "Add Arduino servo"
+    NAME = "Arduino servo"
+    DRIVER = "arduino_servo"
+    DEFAULT_DEVICE = "servo"
+    SIZE = (230, 180)
+    DOT_COLOR = SERVO_BLUE
+    PROPS = [Prop("port", "Port", "str", "auto",
+                  prompt="Serial port, e.g. COM11 (or auto to find the Arduino):"),
+             Prop("baud", "Baud", "int", 9600, min=300, max=2_000_000)]
+
+    def device_options(self):
+        return {"port": self.port or "auto", "baud": self.baud}
+
+    def inspector(self, app):
+        rows = super().inspector(app)
+        arduinos = [p["device"] for p in instruments.client.ports if p.get("arduino")]
+        if instruments.client.connected:
+            rows.append(Row("Arduino found on", ", ".join(arduinos) or "— none plugged in"))
+        return rows
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._shown = None           # the angle the drawn horn is at (eases toward the set one)
+
+    def set_angle(self):
+        """The angle the server says it's set to (None if not known)."""
+        info = self.info() if self.connect else None
+        spec = (info or {}).get("params", {}).get("angle")
+        return None if spec is None else spec.get("value")
+
+    def tick(self, dt):
+        super().tick(dt)             # pushes a linked slider's value to the server
+        target = self.set_angle()
+        if target is None:
+            return                   # unknown (offline): keep the horn where it was
+        if self._shown is None:
+            self._shown = target
+        step = SERVO_SWING * dt
+        self._shown += max(-step, min(step, target - self._shown))
+
+    def draw_shape(self, surface, rect, camera):
+        status = self.status()
+        led_color = DEVICE_STATUS_COLORS.get(status, (110, 110, 120))
+        s = rect.width
+        body_h = round(rect.height * 0.5)
+        body = pygame.Rect(rect.x + round(s * 0.07), rect.bottom - body_h,
+                           rect.width - 2 * round(s * 0.07), body_h)
+        radius = max(2, s // 28)
+        if s < 30:                                   # tiny: the body and its light
+            draw_rect(surface, SERVO_BLUE, body, border_radius=radius)
+            pygame.draw.circle(surface, led_color, body.center, max(1, s // 8))
+            return
+
+        # Mounting ears (with screw holes) behind the body, then the body.
+        ears = pygame.Rect(rect.x, body.y + round(body_h * 0.3), rect.width, round(body_h * 0.4))
+        draw_rect(surface, (12, 12, 16), body.move(0, max(1, s // 50)).union(ears.move(0, max(1, s // 50))),
+                         border_radius=radius)                                  # shadow
+        draw_rect(surface, shade(SERVO_BLUE, 0.72), ears, border_radius=radius)
+        hole = max(1, round(ears.height * 0.17))
+        for hx in (ears.x + round(s * 0.035), ears.right - round(s * 0.035)):
+            pygame.draw.circle(surface, (18, 18, 24), (hx, ears.centery), hole)
+        draw_rect(surface, SERVO_BLUE, body, border_radius=radius)
+        draw_rect(surface, shade(SERVO_BLUE, 1.25), (body.x + radius, body.y + 1, body.width - 2 * radius,
+                                                            max(1, body_h // 14)))          # top shine
+        draw_rect(surface, shade(SERVO_BLUE, 0.5), body, width=max(1, s // 90), border_radius=radius)
+
+        # Shaft (on the round raised part of the case), the 0–180° scale, and the horn.
+        # The shaft sits on the body's top edge, so the whole scale arcs above the body.
+        shaft = (body.x + round(body.width * 0.3), body.y + max(1, body_h // 16))
+        pygame.draw.circle(surface, shade(SERVO_BLUE, 0.85), shaft, round(body_h * 0.28))
+        reach = min(rect.height * 0.42, shaft[0] - rect.x - s * 0.03, shaft[1] - rect.y - s * 0.07)
+        for deg in range(0, 181, 15):
+            a = math.radians(deg)
+            d = (-math.cos(a), -math.sin(a))
+            major = deg % 45 == 0
+            r0 = reach * (0.86 if major else 0.92)
+            pygame.draw.line(surface, (110, 112, 128) if major else (70, 72, 84),
+                             (shaft[0] + d[0] * r0, shaft[1] + d[1] * r0),
+                             (shaft[0] + d[0] * reach, shaft[1] + d[1] * reach), max(1, s // 110))
+        size = round(s * 0.05)
+        if size >= 8:
+            font = get_font(size, "bahnschrift")
+            for deg, at in ((0, 14), (90, 90), (180, 166)):     # 0 and 180 lifted off the body's edge
+                a = math.radians(at)
+                ts = font.render(str(deg), True, (120, 122, 138))
+                pos = (shaft[0] - math.cos(a) * reach * 1.12, shaft[1] - math.sin(a) * reach * 1.12)
+                surface.blit(ts, ts.get_rect(center=(round(pos[0]), round(pos[1]))))
+
+        angle = 90.0 if self._shown is None else self._shown
+        a = math.radians(angle)
+        d = (-math.cos(a), -math.sin(a))
+        horn_w = max(3, round(s * 0.05))
+        length = reach * 0.78
+        tip = (shaft[0] + d[0] * length, shaft[1] + d[1] * length)
+        back = (shaft[0] - d[0] * length * 0.22, shaft[1] - d[1] * length * 0.22)
+        pygame.draw.line(surface, (20, 20, 26), (back[0] + 2, back[1] + 3), (tip[0] + 2, tip[1] + 3), horn_w)  # shadow
+        pygame.draw.line(surface, SERVO_HORN, back, tip, horn_w)
+        for end in (back, tip):
+            pygame.draw.circle(surface, SERVO_HORN, (round(end[0]), round(end[1])), horn_w // 2)
+        for k in range(1, 5):                                       # the horn's holes
+            f = 0.2 + 0.19 * k
+            pygame.draw.circle(surface, (150, 150, 160),
+                               (round(shaft[0] + d[0] * length * f), round(shaft[1] + d[1] * length * f)),
+                               max(1, horn_w // 5))
+        pygame.draw.circle(surface, SERVO_HORN, shaft, round(horn_w * 0.95))
+        pygame.draw.circle(surface, (120, 120, 132), shaft, max(1, horn_w // 3))  # screw
+
+        # Name, angle and status on the body's right side; the status light in its corner.
+        pad = max(2, round(body_h * 0.1))
+        led_r = max(2, s // 45)
+        led = (body.right - pad - led_r, body.y + pad + led_r)
+        if status in ("ok", "starting", "error", "missing"):
+            pygame.draw.circle(surface, shade(led_color, 0.4), led, round(led_r * 1.8))
+        pygame.draw.circle(surface, led_color, led, led_r)
+        text_x = body.x + round(body.width * 0.52)
+        room = led[0] - led_r * 2 - text_x
+        set_angle = self.set_angle()
+        lines = [(self.text or self.device or "servo", round(body_h * 0.2), (236, 240, 255)),
+                 ("—" if set_angle is None else f"{set_angle:.0f}°", round(body_h * 0.3), (255, 255, 255)),
+                 (DEVICE_STATUS_TEXT.get(status, status) if status != "ok" else
+                  (self.info() or {}).get("options", {}).get("port", self.port), round(body_h * 0.15),
+                  shade(led_color, 1.1) if status != "ok" else (190, 205, 240))]
+        y = body.y + pad
+        for text, size, color in lines:
+            if size >= 8 and room > 10:
+                font = get_font(size, "bahnschrift")
+                surface.blit(font.render(clip_text(text, font, room), True, color), (text_x, y))
+            y += round(size * 1.12)
 
 
 def server_object(scene):
@@ -1344,39 +1559,45 @@ class InstrumentServer(Thing):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._phase = 0.0
-        self._launched = False      # tried launching the server for this Connect?
 
     # --- Connection -------------------------------------------------------------
     def state(self):
-        if not self.connect:
-            return "off"
-        return "connected" if instruments.client.connected else "connecting"
+        """The link as a whole (this object or any device may have opened it)."""
+        client = instruments.client
+        if client.connected:
+            return "connected"
+        return "connecting" if client.enabled else "off"
 
     def tick(self, dt):
         self._phase += dt
-        client = instruments.client
-        client.enabled = self.connect             # this object is the on/off switch
-        if self.connect and not client.connected and not self._launched:
-            self._launched = True
-            if not instruments.server_running():
-                instruments.start_server()
+        instruments.client.want(self.id, self.connect)
 
     def on_removed(self):
-        instruments.client.enabled = False        # no server object: nothing connects
+        instruments.client.want(self.id, False)
 
     def connect_now(self, app):
-        self.connect, self._launched = True, False
+        self.connect = True
+        instruments.client.want(self.id, True)
+        instruments.client.retry_launch()
+        app.save()
+
+    def _all_off(self, app):
+        """Master off: this and every device stop wanting the link."""
+        self.connect = False
+        instruments.client.want(self.id, False)
+        for o in app.scene.objects:
+            if isinstance(o, Device):
+                o.connect = False
+                instruments.client.want(o.id, False)
         app.save()
 
     def disconnect(self, app):
-        self.connect = False
-        app.save()
+        self._all_off(app)
 
     def stop_server(self, app):
         def stop():
             instruments.client.send({"op": "shutdown"})
-            self.connect = False                  # after the shutdown goes out, stay off
-            app.save()
+            self._all_off(app)                    # otherwise a device would relaunch it
         app.confirm("Stop the instrument server?", "Its devices will be closed.", stop)
 
     # --- Devices & drivers --------------------------------------------------------
@@ -1391,7 +1612,7 @@ class InstrumentServer(Thing):
 
         def make(x, y):
             obj = cls(x, y)
-            obj.device = name
+            obj.device, obj.connect = name, True
             return obj
         app.start_placing(make)
 
@@ -1443,9 +1664,9 @@ class InstrumentServer(Thing):
         return rows + [Gap(6)] + self.prop_rows()
 
     def buttons(self, app):
-        if not self.connect:
+        if not instruments.client.enabled:
             return [Btn("Connect", self.connect_now, style="go")]
-        out = [Btn("Disconnect", self.disconnect)]
+        out = [Btn("Disconnect all", self.disconnect)]
         if instruments.client.connected:
             out.append(Btn("Stop server", self.stop_server))
         return out

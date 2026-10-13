@@ -19,12 +19,14 @@ Protocol: JSON, one object per line, both ways.
     {"op": "set", "device": "arduino", "param": "angle", "value": 120}
     {"op": "add_device", "name": "arm", "driver": "fake_arduino", "options": {"port": "COM4"}}
     {"op": "remove_device", "name": "arm"}
+    {"op": "configure_device", "name": "servo", "options": {"port": "COM11"}}   (restarts it)
     {"op": "shutdown"}                                -> closes every device and exits
   server -> client
     {"op": "catalog", "devices": [{name, driver, status, message,
                                    params: {angle: {min, max, unit, value}},
-                                   readings: {position: {unit}}, values: {...}}],
-                      "drivers": [{module, title, params: [...], readings: [...], error}]}
+                                   readings: {position: {unit}}, values: {...}, options}],
+                      "drivers": [{module, title, params: [...], readings: [...], error}],
+                      "ports": [{device: "COM11", description, arduino: true}]}
     {"op": "readings", "device": ..., "values": {"position": 87.3, ...}}   (each poll)
     {"op": "param", "device": ..., "param": ..., "value": ...}           (after a set)
     {"op": "status", "device": ..., "status": "ok"|"starting"|"error", "message": ...}
@@ -68,6 +70,16 @@ def load_driver_module(name):
     return importlib.reload(module)     # pick up edits every time
 
 
+def list_ports():
+    """The serial ports on this PC (empty if pyserial isn't installed)."""
+    try:
+        from serial.tools import list_ports as lp
+    except ImportError:
+        return []
+    return [{"device": p.device, "description": p.description,
+             "arduino": p.vid in (0x2341, 0x2A03)} for p in sorted(lp.comports(), key=lambda p: p.device)]
+
+
 def list_drivers():
     """Every driver module in drivers/ (not base.py), described for the canvas."""
     out = []
@@ -97,6 +109,7 @@ class DeviceRunner:
         self.name, self.driver_name, self.options = name, driver, options or {}
         self.server = server
         self.driver = None
+        self.driver_values = None         # param values to start from (kept across restarts)
         self.status, self.message = "starting", ""
         self.values = {}                  # latest readings
         self._pending = {}                # param -> newest requested value
@@ -114,7 +127,7 @@ class DeviceRunner:
             for pname, p in cls.params.items():
                 params[pname] = dict(p.describe(), value=self.driver.values.get(pname))
         return {"name": self.name, "driver": self.driver_name, "status": self.status,
-                "message": self.message, "params": params,
+                "message": self.message, "params": params, "options": dict(self.options),
                 "readings": {r: spec.describe() for r, spec in cls.readings.items()} if cls else {},
                 "values": dict(self.values)}
 
@@ -142,7 +155,12 @@ class DeviceRunner:
         while not self._stop.is_set():
             try:
                 self._set_status("starting")
+                if self.driver is not None:       # a retry: keep the last values (no jump to defaults)
+                    self.driver_values = dict(self.driver.values)
                 self.driver = load_driver_module(self.driver_name).DRIVER(**self.options)
+                if self.driver_values:
+                    self.driver.values.update({k: v for k, v in self.driver_values.items()
+                                               if k in self.driver.params})
                 self.driver.open()
                 self._set_status("ok")
                 self.server.broadcast_catalog()      # params/readings are known now
@@ -200,7 +218,7 @@ class Server:
 
     def catalog(self):
         return {"op": "catalog", "devices": [r.describe() for r in self.devices.values()],
-                "drivers": list_drivers()}
+                "drivers": list_drivers(), "ports": list_ports()}
 
     def broadcast(self, message):
         with self._clients_lock:
@@ -281,6 +299,18 @@ class Server:
                 self.save_config()
                 log(f"removed {runner.name}")
                 self.broadcast_catalog()
+            elif op == "configure_device":
+                old = self.devices.get(msg.get("name"))
+                if old is None:
+                    raise ValueError(f"no device {msg.get('name')!r}")
+                old.stop()
+                options = dict(old.options, **(msg.get("options") or {}))
+                runner = DeviceRunner(old.name, old.driver_name, options, self)
+                runner.driver_values = dict(old.driver.values) if old.driver else None
+                self.start_device(runner)
+                self.save_config()
+                log(f"reconfigured {old.name}: {options}")
+                self.broadcast_catalog()
             elif op == "shutdown":
                 log("shutting down (asked by a client)")
                 for runner in self.devices.values():
@@ -310,11 +340,10 @@ class Server:
 
 
 def load_config():
-    if not os.path.exists(CONFIG):
-        config = {"devices": [{"name": "arduino", "driver": "fake_arduino", "options": {"port": "COM3"}}]}
+    if not os.path.exists(CONFIG):                 # none yet: start empty (canvas objects add devices)
         with open(CONFIG, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
-        log("created devices.json with a fake Arduino")
+            json.dump({"devices": []}, f, indent=2)
+        log("created an empty devices.json")
     with open(CONFIG, "r", encoding="utf-8") as f:
         return json.load(f)
 

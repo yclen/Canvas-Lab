@@ -3,9 +3,9 @@
 The server (instrument_server.py) runs the device drivers in its own process;
 this module keeps a connection to it on a background thread, so the canvas
 never waits on hardware:
-- it only connects while `client.enabled` is on (the Instrument server
-  object's Connect / Disconnect), and then reconnects every second whenever
-  the server isn't up,
+- it only connects while some object wants it to (`client.want(key, True)` —
+  a device's or the Instrument server's Connect), launching the server once if
+  nothing is listening, and then reconnects every second whenever it's down,
 - `client.set(device, param, value)` queues a value — only the newest per
   (device, param) is kept, and they go out at most SEND_HZ times a second, so
   a dragged slider can't flood a slow serial line,
@@ -36,9 +36,11 @@ SERVER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "instru
 
 class InstrumentClient:
     def __init__(self):
-        self.enabled = False            # connect at all? (the Instrument server object decides)
+        self._wants = set()             # keys (object ids) that want the connection open
+        self._launch_tried = False      # launched the server for the current want?
         self.connected = False
         self.drivers = []               # driver modules the server offers (from the catalog)
+        self.ports = []                 # serial ports on this PC: {device, description, arduino}
         self.last_error = ""            # the server's last complaint (e.g. a duplicate name)
         self._devices = {}              # name -> catalog entry (+ live "values")
         self._pending = {}              # (device, param) -> newest value to send
@@ -48,6 +50,28 @@ class InstrumentClient:
         self._thread = None
 
     # --- Used by the canvas (main thread) ---------------------------------------
+    @property
+    def enabled(self):
+        """Connect at all? True while anything wants the connection."""
+        return bool(self._wants)
+
+    @enabled.setter
+    def enabled(self, on):               # a plain on/off switch (scripts, tests)
+        self.want("manual", on)
+
+    def want(self, key, on):
+        """Say whether `key` (e.g. an object's id) wants the connection open."""
+        if on:
+            if not self._wants:
+                self._launch_tried = False   # a fresh Connect may launch the server
+            self._wants.add(key)
+        else:
+            self._wants.discard(key)
+
+    def retry_launch(self):
+        """Allow launching the server again (a Connect button was pressed)."""
+        self._launch_tried = False
+
     def start(self):
         if self._thread is None:
             self._thread = threading.Thread(target=self._run, name="instruments", daemon=True)
@@ -103,7 +127,10 @@ class InstrumentClient:
                     self.connected = True
                     self._serve(sock)
             except (OSError, ValueError):
-                pass
+                if self.enabled and not self.connected and not self._launch_tried:
+                    self._launch_tried = True        # nothing listening: start it (once)
+                    if not server_running():
+                        start_server()
             self.connected = False
             if self.enabled:
                 time.sleep(RECONNECT_SECONDS)
@@ -145,6 +172,7 @@ class InstrumentClient:
             if op == "catalog":
                 self._devices = {d["name"]: d for d in msg["devices"]}
                 self.drivers = msg.get("drivers", [])
+                self.ports = msg.get("ports", [])
                 return
             if op == "error":
                 self.last_error = msg.get("message", "")
