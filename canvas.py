@@ -143,15 +143,22 @@ def _make_cached_font(path, size, bold, italic):
     return font
 
 
+def font_px(size):
+    """The pixel size get_font actually uses for `size`: exact up to
+    FONT_EXACT_MAX, above that snapped to ~5% steps, so a zoom reuses fonts
+    and renders instead of making new ones every frame. Key text caches on it."""
+    size = max(1, int(size))
+    if size > FONT_EXACT_MAX:
+        step = 1.05
+        size = round(FONT_EXACT_MAX * step ** round(math.log(size / FONT_EXACT_MAX, step)))
+    return size
+
+
 def get_font(size, name=None, bold=False):
     """A cached font: pygame's default, or a system font by name ("georgia",
     "bahnschrift", …). A name that isn't installed falls back to the default.
     Fonts remember their renders (see CachedFont)."""
-    size = max(1, int(size))
-    if size > FONT_EXACT_MAX:               # big text (zoomed in): snap to ~5% steps, so a
-        step = 1.05                         # zoom reuses fonts + renders instead of making new ones
-        size = round(FONT_EXACT_MAX * step ** round(math.log(size / FONT_EXACT_MAX, step)))
-    key = (size, name, bold)
+    key = (font_px(size), name, bold)
     font = _font_cache.pop(key, None)       # re-inserted below: the dict stays in use order
     if font is None:
         if len(_font_cache) >= FONT_CACHE_MAX:
@@ -159,6 +166,95 @@ def get_font(size, name=None, bold=False):
         font = pygame.font.SysFont(name, key[0], bold=bold, constructor=_make_cached_font)
     _font_cache[key] = font
     return font
+
+
+# ============================================================================
+# DRAWING — pygame.draw stand-ins that stay fast when zoomed far in
+# ============================================================================
+# pygame draws rounded corners and thick arcs without skipping what's off
+# screen, so their cost grows with their size: a rounded rect 20,000 px across
+# takes ~40 ms, 200,000 px ~4 s — and zoomed into an object, its shapes get
+# that big. These build big curves out of polygons (which pygame clips
+# cheaply) and only curve the corners that are on screen. Small shapes go
+# straight to pygame, so they look exactly as before.
+BIG_CURVE_PX = 48           # radii above this are drawn as polygons
+
+
+def _arc_points(cx, cy, rx, ry, a0, a1):
+    """Points along an ellipse from angle a0 to a1 (radians, in screen
+    coordinates: y points down, so increasing angles run clockwise). Enough
+    of them that the straight pieces stay within ~½ px of the true curve."""
+    steps = max(2, min(1200, math.ceil(0.9 * math.sqrt(max(rx, ry)) * abs(a1 - a0) / (math.pi / 2))))
+    return [(cx + rx * math.cos(a0 + (a1 - a0) * k / steps),
+             cy + ry * math.sin(a0 + (a1 - a0) * k / steps)) for k in range(steps + 1)]
+
+
+def draw_rect(surface, color, rect, width=0, border_radius=0):
+    """pygame.draw.rect, except that big rounded corners don't stall the frame."""
+    rect = pygame.Rect(rect)
+    r = min(border_radius, rect.width // 2, rect.height // 2)
+    if r <= BIG_CURVE_PX or width < 0:
+        return pygame.draw.rect(surface, color, rect, width, border_radius)
+    view = surface.get_clip()
+    if not rect.colliderect(view):
+        return pygame.Rect(rect.topleft, (0, 0))
+    x0, y0, x1, y1 = rect.left, rect.top, rect.right - 1, rect.bottom - 1
+    corners = (   # (arc center, start angle, the square corner it rounds off, that corner's box)
+        ((x0 + r, y0 + r), math.pi, (x0, y0), pygame.Rect(x0, y0, r, r)),
+        ((x1 - r, y0 + r), math.pi * 1.5, (x1, y0), pygame.Rect(x1 - r + 1, y0, r, r)),
+        ((x1 - r, y1 - r), 0.0, (x1, y1), pygame.Rect(x1 - r + 1, y1 - r + 1, r, r)),
+        ((x0 + r, y1 - r), math.pi * 0.5, (x0, y1), pygame.Rect(x0, y1 - r + 1, r, r)),
+    )
+    if width == 0 or 2 * width >= min(rect.size):          # filled: one polygon
+        points = []
+        for (cx, cy), a0, square, box in corners:
+            if box.colliderect(view):
+                points += _arc_points(cx, cy, r, r, a0, a0 + math.pi / 2)
+            else:
+                points.append(square)       # off screen: its curve can't be seen anyway
+        return pygame.draw.polygon(surface, color, points)
+    # Border: four straight bands, plus a curved band at each visible corner.
+    w = width
+    pygame.draw.rect(surface, color, (x0 + r, y0, rect.width - 2 * r, w))
+    pygame.draw.rect(surface, color, (x0 + r, rect.bottom - w, rect.width - 2 * r, w))
+    pygame.draw.rect(surface, color, (x0, y0 + r, w, rect.height - 2 * r))
+    pygame.draw.rect(surface, color, (rect.right - w, y0 + r, w, rect.height - 2 * r))
+    for (cx, cy), a0, _square, box in corners:
+        if box.colliderect(view):
+            outer = _arc_points(cx, cy, r, r, a0, a0 + math.pi / 2)
+            ri = r - w + 1                  # +1: polygons include their edge pixels
+            inner = _arc_points(cx, cy, ri, ri, a0 + math.pi / 2, a0) if ri > 0 else [(cx, cy)]
+            pygame.draw.polygon(surface, color, outer + inner)
+    return rect.clip(view)
+
+
+def draw_arc(surface, color, rect, start_angle, stop_angle, width=1):
+    """pygame.draw.arc (radians, counterclockwise from 3 o'clock), except that
+    big thick arcs don't stall the frame."""
+    rect = pygame.Rect(rect)
+    rx, ry = rect.width / 2, rect.height / 2
+    if max(rx, ry) <= BIG_CURVE_PX or width < 1:
+        return pygame.draw.arc(surface, color, rect, start_angle, stop_angle, width)
+    if not rect.colliderect(surface.get_clip()):
+        return pygame.Rect(rect.center, (0, 0))
+    if stop_angle < start_angle:
+        stop_angle += 2 * math.pi
+    cx, cy = rect.center
+    # pygame measures angles counterclockwise; screen y points down, so negate.
+    outer = _arc_points(cx, cy, rx, ry, -start_angle, -stop_angle)
+    inner = _arc_points(cx, cy, max(0, rx - width), max(0, ry - width), -stop_angle, -start_angle)
+    return pygame.draw.polygon(surface, color, outer + inner)
+
+
+def alpha_layer(surface, rect):
+    """A clear see-through layer covering just the on-screen part of `rect` —
+    one the full size of a zoomed-in glow would be huge. Returns (layer, area):
+    draw on the layer with shapes moved by (-area.x, -area.y), then
+    `surface.blit(layer, area)`. (None, None) when none of `rect` shows."""
+    area = pygame.Rect(rect).clip(surface.get_clip())
+    if area.width <= 0 or area.height <= 0:
+        return None, None
+    return pygame.Surface(area.size, pygame.SRCALPHA), area
 
 
 def read_clipboard():
@@ -709,10 +805,10 @@ def draw_box(surface, rect, text, font, *, base_color, hover_color, click_color,
     """Shared boxed-face rendering for Button/NameTag: selection ring → border →
     state-colored face → centered text. The one place that layering lives."""
     if is_selected:
-        pygame.draw.rect(surface, SELECTION_COLOR, rect.inflate(14, 14),
-                         width=3, border_radius=10)
+        draw_rect(surface, SELECTION_COLOR, rect.inflate(14, 14),
+                  width=3, border_radius=10)
 
-    pygame.draw.rect(surface, border_color, rect.inflate(6, 6), border_radius=8)
+    draw_rect(surface, border_color, rect.inflate(6, 6), border_radius=8)
 
     if is_clicked:
         face_color, inner_rect = click_color, rect.inflate(-4, -4)
@@ -720,7 +816,7 @@ def draw_box(surface, rect, text, font, *, base_color, hover_color, click_color,
         face_color, inner_rect = hover_color, rect
     else:
         face_color, inner_rect = base_color, rect
-    pygame.draw.rect(surface, face_color, inner_rect, border_radius=6)
+    draw_rect(surface, face_color, inner_rect, border_radius=6)
 
     text_surf = font.render(text, True, text_color)
     surface.blit(text_surf, text_surf.get_rect(center=inner_rect.center))
@@ -880,7 +976,7 @@ class Button(Node):
         rect = self.screen_rect(camera)
         if camera.zoom <= BUTTON_MIN_SCALE:
             # LOD: too small to read — just a dot, which can shrink to 1px.
-            pygame.draw.rect(surface, BUTTON_BORDER, rect)
+            draw_rect(surface, BUTTON_BORDER, rect)
             return
         font = get_font(round(BUTTON_BASE_FONT_SIZE * camera.zoom))
         draw_box(surface, rect, self.text, font,
@@ -971,8 +1067,8 @@ class Train(CanvasObject):
         t = max(3, w // 12)
         pts = [(w * 0.18, h * 0.82), (w * 0.18, h * 0.32), (w * 0.72, h * 0.32)]
         for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
-            pygame.draw.rect(surface, TRAIN_COLOR,
-                             (min(x1, x2) - t / 2, min(y1, y2) - t / 2, abs(x2 - x1) + t, abs(y2 - y1) + t))
+            draw_rect(surface, TRAIN_COLOR,
+                      (min(x1, x2) - t / 2, min(y1, y2) - t / 2, abs(x2 - x1) + t, abs(y2 - y1) + t))
         arrow = pygame.Rect(0, 0, w // 3, w // 3)
         arrow.center = (round(w * 0.72), round(h * 0.32))
         cls._draw_arrow(surface, arrow, pygame.Vector2(1, 0))
@@ -1121,9 +1217,9 @@ class Train(CanvasObject):
         # the overlaps at turns form perfectly square corners.
         if self.is_selected:
             for r in self._segment_rects(camera, pad=5):
-                pygame.draw.rect(surface, TRAIN_SELECT_COLOR, r)
+                draw_rect(surface, TRAIN_SELECT_COLOR, r)
         for r in self._segment_rects(camera):
-            pygame.draw.rect(surface, TRAIN_COLOR, r)
+            draw_rect(surface, TRAIN_COLOR, r)
         for rect, direction, _t in self._arrows(camera):
             self._draw_arrow(surface, rect, direction)
 
@@ -1131,8 +1227,8 @@ class Train(CanvasObject):
     def _draw_arrow(surface, rect, direction):
         if rect.width < ARROW_MIN_PX:
             return
-        pygame.draw.rect(surface, TRAIN_COLOR, rect)
-        pygame.draw.rect(surface, ARROW_FILL, rect, width=max(1, rect.width // 12))
+        draw_rect(surface, TRAIN_COLOR, rect)
+        draw_rect(surface, ARROW_FILL, rect, width=max(1, rect.width // 12))
 
         cx, cy = rect.center
         size = rect.width
@@ -1155,7 +1251,7 @@ class Train(CanvasObject):
             shaft = pygame.Rect(0, 0, shaft_half * 2, abs(base - (cy - dyn * half)))
             shaft.center = (cx, (base + (cy - dyn * half)) / 2)
             head = [(cx, tip), (cx - head_half, base), (cx + head_half, base)]
-        pygame.draw.rect(surface, ARROW_FILL, shaft)
+        draw_rect(surface, ARROW_FILL, shaft)
         pygame.draw.polygon(surface, ARROW_FILL, head)
 
     def to_dict(self):
@@ -1203,10 +1299,10 @@ class Wall(CanvasObject):
     def draw_icon(cls, surface):
         w, h = surface.get_size()
         box = pygame.Rect(w * 0.1, h * 0.28, w * 0.8, h * 0.6)
-        pygame.draw.rect(surface, WALL_COLOR, box, width=max(2, w // 20), border_radius=6)
+        draw_rect(surface, WALL_COLOR, box, width=max(2, w // 20), border_radius=6)
         tag = pygame.Rect(box.x, box.y - h * 0.18, w * 0.42, h * 0.18)
-        pygame.draw.rect(surface, (45, 45, 55), tag, border_radius=3)
-        pygame.draw.rect(surface, WALL_COLOR, tag, width=2, border_radius=3)
+        draw_rect(surface, (45, 45, 55), tag, border_radius=3)
+        draw_rect(surface, WALL_COLOR, tag, width=2, border_radius=3)
 
     def __init__(self, x, y, w, h, name="", *, id=None, color=None):
         super().__init__(id=id)
@@ -1271,15 +1367,15 @@ class Wall(CanvasObject):
         r = self.screen_rect(camera)
         border = max(1, round(WALL_WORLD_BORDER * camera.zoom))
         if self.is_selected:
-            pygame.draw.rect(surface, WALL_SELECT_COLOR,
-                             r.inflate(border * 2, border * 2),
-                             width=max(1, border), border_radius=8)
-        pygame.draw.rect(surface, self.color, r, width=border, border_radius=8)
+            draw_rect(surface, WALL_SELECT_COLOR,
+                      r.inflate(border * 2, border * 2),
+                      width=max(1, border), border_radius=8)
+        draw_rect(surface, self.color, r, width=border, border_radius=8)
 
         title = self._title_rect(camera)
         if title is not None:
-            pygame.draw.rect(surface, (45, 45, 55), title, border_radius=6)
-            pygame.draw.rect(surface, self.color, title, width=2, border_radius=6)
+            draw_rect(surface, (45, 45, 55), title, border_radius=6)
+            draw_rect(surface, self.color, title, width=2, border_radius=6)
             ts = get_font(WALL_TITLE_FONT_SIZE).render(self._text, True, self.color)
             surface.blit(ts, ts.get_rect(center=title.center))
 
@@ -1333,17 +1429,17 @@ class Thing(Node):
     def draw(self, surface, camera):
         rect = self.screen_rect(camera)
         if self.is_selected:
-            pygame.draw.rect(surface, SELECTION_COLOR, rect.inflate(12, 12),
-                             width=3, border_radius=max(2, min(rect.size) // 8) + 4)
+            draw_rect(surface, SELECTION_COLOR, rect.inflate(12, 12),
+                      width=3, border_radius=max(2, min(rect.size) // 8) + 4)
         if max(rect.size) <= THING_DOT_PX:
-            pygame.draw.rect(surface, self.DOT_COLOR, rect)
+            draw_rect(surface, self.DOT_COLOR, rect)
             return
         self.draw_shape(surface, rect, camera)
 
     def draw_shape(self, surface, rect, camera):
         """Draw the object into `rect` (its on-screen box, already scaled by
         the zoom). Default: a plain rounded box."""
-        pygame.draw.rect(surface, self.DOT_COLOR, rect, border_radius=max(2, rect.width // 8))
+        draw_rect(surface, self.DOT_COLOR, rect, border_radius=max(2, rect.width // 8))
 
 
 # ---- Agent: a little critter that wanders inside its wall ------------------
@@ -1417,7 +1513,7 @@ class Agent(Thing):
                 self.world_center += to.normalize() * step
 
     def draw_shape(self, surface, rect, camera):
-        pygame.draw.rect(surface, AGENT_COLOR, rect, border_radius=max(2, rect.width // 8))
+        draw_rect(surface, AGENT_COLOR, rect, border_radius=max(2, rect.width // 8))
         ew, eh = max(2, rect.width // 6), max(2, rect.height // 3)
         ey = rect.centery - rect.height // 14
         for ex in (rect.centerx - rect.width // 6, rect.centerx + rect.width // 6):
@@ -1619,7 +1715,7 @@ class Neuron(Agent):
 
     def draw_shape(self, surface, rect, camera):
         body = NEURON_FIRE_COLOR if self.is_firing else NEURON_COLOR
-        pygame.draw.rect(surface, body, rect, border_radius=max(2, rect.width // 8))
+        draw_rect(surface, body, rect, border_radius=max(2, rect.width // 8))
         spot = pygame.Rect(0, 0, max(2, rect.width // 6), max(2, rect.height // 3))
         spot.center = rect.center                      # same proportions as an agent eye
         pygame.draw.ellipse(surface, NEURON_SPOT, spot)

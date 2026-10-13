@@ -36,10 +36,12 @@ See "Adding an object type" in DESIGN.md.
 
 import math
 
+import numpy as np
 import pygame
 
 import instruments
-from canvas import (OBJECT_TYPES, WARN_COLOR, Btn, Field, Gap, Prop, Row, Thing, clip_text,
+from canvas import (OBJECT_TYPES, WARN_COLOR, Btn, Field, Gap, Prop, Row, Thing, alpha_layer,
+                    clip_text, draw_arc, draw_rect, font_px,
                     get_font, panel_button, run_action)
 
 
@@ -86,10 +88,10 @@ class Lamp(Thing):
         if self.on:
             glow = 0.75 + 0.25 * math.sin(self.phase * 2 * math.pi)
             halo = rect.inflate(rect.width, rect.height)
-            if halo.width < 2000:         # skip the halo when zoomed way in (huge surface)
-                layer = pygame.Surface(halo.size, pygame.SRCALPHA)
-                pygame.draw.ellipse(layer, (*self.color, int(70 * glow)), layer.get_rect())
-                surface.blit(layer, halo.topleft)
+            layer, area = alpha_layer(surface, halo)      # just the part on screen
+            if layer is not None:
+                pygame.draw.ellipse(layer, (*self.color, int(70 * glow)), halo.move(-area.x, -area.y))
+                surface.blit(layer, area)
             body = tuple(int(c * glow) for c in self.color)
         else:
             body = (70, 70, 78)
@@ -173,13 +175,13 @@ class Input(Thing):
     def draw_shape(self, surface, rect, camera):
         s = min(rect.width, rect.height)
         radius = max(2, s // 6)
-        pygame.draw.rect(surface, (14, 14, 18), rect.move(0, max(1, s // 22)),
-                         border_radius=radius)                      # drop shadow
-        pygame.draw.rect(surface, INPUT_HOUSING, rect, border_radius=radius)
-        pygame.draw.rect(surface, shade(INPUT_HOUSING, 1.35), rect,
-                         width=max(1, s // 40), border_radius=radius)   # housing edge
+        draw_rect(surface, (14, 14, 18), rect.move(0, max(1, s // 22)),
+                  border_radius=radius)                      # drop shadow
+        draw_rect(surface, INPUT_HOUSING, rect, border_radius=radius)
+        draw_rect(surface, shade(INPUT_HOUSING, 1.35), rect,
+                  width=max(1, s // 40), border_radius=radius)   # housing edge
         well = self.well_rect(rect)
-        pygame.draw.rect(surface, INPUT_WELL, well, border_radius=max(2, radius - 2))
+        draw_rect(surface, INPUT_WELL, well, border_radius=max(2, radius - 2))
         self.draw_face(surface, well, camera)
 
     def draw_face(self, surface, well, camera):
@@ -213,16 +215,16 @@ class PushButton(Input):
             face_color = shade(self.color, 1.15) if self.is_hovered else self.color
 
         if self.is_hovered and not self.pressed:     # soft glow around the well
-            pygame.draw.rect(surface, shade(self.color, 0.9), well.inflate(4, 4),
-                             width=max(1, s // 30), border_radius=radius + 3)
-        pygame.draw.rect(surface, shade(self.color, 0.5), side, border_radius=radius)   # cap's side
-        pygame.draw.rect(surface, face_color, face, border_radius=radius)               # cap's top
+            draw_rect(surface, shade(self.color, 0.9), well.inflate(4, 4),
+                      width=max(1, s // 30), border_radius=radius + 3)
+        draw_rect(surface, shade(self.color, 0.5), side, border_radius=radius)   # cap's side
+        draw_rect(surface, face_color, face, border_radius=radius)               # cap's top
         if not self.pressed:                                                            # gloss
             gloss = pygame.Rect(0, 0, round(face.width * 0.7), max(1, round(face.height * 0.16)))
             gloss.midtop = (face.centerx, face.y + max(1, round(face.height * 0.1)))
-            pygame.draw.rect(surface, shade(face_color, 1.3), gloss, border_radius=max(1, gloss.height // 2))
-        pygame.draw.rect(surface, shade(self.color, 0.4), face,
-                         width=max(1, s // 45), border_radius=radius)                   # cap outline
+            draw_rect(surface, shade(face_color, 1.3), gloss, border_radius=max(1, gloss.height // 2))
+        draw_rect(surface, shade(self.color, 0.4), face,
+                  width=max(1, s // 45), border_radius=radius)                   # cap outline
 
         if self.text:                                  # name printed on the cap, if it fits
             size = round(face.height * 0.32)
@@ -280,13 +282,13 @@ class Switch(Input):
         track = well.inflate(-max(2, round(h * 0.14)), -max(2, round(h * 0.14)))
         tr = track.height // 2
         on_color = self.color if not self.is_hovered else shade(self.color, 1.12)
-        pygame.draw.rect(surface, (40, 40, 48), track, border_radius=tr)
+        draw_rect(surface, (40, 40, 48), track, border_radius=tr)
         if knob_at > 0:             # the color fills in behind the knob as it slides on
             fill = track.copy()
             fill.width = round(track.height + (track.width - track.height) * knob_at)
-            pygame.draw.rect(surface, on_color if knob_at > 0.5 else shade(on_color, 0.6),
-                             fill, border_radius=tr)
-        pygame.draw.rect(surface, (12, 12, 15), track, width=max(1, h // 25), border_radius=tr)
+            draw_rect(surface, on_color if knob_at > 0.5 else shade(on_color, 0.6),
+                      fill, border_radius=tr)
+        draw_rect(surface, (12, 12, 15), track, width=max(1, h // 25), border_radius=tr)
 
         # The knob's spot (drawn last, on top).
         inset = max(1, round(track.height * 0.1))
@@ -314,12 +316,12 @@ class Switch(Input):
         base = (235, 235, 240) if not self.is_hovered else (250, 250, 255)
         if self.pressed:
             base = shade(base, 0.85)
-        pygame.draw.rect(surface, (120, 120, 130), knob.move(0, depth), border_radius=kr)  # side
-        pygame.draw.rect(surface, base, knob, border_radius=kr)
+        draw_rect(surface, (120, 120, 130), knob.move(0, depth), border_radius=kr)  # side
+        draw_rect(surface, base, knob, border_radius=kr)
         shine = pygame.Rect(0, 0, round(knob.width * 0.6), max(1, round(knob.height * 0.18)))
         shine.midtop = (knob.centerx, knob.y + max(1, round(knob.height * 0.12)))
-        pygame.draw.rect(surface, (255, 255, 255), shine, border_radius=max(1, shine.height // 2))
-        pygame.draw.rect(surface, (90, 90, 100), knob, width=max(1, h // 30), border_radius=kr)
+        draw_rect(surface, (255, 255, 255), shine, border_radius=max(1, shine.height // 2))
+        draw_rect(surface, (90, 90, 100), knob, width=max(1, h // 30), border_radius=kr)
 
 
 class Slider(Input):
@@ -452,11 +454,11 @@ class Slider(Input):
         # The slot, filled with color from the bottom up to the cap.
         sw = max(2, round(s * 0.12))
         slot = pygame.Rect(cx - sw // 2, top - sw // 2, sw, bottom - top + sw)
-        pygame.draw.rect(surface, (6, 6, 8), slot, border_radius=sw // 2)
+        draw_rect(surface, (6, 6, 8), slot, border_radius=sw // 2)
         level = pygame.Rect(slot.x, cap.centery, sw, slot.bottom - cap.centery)
         if level.height > 0:
             glow = shade(self.color, 1.1) if (self.is_hovered or self._dragging) else self.color
-            pygame.draw.rect(surface, glow, level, border_radius=sw // 2)
+            draw_rect(surface, glow, level, border_radius=sw // 2)
 
         # The cap: raised, with a side, a top shine and a colored grip line.
         depth = max(1, round(cap_h * (0.06 if self._dragging else 0.16)))
@@ -467,22 +469,22 @@ class Slider(Input):
         elif self.is_hovered:
             base = (242, 242, 250)
         radius = max(2, cap_h // 4)
-        pygame.draw.rect(surface, (10, 10, 12), cap.move(0, depth + 1).inflate(2, 0),
-                         border_radius=radius)                                         # shadow
-        pygame.draw.rect(surface, (115, 115, 126), face.move(0, depth), border_radius=radius)  # side
-        pygame.draw.rect(surface, base, face, border_radius=radius)
+        draw_rect(surface, (10, 10, 12), cap.move(0, depth + 1).inflate(2, 0),
+                  border_radius=radius)                                         # shadow
+        draw_rect(surface, (115, 115, 126), face.move(0, depth), border_radius=radius)  # side
+        draw_rect(surface, base, face, border_radius=radius)
         shine = pygame.Rect(0, 0, round(face.width * 0.7), max(1, round(face.height * 0.16)))
         shine.midtop = (face.centerx, face.y + max(1, round(face.height * 0.12)))
-        pygame.draw.rect(surface, (255, 255, 255), shine, border_radius=max(1, shine.height // 2))
+        draw_rect(surface, (255, 255, 255), shine, border_radius=max(1, shine.height // 2))
         grip = pygame.Rect(0, 0, round(face.width * 0.78), max(1, round(face.height * 0.14)))
         grip.center = (face.centerx, face.centery + max(1, face.height // 10))
-        pygame.draw.rect(surface, shade(self.color, 0.9), grip, border_radius=max(1, grip.height // 2))
-        pygame.draw.rect(surface, (80, 80, 92), face, width=max(1, s // 40), border_radius=radius)
+        draw_rect(surface, shade(self.color, 0.9), grip, border_radius=max(1, grip.height // 2))
+        draw_rect(surface, (80, 80, 92), face, width=max(1, s // 40), border_radius=radius)
 
         # Readout: the value in a small dark display.
         corner = max(2, readout.height // 4)
-        pygame.draw.rect(surface, (8, 9, 11), readout, border_radius=corner)
-        pygame.draw.rect(surface, (45, 45, 54), readout, width=1, border_radius=corner)
+        draw_rect(surface, (8, 9, 11), readout, border_radius=corner)
+        draw_rect(surface, (45, 45, 54), readout, width=1, border_radius=corner)
         size = round(readout.height * 0.72)
         text = self.value_text()
         while size >= 8 and get_font(size).size(text)[0] > readout.width - 4:
@@ -646,9 +648,9 @@ def draw_seven_segment(surface, cells, rect, color, ghost, slots):
         lit = SEGMENTS.get(char, "")
         for name, box in seg.items():
             box = pygame.Rect(round(box[0]), round(box[1]), max(1, round(box[2])), max(1, round(box[3])))
-            pygame.draw.rect(surface, color if name in lit else ghost, box, border_radius=r)
+            draw_rect(surface, color if name in lit else ghost, box, border_radius=r)
         dp = pygame.Rect(round(x + cw + gap * 0.5 - t / 2), round(y + ch - t), max(1, round(t)), max(1, round(t)))
-        pygame.draw.rect(surface, color if dot else ghost, dp, border_radius=r)
+        draw_rect(surface, color if dot else ghost, dp, border_radius=r)
 
 
 class Readout(Output):
@@ -680,12 +682,12 @@ class Readout(Output):
     def draw_shape(self, surface, rect, camera):
         s = min(rect.width, rect.height)
         radius = max(2, s // 6)
-        pygame.draw.rect(surface, (14, 14, 18), rect.move(0, max(1, s // 22)), border_radius=radius)
-        pygame.draw.rect(surface, INPUT_HOUSING, rect, border_radius=radius)
-        pygame.draw.rect(surface, shade(INPUT_HOUSING, 1.35), rect, width=max(1, s // 40),
-                         border_radius=radius)
+        draw_rect(surface, (14, 14, 18), rect.move(0, max(1, s // 22)), border_radius=radius)
+        draw_rect(surface, INPUT_HOUSING, rect, border_radius=radius)
+        draw_rect(surface, shade(INPUT_HOUSING, 1.35), rect, width=max(1, s // 40),
+                  border_radius=radius)
         if s < 16:                                      # too small for detail: just a lit screen
-            pygame.draw.rect(surface, shade(self.color, 0.5), rect.inflate(-max(1, s // 3), -max(1, s // 3)))
+            draw_rect(surface, shade(self.color, 0.5), rect.inflate(-max(1, s // 3), -max(1, s // 3)))
             return
 
         bezel = max(2, round(s * 0.12))
@@ -700,9 +702,9 @@ class Readout(Output):
         screen = pygame.Rect(rect.x + bezel, rect.y + top, rect.width - 2 * bezel,
                              max(4, rect.height - top - bezel))
         glass = shade(self.color, 0.07)
-        pygame.draw.rect(surface, glass, screen, border_radius=max(2, radius - 3))
-        pygame.draw.rect(surface, (8, 8, 10), screen, width=max(1, s // 45),
-                         border_radius=max(2, radius - 3))
+        draw_rect(surface, glass, screen, border_radius=max(2, radius - 3))
+        draw_rect(surface, (8, 8, 10), screen, width=max(1, s // 45),
+                  border_radius=max(2, radius - 3))
 
         pad = max(2, round(screen.height * 0.16))
         inner = screen.inflate(-2 * pad, -2 * pad)
@@ -723,9 +725,10 @@ class Readout(Output):
         # glass shine along the top
         shine = pygame.Rect(screen.x + 3, screen.y + 2, screen.width - 6, max(1, screen.height // 10))
         if shine.width > 0:
-            layer = pygame.Surface(shine.size, pygame.SRCALPHA)
-            layer.fill((255, 255, 255, 14))
-            surface.blit(layer, shine.topleft)
+            layer, area = alpha_layer(surface, shine)     # just the part on screen
+            if layer is not None:
+                layer.fill((255, 255, 255, 14))
+                surface.blit(layer, area)
 
 
 # ============================================================================
@@ -740,6 +743,7 @@ LABEL_FONTS = {             # Font choice -> (system font name, bold)
     "Default": (None, False),
 }
 LABEL_MAX_FONT = 480        # don't render bigger than this (px) when zoomed way in
+LABEL_CACHE_PIXELS = 25_000_000   # rendered label text kept for reuse (~100 MB); emptied past this
 
 
 LABEL_STYLES = {            # frame Style -> padding (left, right, top, bottom) as fractions of text height
@@ -754,6 +758,13 @@ LABEL_STYLES = {            # frame Style -> padding (left, right, top, bottom) 
     "underline": (0.1, 0.1, 0.12, 0.38),
 }
 LABEL_EFFECTS = ["flat", "shadow", "raised", "engraved", "3D", "glow"]
+
+
+def _shift_diagonal(a, s):
+    """An [x, y] array moved s px down-right, zeros moved in (for 3D text)."""
+    out = np.zeros_like(a)
+    out[s:, s:] = a[:a.shape[0] - s, :a.shape[1] - s]
+    return out
 
 
 class Label(Thing):
@@ -776,7 +787,8 @@ class Label(Thing):
              Prop("caps", "Spaced capitals", "bool", True),
              Prop("color", "Accent color", "color", (110, 200, 225))]
 
-    _cache = {}             # (text, px, font, caps, color[, "glow"]) -> rendered surface
+    _cache = {}             # (text, px, font, caps, color[, "glow" / "3D"]) -> rendered surface
+    _cache_pixels = 0       # their total size, kept under LABEL_CACHE_PIXELS
 
     @classmethod
     def create(cls, app):
@@ -812,6 +824,7 @@ class Label(Thing):
     def _render_text(self, px, color):
         """The text as a surface at font size px (letter-spaced when caps is on),
         cached so it's only rebuilt when something about it changes."""
+        px = font_px(px)                    # the size get_font really uses, so a zoom hits the cache
         key = (self.shown_text(), px, self.font, self.caps, color)
         surf = Label._cache.get(key)
         if surf is None:
@@ -835,6 +848,7 @@ class Label(Thing):
         """A soft blurred copy of the text (shrink then grow back), on black so
         it can be added onto the canvas (black adds nothing), padded so the blur
         has room to spread."""
+        px = font_px(px)
         key = (self.shown_text(), px, self.font, self.caps, color, "glow")
         surf = Label._cache.get(key)
         if surf is None:
@@ -849,11 +863,53 @@ class Label(Thing):
             self._remember(key, surf)
         return surf
 
+    def _render_3d(self, px, accent):
+        """The extruded sides of 3D text — the text repeated `steps` times, each
+        copy 1 px further down-right and darker — as one cached surface; blit it
+        1 px down-right of the text. Built with numpy in one pass (stacking that
+        many big tinted copies took up to ~350 ms at each new zoom size): each
+        pixel gets the tone of the front-most copy covering it, and the alpha of
+        the copy covering it most."""
+        px = font_px(px)
+        key = (self.shown_text(), px, self.font, self.caps, accent, "3D")
+        surf = Label._cache.get(key)
+        if surf is None:
+            white = self._render_text(px, (255, 255, 255))
+            steps = max(2, round(px * 0.13))
+            w, h = white.get_size()
+            cover = np.zeros((w + steps - 1, h + steps - 1), np.uint8)    # [x, y], as surfarray
+            cover[:w, :h] = pygame.surfarray.array_alpha(white)
+            # Alpha: the max over the `steps` copies — doubled up along the
+            # diagonal, then two overlapping windows that together span `steps`.
+            span, alpha = 1, cover
+            while span * 2 <= steps:
+                alpha = np.maximum(alpha, _shift_diagonal(alpha, span))
+                span *= 2
+            alpha = np.maximum(alpha, _shift_diagonal(alpha, steps - span))
+            # Tone: the front-most copy at each pixel (0 = front), row by row:
+            # 0 where the text itself is, else one more than the pixel up-left.
+            front = np.empty(cover.shape, np.int32)
+            above = np.full(cover.shape[0], steps - 1, np.int32)
+            for y in range(cover.shape[1]):
+                moved = np.empty_like(above)
+                moved[0], moved[1:] = steps - 1, np.minimum(above[:-1] + 1, steps - 1)
+                above = front[:, y] = np.where(cover[:, y] > 0, 0, moved)
+            tones = np.array([shade(accent, 0.35 + 0.45 * (steps - 1 - i) / steps)
+                              for i in range(steps)], np.uint8)
+            surf = pygame.Surface(cover.shape, pygame.SRCALPHA)
+            pygame.surfarray.pixels3d(surf)[:] = tones[front]
+            pygame.surfarray.pixels_alpha(surf)[:] = alpha
+            self._remember(key, surf)
+        return surf
+
     @staticmethod
     def _remember(key, surf):
-        if len(Label._cache) > 400:
+        pixels = surf.get_width() * surf.get_height()
+        if len(Label._cache) > 400 or Label._cache_pixels + pixels > LABEL_CACHE_PIXELS:
             Label._cache.clear()
+            Label._cache_pixels = 0
         Label._cache[key] = surf
+        Label._cache_pixels += pixels
 
     def _text_size(self, px):
         font = self._font(px)
@@ -884,7 +940,7 @@ class Label(Thing):
         px = round(LABEL_BASE_FONT * self.scale * camera.zoom)
         accent = self.color if not self.is_hovered else shade(self.color, 1.15)
         if px < 7 or px > LABEL_MAX_FONT:          # too small to read (or absurdly big): just the shape
-            pygame.draw.rect(surface, shade(accent, 0.7), rect, border_radius=max(2, rect.height // 5))
+            draw_rect(surface, shade(accent, 0.7), rect, border_radius=max(2, rect.height // 5))
             return
         text_color = self._draw_frame(surface, rect, accent)
         th = self._render_text(px, text_color).get_height()
@@ -899,36 +955,36 @@ class Label(Thing):
         r = max(2, round(h * 0.18))
         light, line = (236, 238, 245), max(1, h // 28)
         if st == "plate":
-            pygame.draw.rect(surface, (12, 12, 15), rect.move(0, max(1, h // 14)), border_radius=r)
-            pygame.draw.rect(surface, (34, 35, 44), rect, border_radius=r)
+            draw_rect(surface, (12, 12, 15), rect.move(0, max(1, h // 14)), border_radius=r)
+            draw_rect(surface, (34, 35, 44), rect, border_radius=r)
             shine_y = rect.y + max(1, h // 14)
             pygame.draw.line(surface, (54, 56, 70), (rect.x + r, shine_y), (rect.right - r, shine_y),
                              max(1, h // 30))
-            pygame.draw.rect(surface, shade(accent, 0.45), rect, width=line, border_radius=r)
+            draw_rect(surface, shade(accent, 0.45), rect, width=line, border_radius=r)
             bar = pygame.Rect(rect.x + round(h * 0.22), rect.y + round(h * 0.2),
                               max(2, round(h * 0.1)), rect.height - 2 * round(h * 0.2))
-            pygame.draw.rect(surface, accent, bar, border_radius=max(1, bar.width // 2))
+            draw_rect(surface, accent, bar, border_radius=max(1, bar.width // 2))
             return light
         if st == "bevel":                           # a raised block, like a button cap
             depth = max(2, round(h * 0.16))
             face = rect.copy()
             face.height -= depth
             body = shade(accent, 0.42)
-            pygame.draw.rect(surface, (10, 10, 12), rect.move(0, max(1, h // 14)), border_radius=r)
-            pygame.draw.rect(surface, shade(accent, 0.2), rect, border_radius=r)          # side
-            pygame.draw.rect(surface, body, face, border_radius=r)                        # top
+            draw_rect(surface, (10, 10, 12), rect.move(0, max(1, h // 14)), border_radius=r)
+            draw_rect(surface, shade(accent, 0.2), rect, border_radius=r)          # side
+            draw_rect(surface, body, face, border_radius=r)                        # top
             shine = pygame.Rect(face.x + r, face.y + max(1, h // 12), face.width - 2 * r, max(1, h // 12))
-            pygame.draw.rect(surface, shade(body, 1.45), shine, border_radius=max(1, shine.height // 2))
-            pygame.draw.rect(surface, shade(accent, 0.14), face, width=line, border_radius=r)
+            draw_rect(surface, shade(body, 1.45), shine, border_radius=max(1, shine.height // 2))
+            draw_rect(surface, shade(accent, 0.14), face, width=line, border_radius=r)
             return light
         if st == "inset":                           # sunk into a housing, like the inputs
-            pygame.draw.rect(surface, (14, 14, 18), rect.move(0, max(1, h // 18)), border_radius=r)
-            pygame.draw.rect(surface, INPUT_HOUSING, rect, border_radius=r)
-            pygame.draw.rect(surface, shade(INPUT_HOUSING, 1.35), rect, width=line, border_radius=r)
+            draw_rect(surface, (14, 14, 18), rect.move(0, max(1, h // 18)), border_radius=r)
+            draw_rect(surface, INPUT_HOUSING, rect, border_radius=r)
+            draw_rect(surface, shade(INPUT_HOUSING, 1.35), rect, width=line, border_radius=r)
             b = max(2, round(h * 0.14))
             well = rect.inflate(-2 * b, -2 * b)
             wr = max(2, r - b // 2)
-            pygame.draw.rect(surface, (13, 13, 17), well, border_radius=wr)
+            draw_rect(surface, (13, 13, 17), well, border_radius=wr)
             pygame.draw.line(surface, (3, 3, 5), (well.x + wr, well.y + 1), (well.right - wr, well.y + 1),
                              max(1, h // 20))                                              # inner shadow
             pygame.draw.line(surface, (46, 46, 58), (well.x + wr, well.bottom - 1),
@@ -947,19 +1003,20 @@ class Label(Thing):
             pygame.draw.polygon(surface, accent, banner(body))
             top_shine = pygame.Rect(body.x + notch, body.y + max(1, h // 14), body.width - 2 * notch,
                                     max(1, h // 16))
-            pygame.draw.rect(surface, shade(accent, 1.25), top_shine)
+            draw_rect(surface, shade(accent, 1.25), top_shine)
             return (22, 22, 28)
         if st == "neon":                            # a glowing tube
-            pygame.draw.rect(surface, (13, 13, 17), rect, border_radius=r)
+            draw_rect(surface, (13, 13, 17), rect, border_radius=r)
             glow = max(3, h // 6)
-            layer = pygame.Surface((rect.width + 4 * glow, rect.height + 4 * glow), pygame.SRCALPHA)
-            inner = layer.get_rect().inflate(-4 * glow, -4 * glow)
-            for i in range(4, 0, -1):
-                pygame.draw.rect(layer, (*accent, 22 + 10 * (4 - i)), inner.inflate(i * glow, i * glow),
-                                 width=glow, border_radius=r + i * glow // 2)
-            surface.blit(layer, (rect.x - 2 * glow, rect.y - 2 * glow))
-            pygame.draw.rect(surface, accent, rect, width=max(2, h // 16), border_radius=r)
-            pygame.draw.rect(surface, shade(accent, 1.6), rect, width=max(1, h // 40), border_radius=r)
+            layer, area = alpha_layer(surface, rect.inflate(4 * glow, 4 * glow))   # just the part on screen
+            if layer is not None:
+                for i in range(4, 0, -1):
+                    draw_rect(layer, (*accent, 22 + 10 * (4 - i)),
+                              rect.inflate(i * glow, i * glow).move(-area.x, -area.y),
+                              width=glow, border_radius=r + i * glow // 2)
+                surface.blit(layer, area)
+            draw_rect(surface, accent, rect, width=max(2, h // 16), border_radius=r)
+            draw_rect(surface, shade(accent, 1.6), rect, width=max(1, h // 40), border_radius=r)
             return shade(accent, 1.3)
         if st == "brackets":                        # HUD corner brackets
             arm, t = max(4, round(h * 0.38)), max(2, h // 14)
@@ -967,22 +1024,22 @@ class Label(Thing):
                                    (rect.left, rect.bottom, 1, -1), (rect.right, rect.bottom, -1, -1)):
                 x0 = cx if dx > 0 else cx - t
                 y0 = cy if dy > 0 else cy - t
-                pygame.draw.rect(surface, accent, (x0 if dx > 0 else cx - arm, y0, arm, t))
-                pygame.draw.rect(surface, accent, (x0, y0 if dy > 0 else cy - arm, t, arm))
+                draw_rect(surface, accent, (x0 if dx > 0 else cx - arm, y0, arm, t))
+                draw_rect(surface, accent, (x0, y0 if dy > 0 else cy - arm, t, arm))
             return light
         if st == "double":
-            pygame.draw.rect(surface, (28, 29, 37), rect, border_radius=r)
-            pygame.draw.rect(surface, accent, rect, width=max(1, h // 22), border_radius=r)
+            draw_rect(surface, (28, 29, 37), rect, border_radius=r)
+            draw_rect(surface, accent, rect, width=max(1, h // 22), border_radius=r)
             gap = max(3, round(h * 0.1))
-            pygame.draw.rect(surface, shade(accent, 0.75), rect.inflate(-2 * gap, -2 * gap),
-                             width=max(1, h // 40), border_radius=max(2, r - gap))
+            draw_rect(surface, shade(accent, 0.75), rect.inflate(-2 * gap, -2 * gap),
+                      width=max(1, h // 40), border_radius=max(2, r - gap))
             return light
         if st == "outline":
-            pygame.draw.rect(surface, accent, rect, width=max(1, round(h * 0.06)), border_radius=r)
+            draw_rect(surface, accent, rect, width=max(1, round(h * 0.06)), border_radius=r)
             return accent
         # underline
         rule = pygame.Rect(rect.x, rect.bottom - max(2, round(h * 0.09)), rect.width, max(2, round(h * 0.09)))
-        pygame.draw.rect(surface, accent, rule, border_radius=max(1, rule.height // 2))
+        draw_rect(surface, accent, rule, border_radius=max(1, rule.height // 2))
         return light
 
     def _draw_text(self, surface, px, color, accent, center):
@@ -1004,10 +1061,7 @@ class Label(Thing):
             surface.blit(self._render_text(px, (90, 92, 108)), pos.move(max(1, k // 2), max(1, k // 2)))
             ts = self._render_text(px, shade(color, 0.62))
         elif effect == "3D":                      # extruded block letters in the accent color
-            steps = max(2, round(px * 0.13))
-            for i in range(steps, 0, -1):
-                tone = shade(accent, 0.35 + 0.45 * (steps - i) / steps)
-                surface.blit(self._render_text(px, tone), pos.move(i, i))
+            surface.blit(self._render_3d(px, accent), pos.move(1, 1))
         elif effect == "glow":
             glow = self._render_glow(px, accent)
             gpos = glow.get_rect(center=center)
@@ -1181,9 +1235,9 @@ class Device(Thing):
     def draw_shape(self, surface, rect, camera):
         s = min(rect.width, rect.height)
         radius = max(2, s // 8)
-        pygame.draw.rect(surface, (14, 14, 18), rect.move(0, max(1, s // 26)), border_radius=radius)
-        pygame.draw.rect(surface, INPUT_HOUSING, rect, border_radius=radius)
-        pygame.draw.rect(surface, shade(INPUT_HOUSING, 1.35), rect, width=max(1, s // 50), border_radius=radius)
+        draw_rect(surface, (14, 14, 18), rect.move(0, max(1, s // 26)), border_radius=radius)
+        draw_rect(surface, INPUT_HOUSING, rect, border_radius=radius)
+        draw_rect(surface, shade(INPUT_HOUSING, 1.35), rect, width=max(1, s // 50), border_radius=radius)
         status = self.status()
         led_color = DEVICE_STATUS_COLORS.get(status, (110, 110, 120))
         if s < 24:                                   # tiny: just the status light
@@ -1211,8 +1265,8 @@ class Device(Thing):
         # The screen: params (what it's set to) and readings (what it reports).
         screen = pygame.Rect(rect.x + pad, rect.y + pad + header_h + pad // 2,
                              rect.width - 2 * pad, rect.bottom - pad - (rect.y + pad + header_h + pad // 2))
-        pygame.draw.rect(surface, (12, 14, 16), screen, border_radius=max(2, radius - 2))
-        pygame.draw.rect(surface, (6, 6, 8), screen, width=1, border_radius=max(2, radius - 2))
+        draw_rect(surface, (12, 14, 16), screen, border_radius=max(2, radius - 2))
+        draw_rect(surface, (6, 6, 8), screen, width=1, border_radius=max(2, radius - 2))
         info = self.info()
         if info is None or status in ("offline", "missing"):
             lines = [(DEVICE_STATUS_TEXT.get(status, status), "", (130, 130, 142))]
@@ -1405,7 +1459,7 @@ class InstrumentServer(Thing):
         body = pygame.Rect(rect.x, rect.bottom - body_h, rect.width, body_h)
         radius = max(2, s // 14)
         if s < 30:                                    # tiny: just the box and its light
-            pygame.draw.rect(surface, INPUT_HOUSING, body, border_radius=radius)
+            draw_rect(surface, INPUT_HOUSING, body, border_radius=radius)
             pygame.draw.circle(surface, light, body.center, max(1, s // 6))
             return
 
@@ -1414,7 +1468,7 @@ class InstrumentServer(Thing):
         ax = body.right - round(s * 0.17)
         tip = (ax, rect.y + round(s * 0.07))
         mast_w = max(2, s // 55)
-        pygame.draw.rect(surface, (34, 34, 42), (ax - mast_w * 2, body.top - max(2, s // 40),
+        draw_rect(surface, (34, 34, 42), (ax - mast_w * 2, body.top - max(2, s // 40),
                                                  mast_w * 4, max(2, s // 40) + 2), border_radius=2)
         pygame.draw.line(surface, (150, 152, 166), (ax, body.top), tip, mast_w)
         if state == "connected":
@@ -1426,8 +1480,8 @@ class InstrumentServer(Thing):
                 box = pygame.Rect(0, 0, 2 * r, 2 * r)
                 box.center = tip
                 width = max(1, s // 70)
-                pygame.draw.arc(surface, col, box, -0.75, 0.75, width)                 # right
-                pygame.draw.arc(surface, col, box, math.pi - 0.75, math.pi + 0.75, width)   # left
+                draw_arc(surface, col, box, -0.75, 0.75, width)                 # right
+                draw_arc(surface, col, box, math.pi - 0.75, math.pi + 0.75, width)   # left
         ball = max(2, s // 32)
         blink = state != "connecting" or (self._phase * 2) % 1 < 0.6
         tip_color = light if blink else shade(light, 0.4)
@@ -1436,12 +1490,12 @@ class InstrumentServer(Thing):
         pygame.draw.circle(surface, tip_color, tip, ball)
 
         # Body: housing, a speaker grille, a display, and a name plate.
-        pygame.draw.rect(surface, (14, 14, 18), body.move(0, max(1, s // 45)), border_radius=radius)
-        pygame.draw.rect(surface, INPUT_HOUSING, body, border_radius=radius)
-        pygame.draw.rect(surface, shade(INPUT_HOUSING, 1.35), body, width=max(1, s // 80), border_radius=radius)
+        draw_rect(surface, (14, 14, 18), body.move(0, max(1, s // 45)), border_radius=radius)
+        draw_rect(surface, INPUT_HOUSING, body, border_radius=radius)
+        draw_rect(surface, shade(INPUT_HOUSING, 1.35), body, width=max(1, s // 80), border_radius=radius)
         pad = max(2, round(s * 0.055))
         grille = pygame.Rect(body.x + pad, body.y + pad, round(body.width * 0.27), body.height - 2 * pad)
-        pygame.draw.rect(surface, (30, 30, 37), grille, border_radius=max(2, radius - 2))
+        draw_rect(surface, (30, 30, 37), grille, border_radius=max(2, radius - 2))
         hole = max(1, s // 90)
         step = max(3, s // 30)
         for gy in range(grille.y + step // 2 + 1, grille.bottom - step // 2, step):
@@ -1450,8 +1504,8 @@ class InstrumentServer(Thing):
 
         display = pygame.Rect(grille.right + pad, body.y + pad,
                               body.right - pad - (grille.right + pad), round(body.height * 0.48))
-        pygame.draw.rect(surface, shade(light, 0.08), display, border_radius=max(2, radius - 3))
-        pygame.draw.rect(surface, (8, 8, 10), display, width=1, border_radius=max(2, radius - 3))
+        draw_rect(surface, shade(light, 0.08), display, border_radius=max(2, radius - 3))
+        draw_rect(surface, (8, 8, 10), display, width=1, border_radius=max(2, radius - 3))
         if state == "connected":
             n = len(instruments.client.device_names())
             lines = ["ONLINE", f"{n} device{'s' if n != 1 else ''}"]
