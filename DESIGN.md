@@ -144,6 +144,20 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   *Export CSV* writes `data/<name> <date time>.csv` (row, time, columns; `data/` is git-ignored); *Clear rows…*
   confirms first. Output: `rows` (the count). Each collect saves the canvas — fine for hand /
   button collects; a very fast trigger on a big table would mean big, frequent saves
+- **Data relay** (E menu ▸ Data, `things.py`): a small junction for routing one value — so a wire
+  can go where you want and split. Click it, then a source; it offers that value as `value`
+  (always offered, `None` until fed, so it can be wired up before its source). Anything that links
+  — device params, function variables, readouts, collector columns, other relays — can read it,
+  any number of them, so relays chain into a path and fan out. `outputs()` reads **straight
+  through** the chain (no frame of delay per hop), with a loop guard (`_RELAYS_RESOLVING`): a chain
+  that loops back has no value, and the relay in the loop shows a red core. It doesn't store the
+  value. Looks: a hex nut (bevel, corner rivets) with a core that's hollow when unlinked, amber when
+  the source has no value, green when carrying one, and flares when the value changes. Nothing
+  else: tried a value tag and port nozzles with arrows toward its source / readers — both cluttered
+  the paths (the wires' flowing dots already show direction). The panel shows the value and what it
+  **Feeds**: readers are found every 0.25 s by `links_to(obj, id)`, which scans an object's
+  `source_id` and every `{"id": …}` inside its data props — it covers today's link styles without
+  each type listing its links
 - **Label** (E menu ▸ Annotations): a world-space title for a region — scales with zoom like a
   node (unlike a NameTag), with **Size** and a width that follows its text. Two independent
   looks to click through — frame **Style** (`LABEL_STYLES`, each with its own padding): *plate*

@@ -1544,6 +1544,204 @@ class DataCollector(Thing):
             surface.blit(ts, at)
 
 
+# ---- Data relay: a junction that routes one value -------------------------------------
+RELAY_BODY = (48, 52, 62)
+RELAY_CORE = (120, 220, 150)       # the same green as the wires
+RELAY_IDLE = (110, 114, 126)       # unlinked
+RELAY_NO_VALUE = (240, 190, 60)    # linked, but its source has no value
+RELAY_LOOP = (235, 80, 80)         # its chain of relays comes back to itself
+RELAY_BLINK = 0.35                 # seconds the core flares after the value changes
+RELAY_READERS_EVERY = 0.25         # how often it re-counts what reads from it
+_RELAYS_RESOLVING = set()          # relay ids mid-lookup (a loop guard for outputs())
+
+
+def links_to(obj, target_id):
+    """True if obj reads from target_id: an Output's source, or any {"id": …} link
+    in its data props (a function's variables, a device's params, a collector's columns)."""
+    def has(value):
+        if isinstance(value, dict):
+            return value.get("id") == target_id or any(has(v) for v in value.values())
+        if isinstance(value, list):
+            return any(has(v) for v in value)
+        return False
+    for p in obj.props():
+        value = getattr(obj, p.key, None)
+        if (p.key == "source_id" and value == target_id) or (p.kind == "data" and has(value)):
+            return True
+    return False
+
+
+class DataRelay(Thing):
+    """A small junction for routing one value across the canvas: click it, then
+    a source (an excitation filter's center, a readout, another relay, …), and
+    it passes that value on as `value`. Link anything to it — a device param, a
+    function variable, a collector column, another relay — and as many things
+    as you like, so the value can travel along a path of relays and split. The
+    core flares when the value changes. No delay along a chain;
+    a chain that loops back on itself has no value (red core). Ctrl+click
+    selects it."""
+
+    TYPE = "data_relay"
+    MENU_LABEL = "Add data relay"
+    NAME = "Data relay"
+    CATEGORY = "Data"
+    SIZE = (34, 34)
+    DOT_COLOR = RELAY_CORE
+    PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
+                  prompt="Size (1 = normal, 2 = twice as big):"),
+             Prop("source", kind="data", default={}, hidden=True)]     # {"id", "key"}
+    WIRE_COLOR = RELAY_CORE
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._last = None           # the value last frame (for the flare)
+        self._blink = 0.0
+        self._readers = []          # objects that read from this relay (re-counted every so often)
+        self._recount = 0.0
+        self._loop = False
+
+    # --- The value ------------------------------------------------------------------
+    def source_obj(self):
+        sid = self.source.get("id")
+        return self.scene.by_id.get(sid) if sid and self.scene else None
+
+    def value(self):
+        """The source's value now, read straight through any chain of relays (so no
+        frame of delay per hop). None when unlinked, when the source has none, or in a loop."""
+        src = self.source_obj()
+        if src is None or self.id in _RELAYS_RESOLVING:
+            return None
+        _RELAYS_RESOLVING.add(self.id)
+        try:
+            return src.outputs().get(self.source.get("key"))
+        finally:
+            _RELAYS_RESOLVING.discard(self.id)
+
+    def outputs(self):
+        return {"value": self.value()}     # always offered, so it can be linked before it's fed
+
+    def _in_loop(self):
+        seen, relay = set(), self
+        while isinstance(relay, DataRelay):
+            if relay.id in seen:
+                return relay is self             # a loop further up just leaves it without a value
+            seen.add(relay.id)
+            relay = relay.source_obj()
+        return False
+
+    def tick(self, dt):
+        value = self.value()
+        if value != self._last and value is not None:
+            self._blink = RELAY_BLINK
+        self._last = value
+        self._blink = max(0.0, self._blink - dt)
+        self._recount -= dt
+        if self._recount <= 0 and self.scene is not None:
+            self._recount = RELAY_READERS_EVERY
+            self._readers = [o for o in self.scene.objects if o is not self and links_to(o, self.id)]
+            self._loop = self._in_loop()
+
+    # --- Linking ------------------------------------------------------------------------
+    def pick_source(self, app):
+        linked = self.source_obj() is not None
+        def link(src):
+            if src is self:                          # clicked itself: unlink
+                self.source = {}
+            else:
+                keys = list(src.outputs())
+                self.source = {"id": src.id, "key": "value" if "value" in keys else keys[0]}
+            self._recount = 0.0
+            app.save()
+        hint = " — or click this relay to unlink" if linked else ""
+        app.start_picking(f"Click what this relay passes on (a device, readout, relay, …){hint}", link,
+                          accept=lambda obj: (obj is self and linked) or (obj is not self and bool(obj.outputs())),
+                          origin=self.center)
+
+    def next_key(self, app):
+        src = self.source_obj()
+        keys = list(src.outputs()) if src is not None else []
+        if keys:
+            key = self.source.get("key")
+            self.source["key"] = keys[(keys.index(key) + 1) % len(keys) if key in keys else 0]
+            app.save()
+
+    def unlink(self, app):
+        self.source = {}
+        app.save()
+
+    def on_click(self, pos, app):
+        self.pick_source(app)
+        return True
+
+    def inspector(self, app):
+        src = self.source_obj()
+        value = self.value()
+        rows = [Row("Passes on", src.display_name if src else "— click to link", on_click=self.pick_source)]
+        if src is not None:
+            rows.append(Row("   reads", self.source.get("key"), on_click=self.next_key))
+        rows.append(Row("Value", "—" if value is None else f"{value:.6g}",
+                        color=RELAY_LOOP if self._loop else None if value is not None else WARN_COLOR))
+        if self._loop:
+            rows.append(Field("Problem", "this chain of relays loops back on itself", color=WARN_COLOR))
+        names = ", ".join(o.display_name for o in self._readers[:4]) + (" …" if len(self._readers) > 4 else "")
+        rows.append(Row("Feeds", f"{len(self._readers)}" + (f"  ({names})" if names else "")))
+        return rows + [Gap(6)] + self.prop_rows()
+
+    def buttons(self, app):
+        out = super().buttons(app)
+        if self.source_obj() is not None:
+            out.append(Btn("Unlink", self.unlink))
+        return out
+
+    # --- Drawing ----------------------------------------------------------------------
+    def draw_links(self, surface, camera):
+        src = self.source_obj()
+        if src is not None and src.center is not None:
+            draw_wire(surface, camera, output_point(src), self.center, self.WIRE_COLOR)
+
+    def _state_color(self, value):
+        if self.source_obj() is None:
+            return RELAY_IDLE
+        if self._loop:
+            return RELAY_LOOP
+        return RELAY_NO_VALUE if value is None else RELAY_CORE
+
+    def draw_shape(self, surface, rect, camera):
+        value = self._last
+        color = self._state_color(value)
+        c = pygame.Vector2(rect.center)
+        r = min(rect.width, rect.height) / 2
+        if r < 5:                                   # tiny: just the core
+            pygame.draw.circle(surface, color, c, max(1, r))
+            return
+
+        def hexagon(radius, offset=(0, 0)):
+            return [(c.x + offset[0] + radius * math.cos(math.radians(60 * i)),
+                     c.y + offset[1] + radius * math.sin(math.radians(60 * i))) for i in range(6)]
+
+        src = self.source_obj()
+        # The body: a hex nut with a bevel, rivets on the corners, and a well for the core.
+        pygame.draw.polygon(surface, (14, 14, 18), hexagon(r * 0.95, (0, max(1, r * 0.08))))
+        pygame.draw.polygon(surface, RELAY_BODY, hexagon(r * 0.95))
+        pygame.draw.polygon(surface, shade(RELAY_BODY, 1.45), hexagon(r * 0.95), max(1, round(r * 0.07)))
+        pygame.draw.polygon(surface, (18, 20, 24), hexagon(r * 0.6))
+        pygame.draw.polygon(surface, shade(RELAY_BODY, 0.75), hexagon(r * 0.6), max(1, round(r * 0.05)))
+        if r >= 10:
+            for x, y in hexagon(r * 0.78):
+                pygame.draw.circle(surface, shade(RELAY_BODY, 1.7), (x, y), max(1, r * 0.07))
+
+        # The core: hollow when unlinked; lit (and flaring when the value changes) when it carries one.
+        core_r = r * 0.34
+        if src is None:
+            pygame.draw.circle(surface, color, c, core_r, max(1, round(r * 0.08)))
+        else:
+            flare = self._blink / RELAY_BLINK
+            if value is not None and r >= 8:
+                pygame.draw.circle(surface, shade(color, 0.25 + 0.3 * flare), c, core_r * (1.45 + 0.35 * flare))
+            pygame.draw.circle(surface, shade(color, 0.85 + 0.35 * flare), c, core_r)
+            pygame.draw.circle(surface, shade(color, 1.6), c - (core_r * 0.3, core_r * 0.3), max(1, core_r * 0.3))
+
+
 # ============================================================================
 # ANNOTATIONS — things that label and organize the canvas (E menu ▸ Annotations)
 # ============================================================================
