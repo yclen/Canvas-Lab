@@ -40,6 +40,7 @@ import time
 import numpy as np
 import pygame
 
+import expressions
 import instruments
 from canvas import (OBJECT_TYPES, WARN_COLOR, Btn, Field, Gap, Prop, Row, Thing, alpha_layer,
                     clip_text, draw_arc, draw_rect, font_px,
@@ -594,7 +595,7 @@ class Output(Thing):
     def draw_links(self, surface, camera):
         src = self.source()
         if src is not None and src.center is not None:
-            draw_wire(surface, camera, src.center, self.center, self.WIRE_COLOR)
+            draw_wire(surface, camera, output_point(src), self.center, self.WIRE_COLOR)
 
 
 # ---- Seven-segment digits -----------------------------------------------------
@@ -730,6 +731,321 @@ class Readout(Output):
             if layer is not None:
                 layer.fill((255, 255, 255, 14))
                 surface.blit(layer, area)
+
+
+# ============================================================================
+# MATH — things that compute a value from other objects' values (E menu ▸ Math)
+# ============================================================================
+FUNCTION_T0 = time.monotonic()  # `t` in equations: seconds since the canvas started
+FN_PAD = 12                     # Function layout, in world units at Size 1
+FN_EQ_SIZE = 18                 # equation text size
+FN_LOWER = 44                   # where the variable chips and result screen start
+FN_CHIP_H, FN_CHIP_GAP = 24, 8
+FN_CHIP_TEXT = 15
+FN_MIN_W, FN_MAX_W = 220, 800
+
+
+def output_point(obj):
+    """World point a wire from obj's output starts at: its output_point() if
+    it has one (a Function's output nub), else its center."""
+    point = getattr(obj, "output_point", None)
+    return point() if point is not None else obj.center
+
+
+class Function(Thing):
+    """y = an equation you type (click it). Every name in the equation that
+    isn't built in (sin, sqrt, pi, t, … — see expressions.py) becomes a little
+    variable chip on the left edge; click a chip, then click a slider, switch,
+    readout, device or another function, and that variable follows its value.
+    The result `y` is an output, so readouts, devices and other functions can
+    link to it. Links are kept by variable name, so editing the equation never
+    loses wiring (a name that comes back reconnects). Unlinked variables, bad
+    syntax or 1/0 give no value (readouts show dashes; devices hold their last
+    one) and the reason, in red. Ctrl+click selects it."""
+
+    TYPE = "function"
+    MENU_LABEL = "Add function"
+    NAME = "Function"
+    CATEGORY = "Math"
+    DOT_COLOR = (175, 140, 255)
+    PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
+                  prompt="Size (1 = normal, 2 = twice as big):"),
+             Prop("color", "Color", "color", (175, 140, 255)),
+             Prop("expression", kind="str", default="", hidden=True),
+             Prop("links", kind="data", default={}, hidden=True)]     # variable -> {"id", "key"}
+    WIRE_COLOR = (120, 220, 150)
+
+    @classmethod
+    def create(cls, app):
+        def typed(text):
+            app.start_placing(lambda x, y: cls(x, y, expression=text.strip() or "x"))
+        app.ask("Equation  y =", typed, q_pastes=False)
+
+    @classmethod
+    def icon_sample(cls):
+        sample = cls(0, 0, expression="2*P + 1")
+        sample.result = 7.0
+        return sample
+
+    def __init__(self, x, y, text="", *, expression=None, **kwargs):
+        super().__init__(x, y, text, **kwargs)
+        if expression is not None:
+            self.expression = expression
+        self.result = None          # last value of y, or None
+        self.problem = ""           # why there's no value ("" when there is one)
+        self._eq = None             # Equation for self._eq.text, rebuilt when the text changes
+        self._size_key = None       # what the cached layout widths were measured for
+        self._widths = (FN_MIN_W, [])
+
+    # --- Equation ---------------------------------------------------------------
+    def equation(self):
+        if self._eq is None or self._eq.text != self.expression:
+            self._eq = expressions.Equation(self.expression)
+        return self._eq
+
+    def source(self, name):
+        link = self.links.get(name)
+        return self.scene.by_id.get(link.get("id")) if link and self.scene else None
+
+    def tick(self, dt):
+        eq = self.equation()
+        self.result, self.problem = None, ""
+        if eq.error:
+            self.problem = eq.error
+            return
+        values = {"t": time.monotonic() - FUNCTION_T0}
+        unlinked = []
+        for name in eq.variables:
+            src = self.source(name)
+            if src is None:
+                unlinked.append(name)
+                continue
+            value = src.outputs().get(self.links[name].get("key"))
+            if value is None:
+                self.problem = f"{name}: its source has no value"
+                return
+            values[name] = value
+        if unlinked:
+            self.problem = f"link {', '.join(unlinked)} (click {'its' if len(unlinked) == 1 else 'a'} chip)"
+            return
+        try:
+            self.result = eq.evaluate(values)
+        except expressions.EquationError as exc:
+            self.problem = str(exc)
+
+    def outputs(self):
+        return {"y": self.result}       # None while there's no value: readers show "—" / hold
+
+    def result_text(self):
+        return "—" if self.result is None else f"{self.result:.6g}"
+
+    # --- Editing and linking --------------------------------------------------------
+    def edit_equation(self, app):
+        def submit(text):
+            self.expression = text.strip()
+            app.save()
+        app.ask("Equation  y =", submit, value=self.expression, q_pastes=False)
+
+    def pick_source(self, app, name):
+        def link(src):
+            if src is self:                         # clicked itself: unlink
+                self.links.pop(name, None)
+            else:
+                keys = list(src.outputs())
+                self.links[name] = {"id": src.id, "key": "value" if "value" in keys else keys[0]}
+            app.save()
+        linked = self.source(name) is not None
+        hint = f" — or click this function to unlink {name}" if linked else ""
+        app.start_picking(f"Click what {name} should follow (a slider, switch, …){hint}", link,
+                          accept=lambda obj: (obj is self and linked) or
+                                             (obj is not self and bool(obj.outputs())),
+                          origin=self.chip_point(name))
+
+    def next_key(self, app, name):
+        """Cycle which of the source's values a variable reads."""
+        src = self.source(name)
+        keys = list(src.outputs()) if src is not None else []
+        if keys:
+            key = self.links[name].get("key")
+            i = keys.index(key) if key in keys else -1
+            self.links[name]["key"] = keys[(i + 1) % len(keys)]
+            app.save()
+
+    def unlink_all(self, app):
+        self.links = {}
+        app.save()
+
+    def on_click(self, pos, app):
+        name = self.chip_at(pos, app.camera)
+        if name is not None:
+            self.pick_source(app, name)
+        else:
+            self.edit_equation(app)
+        return True                 # a click edits/links; Ctrl+click selects
+
+    # --- Inspector ------------------------------------------------------------------
+    def inspector(self, app):
+        rows = [Field("Equation", f"y = {self.expression}" if self.expression else "— click to type one",
+                      on_click=self.edit_equation),
+                Row("y", self.result_text(), color=None if self.result is not None else WARN_COLOR)]
+        if self.problem:
+            rows.append(Field("Problem", self.problem, color=WARN_COLOR))
+        for name in self.equation().variables:
+            rows.append(Gap(6))
+            src = self.source(name)
+            if src is None:
+                rows.append(Row(name, "— click to link", on_click=lambda app, n=name: self.pick_source(app, n)))
+                continue
+            value = src.outputs().get(self.links[name].get("key"))
+            rows.append(Row(name, "—" if value is None else f"{value:g}"))
+            rows.append(Row("   follows", src.display_name,
+                            on_click=lambda app, n=name: self.pick_source(app, n)))
+            rows.append(Row("   reads", self.links[name].get("key"),
+                            on_click=lambda app, n=name: self.next_key(app, n)))
+        return rows + [Gap(6)] + self.prop_rows()
+
+    def buttons(self, app):
+        out = super().buttons(app) + [Btn("Edit equation…", self.edit_equation)]
+        if self.links:
+            out.append(Btn("Unlink all", self.unlink_all))
+        return out
+
+    # --- Layout (world units at Size 1; shared by drawing, clicks and wires) ----------
+    def _measure(self):
+        """(width, [chip width per variable]), re-measured when the text changes."""
+        names = self.equation().variables
+        key = (self.expression, tuple(names))
+        if key != self._size_key:
+            font = get_font(100, "consolas", True)
+            eq_w = font.size(f"y = {self.expression}")[0] * FN_EQ_SIZE / 100
+            chips = [max(FN_CHIP_H, font.size(n)[0] * FN_CHIP_TEXT / 100 + 14) for n in names]
+            col = max(chips, default=0)
+            width = max(FN_MIN_W, min(FN_MAX_W, eq_w + 2 * FN_PAD), FN_PAD * 2 + col + 10 + 120)
+            self._size_key, self._widths = key, (width, chips)
+        return self._widths
+
+    @property
+    def world_width(self):
+        return self._measure()[0] * self.scale
+
+    @property
+    def world_height(self):
+        n = len(self.equation().variables)
+        chips = n * (FN_CHIP_H + FN_CHIP_GAP) - FN_CHIP_GAP if n else 0
+        return (FN_LOWER + max(44, chips) + FN_PAD) * self.scale
+
+    def _chip_boxes(self):
+        """[(name, x, y, w, h)] in world units at Size 1 from the top-left corner."""
+        _w, chips = self._measure()
+        return [(name, FN_PAD, FN_LOWER + i * (FN_CHIP_H + FN_CHIP_GAP), cw, FN_CHIP_H)
+                for i, (name, cw) in enumerate(zip(self.equation().variables, chips))]
+
+    def _screen_box(self):
+        width, chips = self._measure()
+        x = FN_PAD + (max(chips) + 10 if chips else 0)
+        return x, FN_LOWER, width - FN_PAD - x, self.world_height / self.scale - FN_LOWER - FN_PAD
+
+    def _to_world(self, x, y):
+        c = self.world_center
+        return (c.x - self.world_width / 2 + x * self.scale, c.y - self.world_height / 2 + y * self.scale)
+
+    def chip_point(self, name):
+        """World point where a variable's wire ends: its chip's left edge."""
+        for n, x, y, _w, h in self._chip_boxes():
+            if n == name:
+                return self._to_world(x, y + h / 2)
+        return self.center
+
+    def output_point(self):
+        """World point the output wire leaves from: the nub on the right edge."""
+        x, y, w, h = self._screen_box()
+        return self._to_world(x + w + FN_PAD, y + h / 2)
+
+    def _chip_rects(self, rect):
+        k = rect.width / self._measure()[0]          # screen px per layout unit
+        return [(name, pygame.Rect(rect.x + round(x * k), rect.y + round(y * k),
+                                   max(1, round(w * k)), max(1, round(h * k))))
+                for name, x, y, w, h in self._chip_boxes()], k
+
+    def chip_at(self, pos, camera):
+        chips, _k = self._chip_rects(self.screen_rect(camera))
+        return next((name for name, r in chips if r.inflate(6, 6).collidepoint(pos)), None)
+
+    # --- Drawing ----------------------------------------------------------------------
+    def draw_links(self, surface, camera):
+        if self.scene is None:
+            return
+        for name in self.equation().variables:     # links for names no longer in it stay hidden
+            src = self.source(name)
+            if src is not None and src.center is not None:
+                draw_wire(surface, camera, output_point(src), self.chip_point(name), self.WIRE_COLOR)
+
+    def draw_shape(self, surface, rect, camera):
+        s = min(rect.width, rect.height)
+        radius = max(2, s // 8)
+        draw_rect(surface, (14, 14, 18), rect.move(0, max(1, s // 22)), border_radius=radius)
+        draw_rect(surface, INPUT_HOUSING, rect, border_radius=radius)
+        draw_rect(surface, shade(INPUT_HOUSING, 1.35), rect, width=max(1, s // 40),
+                  border_radius=radius)
+        if s < 16:                                   # too small for detail
+            draw_rect(surface, shade(self.color, 0.5), rect.inflate(-max(1, s // 3), -max(1, s // 3)))
+            return
+        chips, k = self._chip_rects(rect)
+        bad_eq = bool(self.equation().error)
+
+        # The equation along the top: "y =" in the accent color, then the text.
+        size = round(FN_EQ_SIZE * k)
+        if size >= 7:
+            font = get_font(size, "consolas", True)
+            x, y = rect.x + round(FN_PAD * k), rect.y + round(FN_PAD * k)
+            head = font.render("y = ", True, self.color)
+            surface.blit(head, (x, y))
+            body = clip_text(self.expression or "(click to type)", font,
+                             rect.right - round(FN_PAD * k) - x - head.get_width())
+            surface.blit(font.render(body, True, WARN_COLOR if bad_eq else (215, 215, 225)),
+                         (x + head.get_width(), y))
+
+        # Variable chips: hollow until linked, filled once linked, brighter under the mouse.
+        mouse = pygame.mouse.get_pos() if self.is_hovered else None
+        csize = round(FN_CHIP_TEXT * k)
+        for name, r in chips:
+            linked = self.source(name) is not None
+            hot = mouse is not None and r.inflate(6, 6).collidepoint(mouse)
+            color = shade(self.color, 1.2) if hot else self.color
+            cr = max(2, r.height // 2)
+            if linked:
+                draw_rect(surface, color, r, border_radius=cr)
+            else:
+                draw_rect(surface, INPUT_WELL, r, border_radius=cr)
+                draw_rect(surface, color, r, width=max(1, round(2 * k)), border_radius=cr)
+            if csize >= 7:
+                ts = get_font(csize, "consolas", True).render(name, True, INPUT_WELL if linked else color)
+                surface.blit(ts, ts.get_rect(center=r.center))
+
+        # The result screen, with the output nub on the right edge.
+        x, y, w, h = self._screen_box()
+        screen = pygame.Rect(rect.x + round(x * k), rect.y + round(y * k), round(w * k), round(h * k))
+        corner = max(2, round(6 * k))
+        draw_rect(surface, shade(self.color, 0.07), screen, border_radius=corner)
+        draw_rect(surface, (8, 8, 10), screen, width=max(1, s // 45), border_radius=corner)
+        nub = (rect.right, screen.centery)
+        pygame.draw.circle(surface, self.color if self.result is not None else shade(self.color, 0.4),
+                           nub, max(2, round(5 * k)))
+        pad = round(8 * k)
+        if self.result is not None:
+            text, color, size = self.result_text(), shade(self.color, 1.2), round(h * 0.55 * k)
+        else:
+            text, color, size = self.problem or "—", WARN_COLOR, round(13 * k)
+        room = screen.width - 2 * pad
+        while self.result is not None and size > 7 and get_font(size, "consolas", True).size(text)[0] > room:
+            size = max(7, int(size * 0.9))          # the number shrinks to fit; an error clips
+        if size >= 7:
+            font = get_font(size, "consolas", True)
+            ts = font.render(clip_text(text, font, room), True, color)
+            if self.result is not None:
+                surface.blit(ts, ts.get_rect(midright=(screen.right - pad, screen.centery)))
+            else:
+                surface.blit(ts, ts.get_rect(midleft=(screen.x + pad, screen.centery)))
 
 
 # ============================================================================
@@ -1313,7 +1629,7 @@ class Device(Thing):
         for link in self.links.values():
             src = self.scene.by_id.get(link.get("id"))
             if src is not None and src.center is not None:
-                draw_wire(surface, camera, src.center, self.center, self.WIRE_COLOR)
+                draw_wire(surface, camera, output_point(src), self.center, self.WIRE_COLOR)
 
     def draw_shape(self, surface, rect, camera):
         s = min(rect.width, rect.height)

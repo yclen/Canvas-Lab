@@ -105,6 +105,25 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   First output: **Readout**, an LED display — seven-segment digits with unlit "ghost" segments,
   a unit beside them (free text: mW, ms, V, …), decimals, digit slots, color, size, and the
   object's name printed on the bezel. Dashes when unlinked
+- **Function** (E menu ▸ Math, `things.py`; evaluator in `expressions.py`): `y = <equation>`.
+  Placing one asks for the equation first; a click on it reopens the text box (Ctrl+click
+  selects). Every name that isn't built in (`expressions.RESERVED`: sin cos tan asin acos atan
+  atan2 sinh cosh tanh sqrt exp log log10 log2 abs min max round floor ceil sign clamp, pi, e,
+  and `t` = seconds since the canvas started) becomes a variable *chip* on the left edge, in
+  the order it first appears — hollow until linked, filled once linked. Click a chip, then a
+  source (anything with outputs); clicking the function itself unlinks that variable. Links
+  are a hidden `links` dict keyed by variable name, so editing the equation never loses wiring
+  (a name that comes back reconnects; links for absent names are kept but not drawn). Output
+  is `{"y": value}`; it's `None` while there's no value (unlinked variable, bad syntax, 1/0,
+  sqrt(-1), NaN/inf), with the reason in red on its screen and in the inspector — a Readout
+  then shows dashes and a Device skips it (holds its last value). Range checking is the
+  drivers' job. The equation is parsed with `ast` against a whitelist and compiled once per
+  text change; numbers are floats (so `9^9^9` overflows instead of hanging). `^` = power,
+  `2P` = 2*P (not inside names like `log10`, not `1e-3`), a leading `y =` is ignored. Wires
+  from a source end at the chip and leave a Function from its output nub: `output_point(obj)`
+  uses an object's `output_point()` if it has one, else its center (Output and Device wires
+  use it too). Chains and loops are fine — each Function computes once a frame in `tick` and
+  `outputs()` returns the stored value, so a loop just runs a frame behind
 - **Label** (E menu ▸ Annotations): a world-space title for a region — scales with zoom like a
   node (unlike a NameTag), with **Size** and a width that follows its text. Two independent
   looks to click through — frame **Style** (`LABEL_STYLES`, each with its own padding): *plate*
