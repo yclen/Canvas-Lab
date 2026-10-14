@@ -84,7 +84,12 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   (`press(app)`, default: run its command) instead of selecting it; it tracks hover /
   held / a short press flash for drawing and draws the shared housing; subclasses draw
   `draw_face`. First member: **PushButton**, an arcade-style square cap that brightens +
-  glows on hover and sinks into its housing when pressed (cap color + name-on-cap).
+  glows on hover and sinks into its housing when pressed (cap color + name-on-cap). An
+  **Icon** on the cap (`icon`, a choice — click cycles): none, up / down / left / right arrows, play,
+  pause, stop, record, plus, minus, check, cross, power, reset — simple bold shapes drawn by
+  `draw_button_icon` (polygons + round-capped strokes, so they're crisp at any size), dark on a
+  light cap, light on a dark one, with a 1px emboss shadow; with a name too, the icon sits above
+  a smaller name.
   **Ctrl+click** selects any object without interacting with it (drag-box works too)
 - **Switch** (Inputs): an on/off slide switch — each click flips it (saved `on`), the knob
   slides across (`SLIDE_TIME`) and the track fills with its color; ON/OFF shows beside the

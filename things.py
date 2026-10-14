@@ -194,15 +194,82 @@ class Input(Thing):
         pass
 
 
+BUTTON_ICONS = ["none", "up", "down", "left", "right", "play", "pause", "stop", "record",
+                "plus", "minus", "check", "cross", "power", "reset"]
+
+
+def _stroke(surface, color, points, width):
+    """A thick polyline with round ends and joins (pygame's own wide lines leave gaps)."""
+    width = max(1, round(width))
+    for a, b in zip(points, points[1:]):
+        pygame.draw.line(surface, color, a, b, width)
+    for p in points:
+        pygame.draw.circle(surface, color, p, width / 2)
+
+
+def draw_button_icon(surface, name, rect, color):
+    """One of BUTTON_ICONS, drawn in `color` to fit a square in the middle of rect."""
+    if name == "none":
+        return
+    c = pygame.Vector2(rect.center)
+    r = min(rect.width, rect.height) / 2           # icon coordinates run -1 … 1 across this
+
+    def pt(x, y):
+        return (c.x + x * r, c.y + y * r)
+
+    w = r * 0.26                                   # stroke width
+    if name in ("up", "down", "left", "right"):    # an arrow: a head and a shaft, drawn pointing up, then turned
+        shape = [(0, -0.9), (0.72, -0.12), (0.26, -0.12), (0.26, 0.85), (-0.26, 0.85), (-0.26, -0.12),
+                 (-0.72, -0.12)]
+        turn = {"up": lambda x, y: (x, y), "down": lambda x, y: (x, -y),
+                "left": lambda x, y: (y, x), "right": lambda x, y: (-y, x)}[name]
+        pygame.draw.polygon(surface, color, [pt(*turn(x, y)) for x, y in shape])
+    elif name == "play":
+        pygame.draw.polygon(surface, color, [pt(-0.55, -0.75), pt(0.8, 0), pt(-0.55, 0.75)])
+    elif name == "pause":
+        for x in (-0.55, 0.15):
+            pygame.draw.rect(surface, color, pygame.Rect(*pt(x, -0.72), round(0.4 * r), round(1.44 * r)))
+    elif name == "stop":
+        pygame.draw.rect(surface, color, pygame.Rect(*pt(-0.65, -0.65), round(1.3 * r), round(1.3 * r)),
+                         border_radius=max(1, round(r * 0.12)))
+    elif name == "record":
+        pygame.draw.circle(surface, color, c, r * 0.72)
+    elif name in ("plus", "minus"):
+        _stroke(surface, color, [pt(-0.7, 0), pt(0.7, 0)], w * 1.15)
+        if name == "plus":
+            _stroke(surface, color, [pt(0, -0.7), pt(0, 0.7)], w * 1.15)
+    elif name == "check":
+        _stroke(surface, color, [pt(-0.7, 0.02), pt(-0.22, 0.52), pt(0.72, -0.55)], w * 1.15)
+    elif name == "cross":
+        _stroke(surface, color, [pt(-0.6, -0.6), pt(0.6, 0.6)], w * 1.15)
+        _stroke(surface, color, [pt(0.6, -0.6), pt(-0.6, 0.6)], w * 1.15)
+    elif name == "power":                          # a ring open at the top, and a bar through the gap
+        ring = [pt(0.7 * math.sin(math.radians(a)), -0.7 * math.cos(math.radians(a))) for a in range(40, 321, 10)]
+        _stroke(surface, color, ring, w)
+        _stroke(surface, color, [pt(0, -0.88), pt(0, -0.12)], w)
+    elif name == "reset":                          # a circular arrow, clockwise
+        ring = [pt(0.66 * math.sin(math.radians(a)), -0.66 * math.cos(math.radians(a))) for a in range(30, 331, 10)]
+        _stroke(surface, color, ring, w)
+        tip = math.radians(330)
+        end = pygame.Vector2(pt(0.66 * math.sin(tip), -0.66 * math.cos(tip)))
+        along = pygame.Vector2(math.cos(tip), math.sin(tip))      # the way the arc is heading at its end
+        across = pygame.Vector2(-along.y, along.x)
+        head = r * 0.36
+        pygame.draw.polygon(surface, color, [end + along * head, end - across * head * 0.9,
+                                             end + across * head * 0.9])
+
+
 class PushButton(Input):
     """A momentary push button: an arcade-style square cap that lifts when you
-    hover and sinks into its housing when you press it."""
+    hover and sinks into its housing when you press it. It can carry an icon on
+    its cap (arrows, play / stop / …, Icon in the panel; none by default)."""
 
     TYPE = "push_button"
     MENU_LABEL = "Add push button"
     NAME = "Push button"
     DOT_COLOR = (215, 60, 60)
-    PROPS = [Prop("color", "Cap color", "color", (215, 60, 60))]
+    PROPS = [Prop("color", "Cap color", "color", (215, 60, 60)),
+             Prop("icon", "Icon", "choice", "none", choices=BUTTON_ICONS)]
 
     def draw_face(self, surface, well, camera):
         s = well.width
@@ -231,14 +298,26 @@ class PushButton(Input):
         draw_rect(surface, shade(self.color, 0.4), face,
                   width=max(1, s // 45), border_radius=radius)                   # cap outline
 
-        if self.text:                                  # name printed on the cap, if it fits
-            size = round(face.height * 0.32)
+        light = sum(face_color) > 450
+        ink = (25, 25, 30) if light else (245, 245, 245)
+        label = None                                   # the name, if it fits on the cap
+        if self.text:
+            size = round(face.height * (0.22 if self.icon != "none" else 0.32))
             if size >= 9:
-                font = get_font(size)
-                light = sum(face_color) > 450
-                ts = font.render(self.text, True, (25, 25, 30) if light else (245, 245, 245))
+                ts = get_font(size).render(self.text, True, ink)
                 if ts.get_width() <= face.width - 6:
-                    surface.blit(ts, ts.get_rect(center=face.center))
+                    label = ts
+        if self.icon != "none":                        # the icon, embossed; above the name when both fit
+            area = face.inflate(-round(face.width * 0.36), -round(face.height * 0.36))
+            if label is not None:
+                area = pygame.Rect(area.x, face.y + round(face.height * 0.12), area.width,
+                                   round(face.height * 0.52))
+            if area.width >= 6:
+                draw_button_icon(surface, self.icon, area.move(0, max(1, s // 60)), shade(face_color, 0.55))
+                draw_button_icon(surface, self.icon, area, ink)
+        if label is not None:
+            at = (face.centerx, face.bottom - round(face.height * 0.2)) if self.icon != "none" else face.center
+            surface.blit(label, label.get_rect(center=at))
 
 
 class Switch(Input):
