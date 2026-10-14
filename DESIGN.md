@@ -316,6 +316,14 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
     the line at 0 V, so the mirror lowers — flipper.py's deliberate end state. The object draws the
     beam: up = mirror at 45° reflecting to the up path, down = mirror flat and the beam straight on,
     unknown = grey mirror and a "?".
+    **Names are canvas-side labels:** the object's name (click *Name* in the inspector; new ones
+    are *Flipper 1*, *Flipper 2*, …) and its *Up path* / *Down path* names (default up / down)
+    are its own Props — shown on the drawing, the Flip / It's at buttons and the confirm. The
+    driver's labels (`up_label` / `down_label` from flipper.SETUP) only identify positions inside
+    the driver. *flipper.py mirror* (`mirror`) is the hardware choice — which SETUP entry, so
+    which DAQ channel and which side is up; a second new mirror defaults to the other one. Old
+    saves (no `up_name`) keep what they showed: the name becomes the mirror's (*Detection*) and
+    the path names are taken from the driver the first time it's live, then saved.
   - **Confirm dialogs** take an `ok_label` ("Delete" by default) and grow to fit their text.
   - **Buttons:** `Btn(style="stop")` is red.
   - **Server robustness:** the server's console replaces characters it can't print (λ, µ …)

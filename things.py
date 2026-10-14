@@ -2628,7 +2628,10 @@ class FlipMirror(Device):
     """A New Focus motorized flip mirror (driver: flip_mirror), drawn as a flip
     mount with the beam: up = the mirror at 45° sending the beam to the up path,
     down = the mirror lying flat and the beam going straight on to the down
-    path. The path names come from flipper.py (e.g. PM100D / sphere).
+    path. Its name (Flipper 1, Flipper 2, …) and the two path names (up /
+    down) are yours to change — they're only labels here. Which mirror it
+    drives (its DAQ channel, and which side flipper.py calls up) is the
+    "flipper.py mirror" setting.
 
     There's no readback, so every position is ASSUMED (the last one commanded),
     and connecting doesn't move the mirror — its position starts unknown. Then:
@@ -2643,25 +2646,68 @@ class FlipMirror(Device):
     DEFAULT_DEVICE = "flipper"
     SIZE = (250, 170)
     DOT_COLOR = FM_MIRROR
-    PROPS = [Prop("mirror", "Mirror", "choice", "detection", choices=["detection", "excitation"]),
+    PROPS = [Prop("up_name", "Up path", "str", "up", prompt="Name of the up path (mirror in the beam):"),
+             Prop("down_name", "Down path", "str", "down",
+                  prompt="Name of the down path (mirror out of the beam):"),
+             Prop("mirror", "flipper.py mirror", "choice", "detection", choices=["detection", "excitation"]),
              Prop("channel", "Channel", "str", "auto",
                   prompt="DAQ channel (auto = the one flipper.py gives this mirror; sim:// to simulate):")]
+
+    @classmethod
+    def create(cls, app):
+        def make(x, y):
+            obj = cls(x, y)
+            used = {o.device for o in app.scene.objects if isinstance(o, Device)}
+            obj.device = next(n for n in [cls.DEFAULT_DEVICE] + [f"{cls.DEFAULT_DEVICE}{i}" for i in range(2, 1000)]
+                              if n not in used)
+            names = {o.text for o in app.scene.objects if isinstance(o, FlipMirror)}
+            obj.text = next(f"Flipper {i}" for i in range(1, 1000) if f"Flipper {i}" not in names)
+            if any(isinstance(o, FlipMirror) and o.mirror == "detection" for o in app.scene.objects):
+                obj.mirror = "excitation"            # the second one is most likely the other mirror
+            return obj
+        app.start_placing(make)
+
+    def load_props(self, d):
+        """Saved before names were editable: keep showing what it showed then —
+        the mirror's name, and flipper.py's path names once it's connected."""
+        super().load_props(d)
+        if "up_name" not in d:
+            self.text = self.text or self.mirror.capitalize()
+            self._adopt_paths = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._pending = None       # (asked-for is_up, when) after a click, until it reports back
+        self._adopt_paths = False  # an old save: take the path names from the driver once live
 
     def device_options(self):
         return {"mirror": self.mirror, "channel": self.channel or "auto"}
 
     def mirror_state(self):
-        """(is_up: True / False / None=unknown, up_label, down_label, flips) — None labels if not live."""
+        """(is_up: True / False / None=unknown, up name, down name, flips) — is_up and
+        flips are None when it isn't live. The names are this object's own."""
         info = self.info() if self.connect else None
         if not info or info.get("status") != "ok":
-            return None, None, None, None
+            return None, self.up_name, self.down_name, None
         v = info["values"]
+        if self._adopt_paths and v.get("up_label") and v.get("down_label"):
+            self.up_name, self.down_name = v["up_label"], v["down_label"]
+            self._adopt_paths = False
+            if self.scene is not None:
+                self.scene.save()
         is_up = v.get("is_up")
-        return (None if is_up is None else bool(is_up), v.get("up_label"), v.get("down_label"), v.get("flips"))
+        return (None if is_up is None else bool(is_up), self.up_name, self.down_name, v.get("flips"))
+
+    @property
+    def title(self):
+        return self.text or "Flip mirror"
+
+    def rename(self, app):
+        def submit(text):
+            if text.strip():
+                self.text = text.strip()
+                app.save()
+        app.ask("Name:", submit, value=self.text)
 
     def live(self):
         return self.connect and self.status() == "ok"
@@ -2684,7 +2730,7 @@ class FlipMirror(Device):
 
     def find_position(self, app):
         up = self.mirror_state()[1] or "up"
-        app.confirm(f"Find the {self.mirror} mirror's position?",
+        app.confirm(f"Find {self.title}'s position?",
                     f"It will MOVE: flip down, then up, ending at {up}.",
                     lambda: self.run_action(app, "find_position"), ok_label="Flip it")
 
@@ -2713,7 +2759,7 @@ class FlipMirror(Device):
         return out
 
     def inspector(self, app):
-        rows = super().inspector(app)
+        rows = [Row("Name", self.title, on_click=self.rename)] + super().inspector(app)
         if self.live():
             is_up = self.mirror_state()[0]
             rows.append(Field("Note", "position unknown: say where it is, or Find position" if is_up is None
@@ -2757,7 +2803,7 @@ class FlipMirror(Device):
         size = round(header_h * 0.85)
         if size >= 8:
             font = get_font(size, "bahnschrift")
-            title = self.text or self.mirror.upper()
+            title = self.title.upper()
             ts = font.render(clip_text(title, font, rect.width - 4 * pad), True, (200, 204, 218))
             surface.blit(ts, (rect.x + pad, led[1] - ts.get_height() // 2))
 
@@ -2767,7 +2813,7 @@ class FlipMirror(Device):
         small = round(s * 0.085)
         font = get_font(max(8, small), "bahnschrift")
         beam_w = max(2, s // 45)
-        up, down = up or "up", down or "down"
+        up, down = up or " ", down or " "
         up_end = pygame.Vector2(hub.x, area_top + small * 1.6)
         down_end = pygame.Vector2(rect.right - pad, hub.y)
         start = pygame.Vector2(rect.x + pad, hub.y)
@@ -2786,7 +2832,9 @@ class FlipMirror(Device):
         if small >= 8:
             for label, at, active, anchor in ((up, up_end, is_up is True, "midbottom"),
                                               (down, down_end, is_up is False, "bottomright")):
-                ts = font.render(label, True, (230, 240, 236) if (live and active) else (110, 114, 128))
+                room = rect.width - 2 * pad if anchor == "bottomright" else 2 * (hub.x - rect.x - pad)
+                ts = font.render(clip_text(label, font, max(1, room)), True,
+                                 (230, 240, 236) if (live and active) else (110, 114, 128))
                 r = ts.get_rect(**{anchor: (round(at.x), round(at.y) - max(2, small // 3))})
                 surface.blit(ts, r)
 
