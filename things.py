@@ -776,12 +776,6 @@ class Function(Thing):
     WIRE_COLOR = (120, 220, 150)
 
     @classmethod
-    def create(cls, app):
-        def typed(text):
-            app.start_placing(lambda x, y: cls(x, y, expression=text.strip() or "x"))
-        app.ask("Equation  y =", typed, q_pastes=False)
-
-    @classmethod
     def icon_sample(cls):
         sample = cls(0, 0, expression="2*P + 1")
         sample.result = 7.0

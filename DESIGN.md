@@ -106,7 +106,7 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   a unit beside them (free text: mW, ms, V, …), decimals, digit slots, color, size, and the
   object's name printed on the bezel. Dashes when unlinked
 - **Function** (E menu ▸ Math, `things.py`; evaluator in `expressions.py`): `y = <equation>`.
-  Placing one asks for the equation first; a click on it reopens the text box (Ctrl+click
+  It's placed empty ("(click to type)"); a click on it opens the equation's text box (Ctrl+click
   selects). Every name that isn't built in (`expressions.RESERVED`: sin cos tan asin acos atan
   atan2 sinh cosh tanh sqrt exp log log10 log2 abs min max round floor ceil sign clamp, pi, e,
   and `t` = seconds since the canvas started) becomes a variable *chip* on the left edge, in
