@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "about": "Excitation filter calibration: each filter's stage position (mm) vs. its cutoff (nm). Logged with scripts/calibrate_excitation_filters.py; read by drivers/filter_band.py when the device opens.",
+  "longpass": {
+    "serial": 137126,
+    "stage": 2,
+    "points": [
+      {
+        "position_mm": 13.703,
+        "cutoff_nm": 439.0,
+        "logged": "2026-09-14 (from Quantum Yield filter_calibration.json)"
+      },
+      {
+        "position_mm": 27.911,
+        "cutoff_nm": 524.0,
+        "logged": "2026-09-14 (from Quantum Yield filter_calibration.json)"
+      },
+      {
+        "position_mm": 50.892,
+        "cutoff_nm": 665.0,
+        "logged": "2026-09-14 (from Quantum Yield filter_calibration.json)"
+      }
+    ]
+  },
+  "shortpass": {
+    "serial": 137120,
+    "stage": 1,
+    "points": [
+      {
+        "position_mm": 12.683,
+        "cutoff_nm": 496.5,
+        "logged": "2026-09-14 (from Quantum Yield filter_calibration.json)"
+      },
+      {
+        "position_mm": 42.523,
+        "cutoff_nm": 679.5,
+        "logged": "2026-09-14 (from Quantum Yield filter_calibration.json)"
+      },
+      {
+        "position_mm": 53.462,
+        "cutoff_nm": 746.0,
+        "logged": "2026-09-14 (from Quantum Yield filter_calibration.json)"
+      }
+    ]
+  },
+  "saved": "2026-10-14T12:55:18"
+}

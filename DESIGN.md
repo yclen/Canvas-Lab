@@ -350,19 +350,34 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   - **Server robustness:** the server's console replaces characters it can't print (λ, µ …)
     instead of raising, and `log()` never raises — a print inside a driver's error used to kill
     that device's worker thread, leaving it stuck at "starting".
-  - **Excitation band** (`drivers/filter_band.py`, canvas object *Excitation band*): the longpass +
+  - **Excitation filters** (`drivers/filter_band.py`, canvas object *Excitation filters* — was *Excitation
+    band*; TYPE stays `filter_band`): the longpass +
     shortpass linear variable filters as one device in **nm** — params `center`, `width`; readings
     the actual band and each cutoff, read back from the stage positions. Wraps the Zaber chain
     through `zaber_stage.py`'s shared chain registry (so Zaber stage devices on the same port
     coexist), finding each stage by **serial** (the chain index isn't stable; `sim://` uses indices).
-    The calibration is **hard-coded** (`CALIBRATION`): the points from the Quantum Yield GUI's
-    `filter_calibration.json`, a least-squares line per filter (that GUI's *linear* mode),
-    extrapolated over the stage travel but held to its 400–800 nm working span. Unreachable
+    The calibration is read from **`calibration/excitation_filters.json`** when the device opens
+    (`load_calibration`): per filter, its stage (`serial`, or chain `stage` index for sim) and its
+    logged points (`position_mm`, `cutoff_nm`, `logged`); a least-squares line per filter (the QY
+    GUI's *linear* mode; `LinearFilter` also has `r2`). Under 2 points, or no file → the built-in
+    `CALIBRATION` (the QY GUI's points; the file was seeded with them). Explicit
+    `longpass_serial` options still win over the file. Extrapolated over the stage travel but held to its 400–800 nm working span. Unreachable
     requests are pulled in to the nearest reachable band (setting center keeps the width and vice
     versa, so only the param that was set changes); nothing moves until both stages are homed, so
     a band is never half-applied. The object is a **color picker**: a spectrum strip — click / drag
     sets the center (unless center is linked), the passed band stays lit, the requested band shows
-    as an orange outline while the stages move. Editing the calibration on the canvas is for later.
+    as an orange outline while the stages move. Its panel says where the calibration lives.
+  - **Scripts** (`scripts/`): standalone procedures with their own window, run from a terminal —
+    not wired to canvas objects yet. **`calibrate_excitation_filters.py`** (tkinter; `--port
+    sim://` to try it): a panel per filter — stage picker (by serial; stage 0 is the ND), ◀ ▶ jog
+    with a step choice (arrow keys move the panel last clicked, Shift = 10×), Go to mm, Home —
+    then type the cutoff seen on the spectrometer and **Log point** (Enter). Every change is
+    written straight to the calibration file (temp file + replace). The table shows each point's
+    distance from the fitted line; with 4+ points, the one whose removal makes the rest fit within
+    2 nm is flagged red as a likely typo (with 3 it only says they disagree). *Clear all* copies
+    the file to `calibration/archive/` first. It opens the Zaber chain itself (through
+    `zaber_stage._open_chain`), so the instrument server must be stopped first — it holds COM3;
+    a failed Connect says so. The canvas picks up a new calibration when the device reconnects.
   - **Driver actions** (general): a driver's `actions = ["home", …]` become buttons on its Device
     (`{"op": "action"}`). Errors from `set_<param>` / actions show as the device's message without
     restarting it. A Device's outputs list readings first, so a Readout links to e.g. `position`.

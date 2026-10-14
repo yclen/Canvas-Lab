@@ -1982,7 +1982,7 @@ class ZaberStage(Device):
 
 
 
-# ---- Excitation band: a color picker over the longpass / shortpass filters ------
+# ---- Excitation filters: a color picker over the longpass / shortpass filters ---
 def wavelength_rgb(nm):
     """Roughly the color of light at `nm` (Bruton's approximation); a dim deep
     red past the visible, so the IR end of the strip still reads as 'there'."""
@@ -2010,17 +2010,20 @@ BAND_DEFAULT_SPAN = (400.0, 800.0)     # the strip, until the driver says what t
 
 
 class FilterBand(Device):
-    """The excitation band (driver: filter_band) as a color picker: a spectrum
+    """The excitation filters (driver: filter_band) as a color picker: a spectrum
     strip over what the longpass + shortpass filters can reach. Click or drag
     on it to set the band's center; the width is set (or linked) in the panel.
     The part of the spectrum the filters are actually passing — read back from
     the stage positions — stays lit, the rest is dimmed, and an orange outline
     shows the requested band while the stages catch up. Home / Stop are buttons
-    once it's connected (the stages must be homed before they'll move)."""
+    once it's connected (the stages must be homed before they'll move). The
+    position -> cutoff calibration is calibration/excitation_filters.json, logged
+    with scripts/calibrate_excitation_filters.py (read when it connects).
+    (TYPE stays "filter_band" so saved canvases still load.)"""
 
     TYPE = "filter_band"
-    MENU_LABEL = "Add excitation band"
-    NAME = "Excitation band"
+    MENU_LABEL = "Add excitation filters"
+    NAME = "Excitation filters"
     DRIVER = "filter_band"
     DEFAULT_DEVICE = "band"
     SIZE = (380, 140)
@@ -2097,6 +2100,9 @@ class FilterBand(Device):
         band = self._band()
         if self.live():
             rows.append(Row("Reach", f"{band['lo']:g} – {band['hi']:g} nm"))
+        rows.append(Field("Calibration", "calibration/excitation_filters.json — recalibrate with "
+                                         "scripts/calibrate_excitation_filters.py (Stop server first; "
+                                         "reconnect to load it)"))
         return rows
 
     # --- Drawing -----------------------------------------------------------------------
@@ -2156,7 +2162,7 @@ class FilterBand(Device):
                 draw_rect(surface, wavelength_rgb(band["center"]), swatch, border_radius=max(2, sw // 4))
                 draw_rect(surface, (20, 20, 24), swatch, width=1, border_radius=max(2, sw // 4))
                 right_x = swatch.x
-            title = self.text or self.device or "band"
+            title = self.text or self.NAME
             ts = font.render(clip_text(title, font, max(10, right_x - rect.x - 2 * pad)), True, (170, 172, 186))
             surface.blit(ts, (rect.x + pad, led[1] - ts.get_height() // 2))
 
