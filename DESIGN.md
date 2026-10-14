@@ -158,6 +158,25 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   **Feeds**: readers are found every 0.25 s by `links_to(obj, id)`, which scans an object's
   `source_id` and every `{"id": …}` inside its data props — it covers today's link styles without
   each type listing its links
+- **Data tag** (E menu ▸ Data, `things.py`): a named data point — a `DataRelay` subclass, so it passes
+  its value through the same way (no delay, loop guard, any number of readers), but it has a body
+  you can read. Named after SCADA/PLC "tags" (a named live value with units). Shaped like a luggage
+  tag: the incoming wire ties into the grommeted hole in its pointed end (`input_point()`, a relay
+  hook that's the center for a plain relay), the output leaves from a nub on the right
+  (`output_point()`), the name is printed across the top, and a screen shows the value
+  Function-style (`.6g`, shrinking to fit) with its **Unit** (free text, display only) beside it.
+  New ones are "Tag 1", "Tag 2", … — placed without asking; click the name to rename, anywhere else
+  to link. The hole glows in the relay's state color; unlinked says "click to link", no value shows
+  an amber dash, a loop says so in red. Color and Size are editable. 270 × 96 at Size 1
+  - **Streaming** (the ((•)) icon, top right): unlinked, the tag streams live. Click the icon, then
+    a button / switch (picks its `pressed`, `on` or `value`), and it streams only while that's
+    > 0.5, otherwise **holds** the value it last took — a push button takes one fresh reading per
+    press, a switch streams while on. The held value is a hidden `held` Prop, saved when streaming
+    stops (so the reading survives a restart); readers downstream get the held value too, so a
+    tag can gate a whole chain. Icon: green waves (outer one pulsing) while streaming, grey while
+    holding (the screen then says HELD and the number dims); a ring (amber / grey) once linked,
+    with an amber wire to it. Clicking the icon then the tag itself goes back to always streaming
+    (or *Always stream* in the panel). The stream lookup uses the same loop guard as the value
 - **Label** (E menu ▸ Annotations): a world-space title for a region — scales with zoom like a
   node (unlike a NameTag), with **Size** and a width that follows its text. Two independent
   looks to click through — frame **Style** (`LABEL_STYLES`, each with its own padding): *plate*

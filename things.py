@@ -1652,10 +1652,11 @@ class DataRelay(Thing):
                 self.source = {"id": src.id, "key": "value" if "value" in keys else keys[0]}
             self._recount = 0.0
             app.save()
-        hint = " — or click this relay to unlink" if linked else ""
-        app.start_picking(f"Click what this relay passes on (a device, readout, relay, …){hint}", link,
+        what = self.NAME.lower()
+        hint = f" — or click this {what} to unlink" if linked else ""
+        app.start_picking(f"Click what this {what} passes on (a device, readout, relay, …){hint}", link,
                           accept=lambda obj: (obj is self and linked) or (obj is not self and bool(obj.outputs())),
-                          origin=self.center)
+                          origin=self.input_point())
 
     def next_key(self, app):
         src = self.source_obj()
@@ -1694,10 +1695,14 @@ class DataRelay(Thing):
         return out
 
     # --- Drawing ----------------------------------------------------------------------
+    def input_point(self):
+        """World point the incoming wire ends at."""
+        return self.center
+
     def draw_links(self, surface, camera):
         src = self.source_obj()
         if src is not None and src.center is not None:
-            draw_wire(surface, camera, output_point(src), self.center, self.WIRE_COLOR)
+            draw_wire(surface, camera, output_point(src), self.input_point(), self.WIRE_COLOR)
 
     def _state_color(self, value):
         if self.source_obj() is None:
@@ -1740,6 +1745,301 @@ class DataRelay(Thing):
                 pygame.draw.circle(surface, shade(color, 0.25 + 0.3 * flare), c, core_r * (1.45 + 0.35 * flare))
             pygame.draw.circle(surface, shade(color, 0.85 + 0.35 * flare), c, core_r)
             pygame.draw.circle(surface, shade(color, 1.6), c - (core_r * 0.3, core_r * 0.3), max(1, core_r * 0.3))
+
+
+# ---- Data tag: a named, displayed relay -----------------------------------------------
+TAG_W, TAG_H = 270, 96             # world size at Size 1
+TAG_TIP = 26                       # how far the pointed left end reaches in
+TAG_HOLE = (17, TAG_H / 2, 6.5)    # the punched hole the wire ties into: x, y, radius
+TAG_PAD = 12
+TAG_NAME_H = 30                    # the name row
+TAG_STREAM = (TAG_W - TAG_PAD - 12, TAG_PAD + TAG_NAME_H / 2, 11)   # the streaming icon: x, y, radius
+TAG_STREAM_WIRE = (240, 200, 90)   # the wire from what turns streaming on
+TAG_HELD = (128, 132, 146)         # the icon and label while holding
+
+
+class DataTag(DataRelay):
+    """A named data point: a relay you can read. Shaped like a luggage tag —
+    the incoming wire ties into the hole in its pointed end, and its name is
+    printed on it ("Time Tagger output"), so a value carried far across the
+    canvas still says what it is. It shows the value the way a Function does
+    (6 significant digits, shrinking to fit) with your unit beside it, and
+    passes it on as `value` — link anything to it, as many as you like, with
+    no delay. Click the name to rename it; click anywhere else to choose its
+    source. Ctrl+click selects it.
+
+    Streaming: the ((•)) icon. Unlinked, the tag streams — live, always. Click
+    it, then a button or switch, and it streams only while that's on and
+    otherwise HOLDS the last value it took (saved with the canvas): a push
+    button takes one fresh reading per press, a switch streams while it's on.
+    Click the icon, then the tag itself, to go back to always streaming."""
+
+    TYPE = "data_tag"
+    MENU_LABEL = "Add data tag"
+    NAME = "Data tag"
+    SIZE = (TAG_W, TAG_H)
+    DOT_COLOR = (110, 200, 255)
+    PROPS = [Prop("unit", "Unit", "str", "", prompt="Unit to show after the number (e.g. counts/s, nm, mW):"),
+             Prop("color", "Color", "color", (110, 200, 255)),
+             Prop("stream", kind="data", default={}, hidden=True),    # what turns streaming on: {"id", "key"}
+             Prop("held", kind="data", default=None, hidden=True)]    # the last value taken (shown while off)
+
+    @classmethod
+    def create(cls, app):
+        def make(x, y):
+            used = {o.text for o in app.scene.objects if isinstance(o, DataTag)}
+            return cls(x, y, next(f"Tag {i}" for i in range(1, 1000) if f"Tag {i}" not in used))
+        app.start_placing(make)
+
+    @classmethod
+    def icon_sample(cls):
+        sample = cls(0, 0, "Power")
+        sample.unit = "mW"
+        sample._last = 2.513
+        sample._icon = True                          # drawn as linked, with that value
+        return sample
+
+    _icon = False
+    _was_streaming = True
+
+    @property
+    def title(self):
+        return self.text or "Data tag"
+
+    # --- Streaming ------------------------------------------------------------------------
+    def stream_source(self):
+        sid = self.stream.get("id")
+        return self.scene.by_id.get(sid) if sid and self.scene else None
+
+    def streaming(self):
+        """True while the tag passes its source's value live: always when nothing is
+        linked to its streaming icon, else while that source is on (> 0.5)."""
+        src = self.stream_source()
+        guard = self.id + "#stream"
+        if src is None or guard in _RELAYS_RESOLVING:
+            return True
+        _RELAYS_RESOLVING.add(guard)
+        try:
+            on = src.outputs().get(self.stream.get("key"))
+        finally:
+            _RELAYS_RESOLVING.discard(guard)
+        return on is not None and on > DC_EDGE
+
+    def value(self):
+        """Live while streaming (and remembered); otherwise the value it last took."""
+        if self._icon:
+            return self._last
+        if self.streaming():
+            self.held = super().value()
+        return self.held
+
+    def tick(self, dt):
+        super().tick(dt)
+        streaming = self.streaming()
+        if self._was_streaming and not streaming and self.scene is not None:
+            self.scene.save()                         # a reading was just taken: keep it
+        self._was_streaming = streaming
+
+    def pick_stream(self, app):
+        linked = self.stream_source() is not None
+        def link(src):
+            if src is self:                          # clicked itself: always stream again
+                self.stream = {}
+            else:
+                keys = list(src.outputs())
+                key = next((k for k in ("pressed", "on", "value") if k in keys), keys[0])
+                self.stream = {"id": src.id, "key": key}
+            self._recount = 0.0
+            app.save()
+        hint = " — or click this tag to always stream" if linked else ""
+        app.start_picking("Click what turns streaming on (a push button: one reading per press; "
+                          f"a switch: live while on){hint}", link,
+                          accept=lambda obj: (obj is self and linked) or (obj is not self and bool(obj.outputs())),
+                          origin=self.stream_point())
+
+    def next_stream_key(self, app):
+        src = self.stream_source()
+        keys = list(src.outputs()) if src is not None else []
+        if keys:
+            key = self.stream.get("key")
+            self.stream["key"] = keys[(keys.index(key) + 1) % len(keys) if key in keys else 0]
+            app.save()
+
+    def always_stream(self, app):
+        self.stream = {}
+        app.save()
+
+    def rename(self, app):
+        def submit(text):
+            if text.strip():
+                self.text = text.strip()
+                app.save()
+        app.ask("Name:", submit, value=self.title)
+
+    # --- Layout (world units at Size 1 from the top-left) ---------------------------------
+    def _to_world(self, x, y):
+        c = self.world_center
+        return (c.x - self.world_width / 2 + x * self.scale, c.y - self.world_height / 2 + y * self.scale)
+
+    def input_point(self):
+        return self._to_world(TAG_HOLE[0], TAG_HOLE[1])
+
+    def output_point(self):
+        return self._to_world(TAG_W, TAG_H / 2)
+
+    def stream_point(self):
+        return self._to_world(TAG_STREAM[0], TAG_STREAM[1])
+
+    def _stream_rect(self, rect):
+        k = rect.width / TAG_W
+        x, y, r = TAG_STREAM
+        return pygame.Rect(round(rect.x + (x - r * 1.4) * k), round(rect.y + (y - r * 1.4) * k),
+                           round(r * 2.8 * k), round(r * 2.8 * k))
+
+    def _name_rect(self, rect):
+        k = rect.width / TAG_W
+        return pygame.Rect(rect.x + round(TAG_TIP * 1.3 * k), rect.y, round((TAG_W - TAG_TIP * 1.3) * k),
+                           round((TAG_PAD + TAG_NAME_H) * k))
+
+    def on_click(self, pos, app):
+        rect = self.screen_rect(app.camera)
+        if self._stream_rect(rect).collidepoint(pos):
+            self.pick_stream(app)
+        elif self._name_rect(rect).collidepoint(pos):
+            self.rename(app)
+        else:
+            self.pick_source(app)
+        return True
+
+    def inspector(self, app):
+        rows = [Row("Name", self.title, on_click=self.rename)]
+        src = self.stream_source()
+        if src is None:
+            rows.append(Row("Streaming", "live — click to link a button", on_click=self.pick_stream))
+        else:
+            rows.append(Row("Streaming", f"{src.display_name} · {'on' if self.streaming() else 'off, holding'}",
+                            on_click=self.pick_stream))
+            rows.append(Row("   reads", self.stream.get("key"), on_click=self.next_stream_key))
+        return rows + super().inspector(app)
+
+    def buttons(self, app):
+        out = super().buttons(app)
+        if self.stream_source() is not None:
+            out.append(Btn("Always stream", self.always_stream))
+        return out
+
+    def draw_links(self, surface, camera):
+        super().draw_links(surface, camera)
+        src = self.stream_source()
+        if src is not None and src.center is not None:
+            draw_wire(surface, camera, output_point(src), self.stream_point(), TAG_STREAM_WIRE)
+
+    # --- Drawing ----------------------------------------------------------------------
+    def draw_shape(self, surface, rect, camera):
+        value = self._last
+        k = rect.width / TAG_W
+        src = self if self._icon else self.source_obj()
+        state = RELAY_CORE if self._icon else self._state_color(value)
+
+        def pt(x, y):
+            return (rect.x + x * k, rect.y + y * k)
+
+        outline = [pt(TAG_TIP, 0), pt(TAG_W, 0), pt(TAG_W, TAG_H), pt(TAG_TIP, TAG_H),
+                   pt(0, TAG_H - TAG_TIP), pt(0, TAG_TIP)]
+        shadow = [(x, y + max(1, 3 * k)) for x, y in outline]
+        pygame.draw.polygon(surface, (14, 14, 18), shadow)
+        pygame.draw.polygon(surface, INPUT_HOUSING, outline)
+        if rect.height < 16:                        # tiny: just the tag shape
+            return
+        # A stripe of the tag's color down the pointed end, then the rim.
+        stripe = [pt(TAG_TIP, 0), pt(TAG_TIP * 1.3, 0), pt(TAG_TIP * 1.3, TAG_H), pt(TAG_TIP, TAG_H),
+                  pt(0, TAG_H - TAG_TIP), pt(0, TAG_TIP)]
+        pygame.draw.polygon(surface, shade(self.color, 0.55), stripe)
+        pygame.draw.polygon(surface, shade(INPUT_HOUSING, 1.35), outline, max(1, round(2 * k)))
+        # The punched hole with a metal grommet; it glows with the relay's state color.
+        hx, hy, hr = TAG_HOLE
+        hole = pygame.Vector2(pt(hx, hy))
+        pygame.draw.circle(surface, (196, 200, 210), hole, hr * k * 1.45)
+        pygame.draw.circle(surface, (120, 124, 134), hole, hr * k * 1.45, max(1, round(k)))
+        pygame.draw.circle(surface, (12, 12, 15), hole, hr * k)
+        if src is not None:
+            flare = self._blink / RELAY_BLINK
+            pygame.draw.circle(surface, shade(state, 0.7 + 0.5 * flare), hole, max(1, hr * k * 0.55))
+        # The output nub on the right edge.
+        nub_on = value is not None
+        pygame.draw.circle(surface, self.color if nub_on else shade(self.color, 0.4),
+                           pt(TAG_W, TAG_H / 2), max(2, round(5 * k)))
+
+        # The name.
+        name = self._name_rect(rect)
+        size = round(TAG_NAME_H * 0.62 * k)
+        if size >= 7:
+            font = get_font(size, "bahnschrift")
+            room = round((TAG_STREAM[0] - TAG_STREAM[2] * 1.6) * k) - (name.x - rect.x)   # up to the icon
+            ts = font.render(clip_text(self.title, font, room), True, (226, 228, 236))
+            surface.blit(ts, ts.get_rect(midleft=(name.x, rect.y + round((TAG_PAD + TAG_NAME_H / 2) * k))))
+
+        # The streaming icon, ((•)): lit while streaming, grey while holding; in a well once linked.
+        live = True if self._icon else self.streaming()
+        stream_linked = self.stream_source() is not None
+        sx, sy, sr = TAG_STREAM
+        center, radius = pygame.Vector2(pt(sx, sy)), sr * k
+        if radius >= 4:
+            if stream_linked:
+                pygame.draw.circle(surface, INPUT_WELL, center, radius * 1.3)
+                pygame.draw.circle(surface, TAG_STREAM_WIRE if live else TAG_HELD, center, radius * 1.3,
+                                   max(1, round(1.5 * k)))
+            ink = RELAY_CORE if live else TAG_HELD
+            pygame.draw.circle(surface, ink, center, max(1, radius * 0.22))
+            width = max(1, round(radius * 0.17))
+            pulse = 0.5 + 0.5 * math.sin(pygame.time.get_ticks() / 1000.0 * 5) if live else 1.0
+            for i, rr in enumerate((radius * 0.55, radius * 0.92)):
+                arc_rect = pygame.Rect(0, 0, round(2 * rr), round(2 * rr))
+                arc_rect.center = (round(center.x), round(center.y))
+                color = shade(ink, 0.55 + 0.45 * pulse) if live and i == 1 else ink
+                pygame.draw.arc(surface, color, arc_rect, -0.75, 0.75, width)
+                pygame.draw.arc(surface, color, arc_rect, math.pi - 0.75, math.pi + 0.75, width)
+
+        # The screen: the value (Function-style digits, shrinking to fit) and the unit.
+        screen = pygame.Rect(rect.x + round(TAG_TIP * 1.3 * k), rect.y + round((TAG_PAD + TAG_NAME_H) * k),
+                             round((TAG_W - TAG_TIP * 1.3 - TAG_PAD) * k),
+                             round((TAG_H - TAG_PAD * 2 - TAG_NAME_H) * k))
+        corner = max(2, round(6 * k))
+        draw_rect(surface, shade(self.color, 0.07), screen, border_radius=corner)
+        draw_rect(surface, (8, 8, 10), screen, width=max(1, round(2 * k)), border_radius=corner)
+        pad = round(8 * k)
+        if src is None or self._loop:
+            text = "click to link" if src is None else "loop"
+            size = round(13 * k)
+            if size >= 7:
+                font = get_font(size, "consolas", True)
+                ts = font.render(clip_text(text, font, screen.width - 2 * pad), True,
+                                 (130, 132, 144) if src is None else RELAY_LOOP)
+                surface.blit(ts, ts.get_rect(midleft=(screen.x + pad, screen.centery)))
+            return
+        number = "—" if value is None else f"{value:.6g}"
+        color = shade(self.color, 1.2 if live else 0.85) if value is not None else WARN_COLOR
+        held_w = 0
+        if not live:                                 # holding: say so, at the left of the screen
+            size = round(screen.height * 0.3)
+            if size >= 7:
+                hs = get_font(size, "bahnschrift").render("HELD", True, TAG_HELD)
+                surface.blit(hs, hs.get_rect(midleft=(screen.x + pad, screen.centery)))
+                held_w = hs.get_width() + pad
+        unit_w = 0
+        usize = round(screen.height * 0.42)
+        if self.unit and usize >= 7:
+            us = get_font(usize, "consolas", True).render(self.unit, True, shade(self.color, 0.85))
+            if us.get_width() < screen.width * 0.45:
+                unit_w = us.get_width() + round(5 * k)
+                surface.blit(us, us.get_rect(midright=(screen.right - pad, screen.centery + round(2 * k))))
+        size = round(screen.height * 0.62)
+        room = screen.width - 2 * pad - unit_w - held_w
+        while size > 7 and get_font(size, "consolas", True).size(number)[0] > room:
+            size = max(7, int(size * 0.9))
+        if size >= 7:
+            ts = get_font(size, "consolas", True).render(number, True, color)
+            surface.blit(ts, ts.get_rect(midright=(screen.right - pad - unit_w, screen.centery)))
 
 
 # ============================================================================
