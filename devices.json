@@ -1,3 +1,68 @@
 {
-  "devices": []
+  "devices": [
+    {
+      "name": "arduino_servo",
+      "driver": "arduino_servo",
+      "options": {
+        "port": "auto",
+        "baud": 9600
+      }
+    },
+    {
+      "name": "zaber",
+      "driver": "zaber_stage",
+      "options": {
+        "port": "COM3",
+        "stage": 1,
+        "baud": 115200
+      }
+    },
+    {
+      "name": "zaber2",
+      "driver": "zaber_stage",
+      "options": {
+        "port": "COM3",
+        "stage": 0,
+        "baud": 115200
+      }
+    },
+    {
+      "name": "pm100d",
+      "driver": "pm100d_meter",
+      "options": {
+        "address": "auto"
+      }
+    },
+    {
+      "name": "superk",
+      "driver": "superk_laser",
+      "options": {
+        "port": "auto"
+      }
+    },
+    {
+      "name": "flipper",
+      "driver": "flip_mirror",
+      "options": {
+        "mirror": "detection",
+        "channel": "auto"
+      }
+    },
+    {
+      "name": "flipper2",
+      "driver": "flip_mirror",
+      "options": {
+        "mirror": "excitation",
+        "channel": "auto"
+      }
+    },
+    {
+      "name": "band",
+      "driver": "filter_band",
+      "options": {
+        "port": "COM3",
+        "baud": 115200
+      }
+    }
+  ]
 }

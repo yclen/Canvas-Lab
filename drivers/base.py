@@ -5,6 +5,7 @@ A driver describes its device in two lists and implements a few methods:
     class Servo(Driver):
         params = {"angle": Param(0, 180, unit="deg", default=90)}     # things you SET
         readings = {"position": Reading(unit="deg")}                  # things you READ
+        actions = ["home"]                                            # buttons: methods to call
         poll_hz = 20                                                  # read() calls per second
 
         def open(self):                 # connect (e.g. open the serial port)
@@ -18,7 +19,11 @@ A driver describes its device in two lists and implements a few methods:
 
 The server calls these from one worker thread per device, so a driver never
 needs locks of its own. It clamps every value to the Param's min/max before
-calling set_<name>, so out-of-range values never reach the hardware.
+calling set_<name>, so out-of-range values never reach the hardware. If
+set_<name> or an action raises, the error is shown as the device's message
+and the device keeps running (only open() / read() failures restart it).
+A driver can replace `params` / `readings` per instance in open() — e.g. a
+stage whose travel range is only known once it's connected.
 """
 
 
@@ -52,6 +57,7 @@ class Reading:
 class Driver:
     params = {}       # name -> Param
     readings = {}     # name -> Reading
+    actions = []      # method names the canvas shows as buttons (e.g. "home", "stop")
     poll_hz = 20      # how often the server calls read()
 
     def __init__(self, **options):
@@ -66,6 +72,10 @@ class Driver:
 
     def read(self):
         return {}
+
+    # Optional: on_no_clients(self) — called when the last client (the canvas)
+    # disconnects or crashes; e.g. a laser turns its emission off. Readings may
+    # also be text (shown as-is, never linked: only numbers are outputs).
 
     def apply(self, name, value):
         """Called by the server: clamp, hand to set_<name>, remember. Returns

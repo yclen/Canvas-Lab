@@ -20,11 +20,13 @@ Protocol: JSON, one object per line, both ways.
     {"op": "add_device", "name": "arm", "driver": "fake_arduino", "options": {"port": "COM4"}}
     {"op": "remove_device", "name": "arm"}
     {"op": "configure_device", "name": "servo", "options": {"port": "COM11"}}   (restarts it)
+    {"op": "action", "device": "zaber", "name": "home"}       (runs a driver action, e.g. home / stop)
     {"op": "shutdown"}                                -> closes every device and exits
   server -> client
     {"op": "catalog", "devices": [{name, driver, status, message,
                                    params: {angle: {min, max, unit, value}},
-                                   readings: {position: {unit}}, values: {...}, options}],
+                                   readings: {position: {unit}}, values: {...}, options,
+                                   actions: ["home", "stop"]}],
                       "drivers": [{module, title, params: [...], readings: [...], error}],
                       "ports": [{device: "COM11", description, arduino: true}]}
     {"op": "readings", "device": ..., "values": {"position": 87.3, ...}}   (each poll)
@@ -57,12 +59,24 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(HERE, "devices.json")
 DRIVERS_DIR = os.path.join(HERE, "drivers")
 RETRY_SECONDS = 3
+NO_CLIENTS = "__no_clients__"          # internal action: the last client (canvas) went away
 
 sys.path.insert(0, HERE)               # so "drivers" imports from this folder
 
 
+for _stream in (sys.stdout, sys.stderr):        # a console that can't show a character (λ, µ…)
+    try:                                        # prints a stand-in instead of raising
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+
 def log(message):
-    print(time.strftime("%H:%M:%S"), message, flush=True)
+    # Never let logging take a device down: this runs inside error handlers.
+    try:
+        print(time.strftime("%H:%M:%S"), message, flush=True)
+    except Exception:
+        pass
 
 
 def load_driver_module(name):
@@ -113,6 +127,7 @@ class DeviceRunner:
         self.status, self.message = "starting", ""
         self.values = {}                  # latest readings
         self._pending = {}                # param -> newest requested value
+        self._actions = []                # driver actions requested (run in order)
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -121,14 +136,18 @@ class DeviceRunner:
         return {"name": self.name, "driver": self.driver_name, "options": self.options}
 
     def describe(self):
-        cls = type(self.driver) if self.driver is not None else None
+        # Status first: the worker sets it to "ok" only after the driver is open, so
+        # reading it before the driver means "ok" always comes with the driver's params.
+        status, message = self.status, self.message
+        d = self.driver                   # params / readings may be set per instance (e.g. a travel range)
         params = {}
-        if cls is not None:
-            for pname, p in cls.params.items():
-                params[pname] = dict(p.describe(), value=self.driver.values.get(pname))
-        return {"name": self.name, "driver": self.driver_name, "status": self.status,
-                "message": self.message, "params": params, "options": dict(self.options),
-                "readings": {r: spec.describe() for r, spec in cls.readings.items()} if cls else {},
+        if d is not None:
+            for pname, p in d.params.items():
+                params[pname] = dict(p.describe(), value=d.values.get(pname))
+        return {"name": self.name, "driver": self.driver_name, "status": status,
+                "message": message, "params": params, "options": dict(self.options),
+                "readings": {r: spec.describe() for r, spec in d.readings.items()} if d else {},
+                "actions": list(getattr(d, "actions", [])) if d else [],
                 "values": dict(self.values)}
 
     def request(self, param, value):
@@ -136,9 +155,21 @@ class DeviceRunner:
             self._pending[param] = value
         self._wake.set()
 
+    def request_action(self, name):
+        with self._lock:
+            self._actions.append(name)
+        self._wake.set()
+
     def stop(self):
         self._stop.set()
         self._wake.set()
+
+    def _warn(self, message):
+        """Show (or clear) a message without changing the status — the device is still running."""
+        if message:
+            log(f"{self.name}: {message}")
+        if message != self.message:
+            self._set_status(self.status, message)
 
     def _set_status(self, status, message=""):
         self.status, self.message = status, message
@@ -162,8 +193,8 @@ class DeviceRunner:
                     self.driver.values.update({k: v for k, v in self.driver_values.items()
                                                if k in self.driver.params})
                 self.driver.open()
-                self._set_status("ok")
-                self.server.broadcast_catalog()      # params/readings are known now
+                self.status, self.message = "ok", ""
+                self.server.broadcast_catalog()      # status + params/readings arrive together
                 log(f"{self.name}: running ({self.driver_name})")
                 self._loop()
             except Exception as e:
@@ -180,12 +211,33 @@ class DeviceRunner:
         while not self._stop.is_set():
             with self._lock:
                 pending, self._pending = self._pending, {}
+                actions, self._actions = self._actions, []
             for param, value in pending.items():
                 if param not in self.driver.params:
                     continue
-                applied = self.driver.apply(param, value)
+                try:
+                    applied = self.driver.apply(param, value)
+                except Exception as e:            # a refused move etc.: report it, keep running
+                    self._warn(f"{param}: {type(e).__name__}: {e}")
+                    continue
                 self.server.broadcast({"op": "param", "device": self.name, "param": param,
                                        "value": applied})
+            for name in actions:
+                if name == NO_CLIENTS:            # the canvas closed / crashed: let the driver react
+                    hook = getattr(self.driver, "on_no_clients", None)
+                    if hook is not None:
+                        try:
+                            hook()
+                        except Exception as e:
+                            self._warn(f"on_no_clients: {type(e).__name__}: {e}")
+                    continue
+                if name not in getattr(self.driver, "actions", []):
+                    continue
+                try:
+                    getattr(self.driver, name)()
+                    self._warn("")                 # an action that worked clears an old warning
+                except Exception as e:
+                    self._warn(f"{name}: {type(e).__name__}: {e}")
             now = time.monotonic()
             if now >= next_poll:
                 self.values = self.driver.read() or {}
@@ -212,6 +264,7 @@ class Server:
     def __init__(self, config):
         self.clients = set()
         self._clients_lock = threading.Lock()
+        self._catalog_lock = threading.Lock()   # build + send catalogs one at a time, in order
         self.devices = {}
         for d in config.get("devices", []):
             self.devices[d["name"]] = DeviceRunner(d["name"], d["driver"], d.get("options"), self)
@@ -230,17 +283,26 @@ class Server:
                 self._drop(c)
 
     def broadcast_catalog(self):
-        self.broadcast(self.catalog())
+        # Built and sent under one lock, so an older catalog (from another
+        # thread) can never arrive after a newer one.
+        with self._catalog_lock:
+            self.broadcast(self.catalog())
 
     def save_config(self):
         with open(CONFIG, "w", encoding="utf-8") as f:
             json.dump({"devices": [r.config() for r in self.devices.values()]}, f, indent=2)
 
     def _drop(self, client):
+        last = False
         with self._clients_lock:
             if client in self.clients:
                 self.clients.discard(client)
                 log(f"client {client.addr[1]} disconnected")
+                last = not self.clients
+        if last:                                  # nobody's watching: e.g. a laser turns its emission off
+            log("no clients left")
+            for runner in list(self.devices.values()):
+                runner.request_action(NO_CLIENTS)
         try:
             client.sock.close()
         except OSError:
@@ -279,6 +341,11 @@ class Server:
                 if runner is None:
                     raise ValueError(f"no device {msg.get('device')!r}")
                 runner.request(msg["param"], float(msg["value"]))
+            elif op == "action":
+                runner = self.devices.get(msg.get("device"))
+                if runner is None:
+                    raise ValueError(f"no device {msg.get('device')!r}")
+                runner.request_action(str(msg["name"]))
             elif op == "add_device":
                 name, driver = str(msg["name"]).strip(), str(msg["driver"])
                 if not re.fullmatch(r"[A-Za-z0-9_\- ]{1,40}", name):

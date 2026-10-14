@@ -560,7 +560,7 @@ class ScrollList:
 
 
 class Btn:
-    """A button at the bottom of the inspector. style "go" = green when enabled."""
+    """A button at the bottom of the inspector. style "go" = green, "stop" = red."""
 
     def __init__(self, label, on_click, *, style="normal", enabled=True):
         self.label, self.on_click, self.style, self.enabled = label, on_click, style, enabled
@@ -2433,16 +2433,19 @@ class ConfirmModal:
     by draw and hit-testing so they can't drift. `handle_event` returns None /
     "confirm" / "cancel"; on confirm the loop calls commit() -> on_confirm()."""
 
-    def __init__(self, message, sub, on_confirm):
+    def __init__(self, message, sub, on_confirm, ok_label="Delete"):
         self.message = message
         self.sub = sub
         self.on_confirm = on_confirm
+        self.ok_label = ok_label                # the confirming button ("Delete", "Flip it", …)
 
     def commit(self):
         self.on_confirm()
 
     def layout(self, screen_size):
-        box = pygame.Rect(0, 0, 300, 130)
+        font = get_font(MENU_FONT_SIZE)                  # wide enough for its text
+        width = max(300, font.size(self.message)[0] + 32, font.size(self.sub)[0] + 32)
+        box = pygame.Rect(0, 0, min(width, screen_size[0] - 20), 130)
         box.center = (screen_size[0] // 2, screen_size[1] // 2)
         bw, bh, gap = 100, 32, 16
         start_x = box.centerx - (bw * 2 + gap) // 2
@@ -2479,7 +2482,7 @@ class ConfirmModal:
         surface.blit(cl, cl.get_rect(center=cancel.center))
 
         pygame.draw.rect(surface, (150, 50, 50), delete, border_radius=4)
-        dl = font.render("Delete", True, (255, 255, 255))
+        dl = font.render(self.ok_label, True, (255, 255, 255))
         surface.blit(dl, dl.get_rect(center=delete.center))
 
 
@@ -2587,6 +2590,8 @@ class InspectorPanel:
                 bcolor, tcolor = (55, 55, 64), (120, 120, 130)
             elif b.style == "go":
                 bcolor, tcolor = (60, 130, 70), (240, 240, 240)
+            elif b.style == "stop":
+                bcolor, tcolor = (170, 48, 48), (250, 240, 240)
             else:
                 bcolor, tcolor = (70, 70, 88), INSPECTOR_TITLE
             pygame.draw.rect(surface, bcolor, rect, border_radius=6)
@@ -3250,6 +3255,6 @@ class App:
         q_pastes=False when the user needs to type a 'q' (e.g. 'sqrt')."""
         self.modal = TextInputModal(prompt, on_submit, value=value, q_pastes=q_pastes)
 
-    def confirm(self, message, sub, on_confirm):
-        """Open a Cancel / Delete dialog; on_confirm() runs if they confirm."""
-        self.modal = ConfirmModal(message, sub, on_confirm)
+    def confirm(self, message, sub, on_confirm, ok_label="Delete"):
+        """Open a Cancel / <ok_label> dialog; on_confirm() runs if they confirm."""
+        self.modal = ConfirmModal(message, sub, on_confirm, ok_label)

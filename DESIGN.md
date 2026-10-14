@@ -233,6 +233,91 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
     Only one program can hold a COM port: close the Arduino IDE's Serial Monitor first.
     The canvas object draws the servo from above — blue case with ears, a 0–180° scale, and a
     white horn that swings to the set angle — over the generic Device's panel.
+  - **Zaber stage** (`drivers/zaber_stage.py`, canvas object *Zaber stage*): wraps the lab driver
+    `../hardware drivers/zaber.py` (imported, not copied). One device per stage; stages on the
+    same port share one chain connection (ref-counted: first opens, last closes). The registry
+    survives the server re-importing drivers (`globals().get(...)`) — a reset registry made a
+    second stage try to reopen the port ("in use"). `sim://` refuses a second open, like a
+    real port, so tests catch that. The server reads a device's status before its driver and
+    sends catalogs one at a time, so "ok" always arrives with the device's params. Options:
+    `port` (never scans — `auto` only matches Zaber's own USB id 0x2939, since an FTDI port here
+    may be the laser), `stage` (0-based chain index), `baud`. Param `target` (mm) gets the
+    stage's real travel range in `open()` (drivers can set `params` per instance); readings
+    `position`, `moving`, `homed`; actions `home`, `stop`. Moves don't wait, so a slider keeps
+    re-targeting; connecting never moves (target starts at the current position). `sim://` is a
+    built-in pretend 3-stage chain. The canvas object draws a stepper motor on a rail with the
+    carriage at the real position, an orange target marker, a glow while moving, NOT HOMED.
+  - **PM100D power meter** (`drivers/pm100d_meter.py`, canvas object *PM100D*): wraps the lab
+    driver `../hardware drivers/pm100d.py` (pyvisa / NI-VISA, USB — not a COM port). Option
+    `address`: `auto` (the lab driver finds the Thorlabs VID 0x1313 resource), a VISA resource
+    string, or `sim://`. Readings `power` (W) and `power_mW`; param `wavelength` (nm, the
+    sensor's correction range, starting at the meter's own setting — connecting never changes
+    it). The object is a display: the handheld console with a backlit LCD, power auto-scaled to
+    nW / µW / mW / W (4 significant digits, `format_power`), the wavelength, and a log level
+    bar from 1 nW to 1 W.
+  - **SuperK laser** (`drivers/superk_laser.py`, canvas object *SuperK laser*): wraps the lab driver
+    `../hardware drivers/superk.py` (nkt_tools / NKT DLL). Safety rules from the Quantum Yield
+    control GUI: emission changes **only** through actions (`emission_on` / `emission_off`) —
+    never a linkable param, since linked params are re-sent after a reconnect; `emission_on` is
+    refused while the interlock is open (with the reason); the object's button is green "Turn
+    emission ON" when idle and red "Turn emission OFF" when emitting **or unknown** (never
+    guesses); the object also has a built-in switch (below). Emission goes off on the object's Disconnect, when the server loses its last
+    client (`on_no_clients` hook — the canvas closed or crashed; option
+    `off_when_canvas_closes`, default on), and on any driver close (device restart / removal /
+    read error / server stop — the lab driver turns it off on disconnect). Param `power_level`
+    (0–100 %, 0.1 % steps, starts at the laser's own setpoint). Text readings `interlock`,
+    `status`, `port` are shown but not outputs (Device outputs are numbers only). Port `auto`
+    scans like the lab GUIs; set it explicitly to avoid opening other ports. `sim://` pretends.
+    The object: laser head with a warning triangle, EMITTING / IDLE / UNKNOWN, power bar,
+    interlock / status lines, and a rainbow beam from the output port while emitting.
+  - **Built-in emission switch** (SuperK): the safety lives in the object. The SuperK draws its
+    own slide switch next to EMITTING / IDLE / UNKNOWN; clicking it (on the canvas — it doesn't
+    select) or the panel button toggles emission. It always shows the laser's *actual* state, read
+    back — never a remembered position — so it can't disagree with the laser; unknown is an amber
+    "?" and a click turns emission off. After a click the knob shows the asked-for side with an
+    amber ring until the laser confirms (≤ 1.5 s), snapping back at once if the driver refuses
+    (interlock open — the panel shows why). This replaced linking emission to an external switch
+    (which could end up showing ON while the laser was off). Emission still isn't linkable.
+  - **SuperK start-up state:** the emission register reads 0 (off) / 3 (on) and something else
+    while the laser ramps up after "on"; nkt_tools raises "Unknown emission state" for that. The
+    driver treats it as *unknown* (no `emission` reading) and carries on, as the Quantum Yield GUI
+    does — letting it fail the read restarted the device, and the restart turned emission off.
+    The object shows STARTING… for an unknown state within 30 s of an "on" request (UNKNOWN
+    otherwise); the switch is an amber "?" (a click turns emission off). `sim://` ramps for 1.5 s.
+  - **Flip mirror** (`drivers/flip_mirror.py`, canvas object *Flip mirror*): wraps the lab driver
+    `../hardware drivers/flipper.py` (New Focus flipper on an NI 6363 output; nidaqmx). The mirror's
+    channel and its up / down path names come from `flipper.SETUP` at connect time (option `mirror`:
+    excitation | detection; `channel` auto | explicit | `sim://`). No readback, edge-triggered (see
+    flipper.py), so: **connecting never moves it** (`connect(initialize=False)` — the NI output keeps
+    its level; position starts unknown), since the server opens every device in devices.json when it
+    launches. Then "It's at <path>" (`sync_up` / `sync_down` — nothing moves) or "Find position"
+    (`find_position` — flips down then up; asks first: `App.confirm(..., ok_label=...)`). Known →
+    click the mirror (or Flip) to toggle; param `up` (1/0) is linkable. Every position is labelled
+    *assumed*. Closing the device (server stop / restart / removal, or switching `mirror`) parks
+    the line at 0 V, so the mirror lowers — flipper.py's deliberate end state. The object draws the
+    beam: up = mirror at 45° reflecting to the up path, down = mirror flat and the beam straight on,
+    unknown = grey mirror and a "?".
+  - **Confirm dialogs** take an `ok_label` ("Delete" by default) and grow to fit their text.
+  - **Buttons:** `Btn(style="stop")` is red.
+  - **Server robustness:** the server's console replaces characters it can't print (λ, µ …)
+    instead of raising, and `log()` never raises — a print inside a driver's error used to kill
+    that device's worker thread, leaving it stuck at "starting".
+  - **Excitation band** (`drivers/filter_band.py`, canvas object *Excitation band*): the longpass +
+    shortpass linear variable filters as one device in **nm** — params `center`, `width`; readings
+    the actual band and each cutoff, read back from the stage positions. Wraps the Zaber chain
+    through `zaber_stage.py`'s shared chain registry (so Zaber stage devices on the same port
+    coexist), finding each stage by **serial** (the chain index isn't stable; `sim://` uses indices).
+    The calibration is **hard-coded** (`CALIBRATION`): the points from the Quantum Yield GUI's
+    `filter_calibration.json`, a least-squares line per filter (that GUI's *linear* mode),
+    extrapolated over the stage travel but held to its 400–800 nm working span. Unreachable
+    requests are pulled in to the nearest reachable band (setting center keeps the width and vice
+    versa, so only the param that was set changes); nothing moves until both stages are homed, so
+    a band is never half-applied. The object is a **color picker**: a spectrum strip — click / drag
+    sets the center (unless center is linked), the passed band stays lit, the requested band shows
+    as an orange outline while the stages move. Editing the calibration on the canvas is for later.
+  - **Driver actions** (general): a driver's `actions = ["home", …]` become buttons on its Device
+    (`{"op": "action"}`). Errors from `set_<param>` / actions show as the device's message without
+    restarting it. A Device's outputs list readings first, so a Readout links to e.g. `position`.
   - pyserial is required (`pip install pyserial`); the unrelated `serial` package (a JSON/YAML
     library, same import name) was removed from this PC's miniconda for that reason.
 

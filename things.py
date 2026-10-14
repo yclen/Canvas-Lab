@@ -1182,11 +1182,16 @@ class Device(Thing):
         instruments.client.want(self.id, False)
 
     def outputs(self):
+        """Readings first (what it reports — a readout links to the first one by
+        default), then params (what it's set to)."""
         info = self.info()
         if info is None:
             return {}
-        out = {p: spec["value"] for p, spec in info["params"].items() if spec.get("value") is not None}
-        out.update(info["values"])
+        out = {k: v for k, v in info["values"].items()
+               if isinstance(v, (int, float)) and not isinstance(v, bool)}   # numbers only (text is shown, not linked)
+        for p, spec in info["params"].items():
+            if spec.get("value") is not None:
+                out.setdefault(p, spec["value"])
         return out
 
     def tick(self, dt):
@@ -1274,7 +1279,8 @@ class Device(Thing):
                 rows.append(Gap(6))
             for name, spec in info["readings"].items():
                 value = info["values"].get(name)
-                rows.append(Row(name, "—" if value is None else f"{value:g} {spec.get('unit', '')}"))
+                rows.append(Row(name, "—" if value is None else
+                                str(value) if isinstance(value, str) else f"{value:g} {spec.get('unit', '')}"))
         return rows + [Gap(6)] + self.prop_rows()
 
     def remove_from_server(self, app):
@@ -1283,8 +1289,15 @@ class Device(Thing):
             app.scene.delete(self)
         app.confirm(f"Remove '{self.device}'?", "From the server and the canvas.", remove)
 
+    def run_action(self, app, name):
+        instruments.client.send({"op": "action", "device": self.device, "name": name})
+
     def buttons(self, app):
         out = []
+        info = self.info() if self.connect else None
+        if info is not None and info.get("status") == "ok":
+            for name in info.get("actions", []):          # driver actions: Home, Stop, …
+                out.append(Btn(name.capitalize(), lambda app, n=name: self.run_action(app, n)))
         if self.links:
             out.append(Btn("Unlink all", self.unlink_all))
         if not self.DRIVER and self.connect and instruments.client.connected and self.info() is not None:
@@ -1347,7 +1360,8 @@ class Device(Thing):
                 lines.append((f"{p} →", "—" if v is None else f"{v:.1f} {spec.get('unit', '')}", (255, 190, 90)))
             for r, spec in info["readings"].items():
                 v = info["values"].get(r)
-                lines.append((r, "—" if v is None else f"{v:.1f} {spec.get('unit', '')}", (120, 230, 150)))
+                lines.append((r, "—" if v is None else str(v) if isinstance(v, str)
+                              else f"{v:.1f} {spec.get('unit', '')}", (120, 230, 150)))
         line_h = screen.height / max(3, len(lines) + 0.6)
         size = round(line_h * 0.8)
         if size >= 8:
@@ -1506,6 +1520,996 @@ class ArduinoServo(Device):
                 font = get_font(size, "bahnschrift")
                 surface.blit(font.render(clip_text(text, font, room), True, color), (text_x, y))
             y += round(size * 1.12)
+
+
+
+# ---- Zaber stage: a Device with its own look ---------------------------------
+ZABER_RAIL = (58, 60, 70)
+ZABER_CARRIAGE = (196, 200, 210)
+ZABER_MOTOR = (34, 35, 40)
+ZABER_TARGET = (255, 170, 60)
+
+
+class ZaberStage(Device):
+    """One stage of a Zaber chain (driver: zaber_stage), drawn from above: a
+    stepper motor on the end of a rail, and the carriage sitting at the real
+    position (read back from the stage) along its travel. An orange marker
+    shows the target; the carriage glows while moving. Link target to a slider
+    and a readout to position. Home / Stop are buttons once it's connected."""
+
+    TYPE = "zaber_stage"
+    MENU_LABEL = "Add Zaber stage"
+    NAME = "Zaber stage"
+    DRIVER = "zaber_stage"
+    DEFAULT_DEVICE = "zaber"
+    SIZE = (300, 130)
+    DOT_COLOR = ZABER_CARRIAGE
+    PROPS = [Prop("port", "Port", "str", "COM3",
+                  prompt="The Zaber chain's COM port (e.g. COM3), or sim:// to simulate:"),
+             Prop("stage", "Stage # in chain", "int", 0, min=0, max=31,
+                  prompt="Which stage on the chain (0 = the first device):"),
+             Prop("baud", "Baud", "int", 115200, min=300, max=2_000_000)]
+
+    def device_options(self):
+        return {"port": self.port or "auto", "stage": self.stage, "baud": self.baud}
+
+    def _numbers(self):
+        """(position, target, low, high, moving, homed) from the server, None where unknown."""
+        info = self.info() if self.connect else None
+        if not info:
+            return None, None, None, None, False, False
+        spec = info["params"].get("target", {})
+        values = info["values"]
+        return (values.get("position"), spec.get("value"), spec.get("min"), spec.get("max"),
+                bool(values.get("moving")), bool(values.get("homed")))
+
+    def inspector(self, app):
+        rows = super().inspector(app)
+        position, target, low, high, moving, homed = self._numbers()
+        if low is not None and high is not None:
+            rows.append(Row("Travel", f"{low:g} – {high:g} mm"))
+        return rows
+
+    def draw_shape(self, surface, rect, camera):
+        status = self.status()
+        led_color = DEVICE_STATUS_COLORS.get(status, (110, 110, 120))
+        position, target, low, high, moving, homed = self._numbers()
+        s = rect.height
+        radius = max(2, s // 12)
+        if s < 24:                                   # tiny: rail and light
+            draw_rect(surface, ZABER_RAIL, rect, border_radius=radius)
+            pygame.draw.circle(surface, led_color, rect.center, max(1, s // 5))
+            return
+
+        # Base plate (the whole object), a header strip with the name / position / light.
+        draw_rect(surface, (14, 14, 18), rect.move(0, max(1, s // 26)), border_radius=radius)
+        draw_rect(surface, INPUT_HOUSING, rect, border_radius=radius)
+        draw_rect(surface, shade(INPUT_HOUSING, 1.35), rect, width=max(1, s // 60), border_radius=radius)
+        pad = max(2, round(s * 0.08))
+        header_h = round(s * 0.26)
+        led_r = max(2, s // 26)
+        led = (rect.right - pad - led_r, rect.y + pad + header_h // 2)
+        if status in ("ok", "starting", "error", "missing", "connecting"):
+            pygame.draw.circle(surface, shade(led_color, 0.4), led, round(led_r * 1.8))
+        pygame.draw.circle(surface, led_color, led, led_r)
+        size = round(header_h * 0.72)
+        if size >= 8:
+            font = get_font(size, "bahnschrift")
+            if status == "ok" and position is not None:
+                right_text, right_color = f"{position:.3f} mm", (236, 240, 255)
+            else:
+                right_text, right_color = DEVICE_STATUS_TEXT.get(status, status), shade(led_color, 1.1)
+            rs = font.render(right_text, True, right_color)
+            right_x = led[0] - 2 * led_r - pad - rs.get_width()
+            surface.blit(rs, (right_x, led[1] - rs.get_height() // 2))
+            title = self.text or f"{self.device} #{self.stage}"
+            ts = font.render(clip_text(title, font, max(10, right_x - rect.x - 2 * pad)), True, (170, 172, 186))
+            surface.blit(ts, (rect.x + pad, led[1] - ts.get_height() // 2))
+
+        # The stage: a stepper motor on the left end of a rail, a lead screw, the carriage.
+        area = pygame.Rect(rect.x + pad, rect.y + pad + header_h + pad // 2,
+                           rect.width - 2 * pad, rect.bottom - pad - (rect.y + pad + header_h + pad // 2))
+        motor = pygame.Rect(area.x, area.y, area.height, area.height)          # square, like a NEMA motor
+        draw_rect(surface, ZABER_MOTOR, motor, border_radius=max(2, motor.width // 8))
+        draw_rect(surface, (70, 72, 82), motor, width=max(1, motor.width // 20), border_radius=max(2, motor.width // 8))
+        boss = max(2, round(motor.width * 0.26))
+        pygame.draw.circle(surface, (60, 62, 72), motor.center, boss)
+        pygame.draw.circle(surface, (120, 122, 134), motor.center, max(1, boss // 3))
+        inset = round(motor.width * 0.17)
+        for cx, cy in ((motor.x + inset, motor.y + inset), (motor.right - inset, motor.y + inset),
+                       (motor.x + inset, motor.bottom - inset), (motor.right - inset, motor.bottom - inset)):
+            pygame.draw.circle(surface, (16, 16, 20), (cx, cy), max(1, motor.width // 18))
+        rail = pygame.Rect(motor.right, area.y + round(area.height * 0.18), area.right - motor.right,
+                           area.height - 2 * round(area.height * 0.18))
+        draw_rect(surface, ZABER_RAIL, rail, border_radius=max(2, rail.height // 6))
+        draw_rect(surface, shade(ZABER_RAIL, 0.6), rail, width=max(1, s // 70), border_radius=max(2, rail.height // 6))
+        pygame.draw.line(surface, (110, 112, 124), (rail.x, rail.centery), (rail.right - pad, rail.centery),
+                         max(1, rail.height // 9))                                              # lead screw
+
+        # Positions along the travel: carriage at the real position, marker at the target.
+        car_w = max(6, round(rail.width * 0.16))
+        track = (rail.x + car_w // 2 + pad // 2, rail.right - car_w // 2 - pad // 2)
+
+        def along(mm):
+            if mm is None or low is None or high is None or high == low:
+                return None
+            f = max(0.0, min(1.0, (mm - low) / (high - low)))
+            return round(track[0] + f * (track[1] - track[0]))
+
+        tx = along(target)
+        if tx is not None:
+            tri = max(3, rail.height // 4)
+            pygame.draw.polygon(surface, ZABER_TARGET, [(tx, rail.y - 1), (tx - tri, rail.y - tri - 1),
+                                                       (tx + tri, rail.y - tri - 1)])
+            pygame.draw.line(surface, ZABER_TARGET, (tx, rail.y), (tx, rail.bottom), max(1, s // 80))
+        cx = along(position)
+        if cx is None:
+            cx = (track[0] + track[1]) // 2
+        carriage = pygame.Rect(0, 0, car_w, rail.height + round(area.height * 0.2))
+        carriage.center = (cx, rail.centery)
+        if moving:
+            draw_rect(surface, shade(led_color, 0.6), carriage.inflate(6, 6), border_radius=max(2, car_w // 5))
+        body = ZABER_CARRIAGE if status == "ok" else shade(ZABER_CARRIAGE, 0.6)
+        draw_rect(surface, body, carriage, border_radius=max(2, car_w // 6))
+        draw_rect(surface, shade(body, 1.12), (carriage.x + 2, carriage.y + 2, carriage.width - 4,
+                                               max(1, carriage.height // 8)), border_radius=2)
+        draw_rect(surface, shade(body, 0.5), carriage, width=max(1, s // 70), border_radius=max(2, car_w // 6))
+        hole = max(1, car_w // 12)
+        for hx in (carriage.x + car_w // 4, carriage.right - car_w // 4):
+            for hy in (carriage.y + carriage.height // 4, carriage.bottom - carriage.height // 4):
+                pygame.draw.circle(surface, shade(body, 0.45), (hx, hy), hole)
+        if status == "ok" and not homed:
+            size = round(area.height * 0.22)
+            if size >= 8:
+                ns = get_font(size, "bahnschrift").render("NOT HOMED", True, WARN_COLOR)
+                surface.blit(ns, ns.get_rect(midbottom=(rail.centerx + motor.width // 2, rail.y - 2)))
+
+
+
+# ---- Excitation band: a color picker over the longpass / shortpass filters ------
+def wavelength_rgb(nm):
+    """Roughly the color of light at `nm` (Bruton's approximation); a dim deep
+    red past the visible, so the IR end of the strip still reads as 'there'."""
+    if nm < 380:
+        r, g, b = 0.38, 0.0, 0.55
+    elif nm < 440:
+        r, g, b = (440 - nm) / 60, 0.0, 1.0
+    elif nm < 490:
+        r, g, b = 0.0, (nm - 440) / 50, 1.0
+    elif nm < 510:
+        r, g, b = 0.0, 1.0, (510 - nm) / 20
+    elif nm < 580:
+        r, g, b = (nm - 510) / 70, 1.0, 0.0
+    elif nm < 645:
+        r, g, b = 1.0, (645 - nm) / 65, 0.0
+    else:
+        r, g, b = 1.0, 0.0, 0.0
+    # Fade toward the ends of what the eye sees.
+    fade = 0.35 + 0.65 * (nm - 380) / 40 if nm < 420 else 0.35 + 0.65 * (780 - nm) / 80 if nm > 700 else 1.0
+    fade = max(0.3, min(1.0, fade))
+    return tuple(round(255 * (c * fade) ** 0.8) for c in (r, g, b))
+
+
+BAND_DEFAULT_SPAN = (400.0, 800.0)     # the strip, until the driver says what the filters reach
+
+
+class FilterBand(Device):
+    """The excitation band (driver: filter_band) as a color picker: a spectrum
+    strip over what the longpass + shortpass filters can reach. Click or drag
+    on it to set the band's center; the width is set (or linked) in the panel.
+    The part of the spectrum the filters are actually passing — read back from
+    the stage positions — stays lit, the rest is dimmed, and an orange outline
+    shows the requested band while the stages catch up. Home / Stop are buttons
+    once it's connected (the stages must be homed before they'll move)."""
+
+    TYPE = "filter_band"
+    MENU_LABEL = "Add excitation band"
+    NAME = "Excitation band"
+    DRIVER = "filter_band"
+    DEFAULT_DEVICE = "band"
+    SIZE = (380, 140)
+    DOT_COLOR = (90, 200, 120)
+    PROPS = [Prop("port", "Port", "str", "COM3",
+                  prompt="The Zaber chain's COM port (e.g. COM3), or sim:// to simulate:"),
+             Prop("baud", "Baud", "int", 115200, min=300, max=2_000_000)]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._drag_nm = None        # center being dragged to (shown at once; the server lags a little)
+        self._strip_cache = None    # (key, surface): the visible part of the spectrum, rendered
+
+    def device_options(self):
+        return {"port": self.port or "auto", "baud": self.baud}
+
+    def _band(self):
+        """{center, width, lo, hi (the strip's span), actual_lp, actual_sp, moving, homed}."""
+        info = self.info() if self.connect else None
+        params = (info or {}).get("params", {})
+        values = (info or {}).get("values", {})
+        center, width = params.get("center", {}), params.get("width", {})
+        lo, hi = center.get("min"), center.get("max")
+        if lo is None or hi is None or hi <= lo:
+            lo, hi = BAND_DEFAULT_SPAN
+        return {"center": self._drag_nm if self._drag_nm is not None else center.get("value"),
+                "width": width.get("value"), "lo": lo, "hi": hi,
+                "actual_lp": values.get("longpass"), "actual_sp": values.get("shortpass"),
+                "moving": bool(values.get("moving")), "homed": bool(values.get("homed"))}
+
+    def live(self):
+        return self.connect and self.status() == "ok"
+
+    # --- Layout (shared by drawing and clicking) -------------------------------------
+    def _layout(self, rect):
+        s = rect.height
+        pad = max(2, round(s * 0.08))
+        header_h = round(s * 0.24)
+        label_h = round(s * 0.16)
+        top = rect.y + pad + header_h + pad // 2
+        strip = pygame.Rect(rect.x + pad, top, rect.width - 2 * pad, rect.bottom - pad - label_h - top)
+        return {"pad": pad, "header_h": header_h, "strip": strip, "label_h": label_h}
+
+    def _x_to_nm(self, x, strip, band):
+        t = max(0.0, min(1.0, (x - strip.x) / max(1, strip.width)))
+        return band["lo"] + t * (band["hi"] - band["lo"])
+
+    # --- Picking ---------------------------------------------------------------------
+    def on_click(self, pos, app):
+        """A click on the spectrum sets the center (and drags it); anywhere else
+        selects as usual. Not while center follows a link — the link would win."""
+        if not self.live() or "center" in self.links:
+            return False
+        strip = self._layout(self.screen_rect(app.camera))["strip"]
+        if not strip.inflate(0, 6).collidepoint(pos):
+            return False
+        self._pick(pos, app)
+        return True
+
+    def on_drag(self, pos, app):
+        self._pick(pos, app)
+
+    def on_release(self, pos, app):
+        self._drag_nm = None
+
+    def _pick(self, pos, app):
+        band = self._band()
+        nm = round(self._x_to_nm(pos[0], self._layout(self.screen_rect(app.camera))["strip"], band), 1)
+        self._drag_nm = nm
+        instruments.client.set(self.device, "center", nm)
+
+    def inspector(self, app):
+        rows = super().inspector(app)
+        band = self._band()
+        if self.live():
+            rows.append(Row("Reach", f"{band['lo']:g} – {band['hi']:g} nm"))
+        return rows
+
+    # --- Drawing -----------------------------------------------------------------------
+    def _draw_spectrum(self, surface, strip, band):
+        """The visible part of the strip: rendered small, scaled up, cached."""
+        area = strip.clip(surface.get_clip())
+        if area.width <= 0 or area.height <= 0:
+            return
+        a = self._x_to_nm(area.x, strip, band)
+        b = self._x_to_nm(area.right, strip, band)
+        key = (area.size, round(a, 2), round(b, 2))
+        if self._strip_cache is None or self._strip_cache[0] != key:
+            n = max(1, min(area.width, 400))
+            small = pygame.Surface((n, 1))
+            for i in range(n):
+                small.set_at((i, 0), wavelength_rgb(a + (b - a) * (i + 0.5) / n))
+            self._strip_cache = (key, pygame.transform.scale(small, area.size))   # (smoothscale crashes on 1-px-high)
+        surface.blit(self._strip_cache[1], area)
+
+    def draw_shape(self, surface, rect, camera):
+        status = self.status()
+        led_color = DEVICE_STATUS_COLORS.get(status, (110, 110, 120))
+        band = self._band()
+        s = rect.height
+        radius = max(2, s // 12)
+        if s < 24:                                   # tiny: a sliver of spectrum and the light
+            self._draw_spectrum(surface, rect, band)
+            pygame.draw.circle(surface, led_color, rect.center, max(1, s // 5))
+            return
+
+        draw_rect(surface, (14, 14, 18), rect.move(0, max(1, s // 26)), border_radius=radius)
+        draw_rect(surface, INPUT_HOUSING, rect, border_radius=radius)
+        draw_rect(surface, shade(INPUT_HOUSING, 1.35), rect, width=max(1, s // 60), border_radius=radius)
+        layout = self._layout(rect)
+        pad, header_h, strip = layout["pad"], layout["header_h"], layout["strip"]
+        live = status == "ok"
+
+        # Header: name, the band (with a swatch of its color), the status light.
+        led_r = max(2, s // 26)
+        led = (rect.right - pad - led_r, rect.y + pad + header_h // 2)
+        if status in ("ok", "starting", "error", "missing", "connecting"):
+            pygame.draw.circle(surface, shade(led_color, 0.4), led, round(led_r * 1.8))
+        pygame.draw.circle(surface, led_color, led, led_r)
+        size = round(header_h * 0.72)
+        if size >= 8:
+            font = get_font(size, "bahnschrift")
+            if live and band["center"] is not None and band["width"] is not None:
+                right_text, right_color = f"{band['center']:.1f} nm  ±{band['width'] / 2:g}", (236, 240, 255)
+            else:
+                right_text, right_color = DEVICE_STATUS_TEXT.get(status, status), shade(led_color, 1.1)
+            rs = font.render(right_text, True, right_color)
+            right_x = led[0] - 2 * led_r - pad - rs.get_width()
+            surface.blit(rs, (right_x, led[1] - rs.get_height() // 2))
+            if live and band["center"] is not None:
+                sw = rs.get_height()
+                swatch = pygame.Rect(right_x - pad - sw, led[1] - sw // 2, sw, sw)
+                draw_rect(surface, wavelength_rgb(band["center"]), swatch, border_radius=max(2, sw // 4))
+                draw_rect(surface, (20, 20, 24), swatch, width=1, border_radius=max(2, sw // 4))
+                right_x = swatch.x
+            title = self.text or self.device or "band"
+            ts = font.render(clip_text(title, font, max(10, right_x - rect.x - 2 * pad)), True, (170, 172, 186))
+            surface.blit(ts, (rect.x + pad, led[1] - ts.get_height() // 2))
+
+        # The spectrum, dimmed outside what the filters are passing right now.
+        self._draw_spectrum(surface, strip, band)
+
+        def x_at(nm):
+            return round(strip.x + (nm - band["lo"]) / (band["hi"] - band["lo"]) * strip.width)
+
+        lp, sp = band["actual_lp"], band["actual_sp"]
+        layer, area = alpha_layer(surface, strip)
+        if layer is not None:
+            if live and lp is not None and sp is not None:
+                x0, x1 = max(strip.x, x_at(lp)), min(strip.right, x_at(sp))
+                dim = (0, 0, 0, 175)
+                if x1 <= x0:                         # edges crossed: no light gets through
+                    pygame.draw.rect(layer, dim, strip.move(-area.x, -area.y))
+                else:
+                    pygame.draw.rect(layer, dim, (strip.x - area.x, strip.y - area.y, x0 - strip.x, strip.height))
+                    pygame.draw.rect(layer, dim, (x1 - area.x, strip.y - area.y, strip.right - x1, strip.height))
+            elif not live:
+                pygame.draw.rect(layer, (30, 30, 36, 190), strip.move(-area.x, -area.y))
+            surface.blit(layer, area)
+        if live and lp is not None and sp is not None:
+            for x in (x_at(lp), x_at(sp)):           # the actual edges
+                if strip.x <= x <= strip.right:
+                    pygame.draw.line(surface, (245, 245, 250), (x, strip.y), (x, strip.bottom - 1), max(1, s // 70))
+        if live and band["center"] is not None and band["width"] is not None:
+            target = pygame.Rect(x_at(band["center"] - band["width"] / 2), strip.y - 2, 0, strip.height + 4)
+            target.width = max(2, x_at(band["center"] + band["width"] / 2) - target.x)
+            if band["moving"] or self._drag_nm is not None:
+                pygame.draw.rect(surface, ZABER_TARGET, target, width=max(1, s // 60), border_radius=2)
+            tri = max(3, strip.height // 6)
+            cx = x_at(band["center"])
+            pygame.draw.polygon(surface, ZABER_TARGET, [(cx, strip.y + tri), (cx - tri, strip.y - 1),
+                                                       (cx + tri, strip.y - 1)])
+        draw_rect(surface, (8, 8, 10), strip, width=1)
+
+        # Wavelength ticks under the strip.
+        size = round(layout["label_h"] * 0.8)
+        if size >= 8:
+            font = get_font(size, "consolas")
+            step = 50 if strip.width >= 300 else 100
+            nm = math.ceil(band["lo"] / step) * step
+            while nm <= band["hi"]:
+                x = x_at(nm)
+                pygame.draw.line(surface, (110, 112, 124), (x, strip.bottom), (x, strip.bottom + pad // 2))
+                ls = font.render(f"{nm:g}", True, (140, 142, 156))
+                lr = ls.get_rect(midtop=(x, strip.bottom + pad // 2))
+                if lr.x >= rect.x + 2 and lr.right <= rect.right - 2:
+                    surface.blit(ls, lr)
+                nm += step
+
+        if live and not band["homed"]:
+            size = round(strip.height * 0.32)
+            if size >= 8:
+                ns = get_font(size, "bahnschrift").render("NOT HOMED — press Home", True, WARN_COLOR)
+                back = ns.get_rect(center=strip.center).inflate(pad, pad // 2)
+                draw_rect(surface, (14, 14, 18), back, border_radius=max(2, pad // 2))
+                surface.blit(ns, ns.get_rect(center=strip.center))
+
+
+
+# ---- PM100D power meter: a Device that's a display ---------------------------
+PM_BODY = (44, 45, 52)
+PM_LCD = (178, 198, 172)
+PM_LCD_INK = (24, 34, 26)
+PM_RED = (200, 40, 45)
+
+
+def format_power(watts):
+    """Power with an SI unit and 4 significant digits: '2.513 mW', '845.2 nW'."""
+    if watts is None:
+        return "—", ""
+    magnitude = abs(watts)
+    for scale, unit in ((1.0, "W"), (1e-3, "mW"), (1e-6, "µW"), (1e-9, "nW")):
+        if magnitude >= scale * 0.99995:
+            break
+    value = watts / scale
+    decimals = max(0, min(3, 3 - int(math.floor(math.log10(abs(value))))) if value else 3)
+    return f"{value:.{decimals}f}", unit
+
+
+class PowerMeter(Device):
+    """A Thorlabs PM100D optical power meter (driver: pm100d_meter), drawn as
+    the handheld console: a pale LCD with the power in big digits (auto-scaled
+    nW / µW / mW / W), the correction wavelength, and a log-scale level bar
+    (1 nW – 1 W). Its readings — power (W) and power_mW — can feed readouts;
+    the wavelength can be set by hand or linked."""
+
+    TYPE = "pm100d"
+    MENU_LABEL = "Add PM100D power meter"
+    NAME = "PM100D"
+    DRIVER = "pm100d_meter"
+    DEFAULT_DEVICE = "pm100d"
+    SIZE = (240, 170)
+    DOT_COLOR = PM_LCD
+    PROPS = [Prop("address", "Address", "str", "auto",
+                  prompt="VISA address (auto finds the meter; sim:// to simulate):")]
+
+    def device_options(self):
+        return {"address": self.address or "auto"}
+
+    def _reading(self):
+        """(watts, wavelength) from the server, None where unknown."""
+        info = self.info() if self.connect else None
+        if not info:
+            return None, None
+        return info["values"].get("power"), info["params"].get("wavelength", {}).get("value")
+
+    def draw_shape(self, surface, rect, camera):
+        status = self.status()
+        led_color = DEVICE_STATUS_COLORS.get(status, (110, 110, 120))
+        watts, wavelength = self._reading()
+        s = min(rect.width, rect.height)
+        radius = max(2, s // 10)
+        if s < 24:                                   # tiny: the console and its display
+            draw_rect(surface, PM_BODY, rect, border_radius=radius)
+            draw_rect(surface, PM_LCD, rect.inflate(-rect.width // 3, -rect.height // 3))
+            return
+
+        # Console body, with the red stripe along the bottom.
+        draw_rect(surface, (14, 14, 18), rect.move(0, max(1, s // 30)), border_radius=radius)
+        draw_rect(surface, PM_BODY, rect, border_radius=radius)
+        stripe = pygame.Rect(rect.x, rect.bottom - max(2, round(s * 0.07)), rect.width, max(2, round(s * 0.07)))
+        prev_clip = surface.get_clip()              # the body's rounded shape, cut to the stripe:
+        surface.set_clip(stripe.clip(prev_clip))    # rounded bottom corners via the fast draw_rect
+        draw_rect(surface, PM_RED, rect, border_radius=radius)
+        surface.set_clip(prev_clip)
+        draw_rect(surface, shade(PM_BODY, 1.4), rect, width=max(1, s // 70), border_radius=radius)
+
+        pad = max(2, round(s * 0.07))
+        header_h = round(s * 0.14)
+        led_r = max(2, s // 32)
+        led = (rect.right - pad - led_r, rect.y + pad + header_h // 2)
+        if status in ("ok", "starting", "error", "missing", "connecting"):
+            pygame.draw.circle(surface, shade(led_color, 0.4), led, round(led_r * 1.8))
+        pygame.draw.circle(surface, led_color, led, led_r)
+        size = round(header_h * 0.8)
+        if size >= 8:
+            font = get_font(size, "bahnschrift")
+            title = self.text or "PM100D"
+            ts = font.render(clip_text(title, font, rect.width - 4 * pad - 2 * led_r), True, (200, 202, 214))
+            surface.blit(ts, (rect.x + pad, led[1] - ts.get_height() // 2))
+
+        # The LCD.
+        lcd = pygame.Rect(rect.x + pad, rect.y + pad + header_h + pad // 2, rect.width - 2 * pad,
+                          stripe.y - pad - (rect.y + pad + header_h + pad // 2))
+        live = status == "ok"
+        glass = PM_LCD if live else shade(PM_LCD, 0.45)
+        draw_rect(surface, (20, 20, 24), lcd.inflate(4, 4), border_radius=max(2, radius - 2))   # bezel
+        draw_rect(surface, glass, lcd, border_radius=max(2, radius - 4))
+        ink = PM_LCD_INK if live else shade(PM_LCD, 0.3)
+        inner = lcd.inflate(-2 * pad, -pad)
+        if not live:
+            size = round(inner.height * 0.2)
+            if size >= 8:
+                font = get_font(size, "bahnschrift")
+                ts = font.render(clip_text(DEVICE_STATUS_TEXT.get(status, status), font, inner.width), True,
+                                 shade(led_color, 0.6) if status == "error" else ink)
+                surface.blit(ts, ts.get_rect(center=inner.center))
+            return
+
+        number, unit = format_power(watts)
+        big = round(inner.height * 0.46)
+        unit_size = round(inner.height * 0.22)
+        if big >= 8:
+            nfont, ufont = get_font(big, "bahnschrift"), get_font(max(8, unit_size), "bahnschrift")
+            us = ufont.render(unit, True, ink)
+            room = inner.width - us.get_width() - pad
+            while big >= 8 and nfont.size(number)[0] > room:
+                big -= 1
+                nfont = get_font(big, "bahnschrift")
+            ns = nfont.render(number, True, ink)
+            base_y = inner.y + round(inner.height * 0.56)
+            surface.blit(ns, ns.get_rect(bottomright=(inner.right - us.get_width() - pad // 2, base_y)))
+            surface.blit(us, us.get_rect(bottomright=(inner.right, base_y - max(1, big // 10))))
+        small = round(inner.height * 0.16)
+        if small >= 8 and wavelength is not None:
+            ts = get_font(small, "bahnschrift").render(f"λ {wavelength:g} nm", True, ink)
+            surface.blit(ts, (inner.x, inner.y))
+        # Level bar: log scale, 1 nW to 1 W.
+        bar = pygame.Rect(inner.x, inner.bottom - max(3, round(inner.height * 0.13)), inner.width,
+                          max(3, round(inner.height * 0.13)))
+        draw_rect(surface, shade(glass, 0.85), bar, border_radius=max(1, bar.height // 3))
+        if watts is not None and watts > 0:
+            f = max(0.0, min(1.0, (math.log10(watts) + 9) / 9))
+            if f > 0:
+                draw_rect(surface, ink, (bar.x, bar.y, max(1, round(bar.width * f)), bar.height),
+                          border_radius=max(1, bar.height // 3))
+        for k in range(10):                          # decade ticks
+            x = bar.x + round(bar.width * k / 9)
+            pygame.draw.line(surface, shade(glass, 0.6), (x, bar.y - max(1, bar.height // 2)), (x, bar.y - 1), 1)
+
+
+
+# ---- SuperK supercontinuum laser: a Device with an emission switch ------------
+SK_BODY = (30, 34, 44)
+SK_PANEL = (14, 16, 22)
+SK_WARN = (250, 200, 40)
+SK_RED = (235, 60, 55)
+SK_RAINBOW = [(150, 60, 220), (70, 90, 255), (40, 200, 230), (60, 220, 90),
+              (240, 230, 60), (250, 150, 40), (240, 60, 50)]
+
+
+SK_PENDING_SECONDS = 1.5        # longest a clicked switch shows where it was asked to go (2 Hz polling)
+SK_STARTING_SECONDS = 30.0      # an unknown state this soon after "on" reads as STARTING…
+
+
+class SuperK(Device):
+    """The NKT SuperK supercontinuum laser (driver: superk_laser): a laser head
+    with a warning triangle, a big EMITTING / IDLE / UNKNOWN state, a built-in
+    emission switch, the power setpoint as a bar, the interlock + status lines,
+    and — while emitting — a rainbow beam out of its output port.
+
+    The safety is in the object: emission changes only through its own switch
+    (click it on the canvas) or its panel button, both of which
+    - show the laser's *actual* state, read back from it — never a remembered
+      position, so they can't disagree with the laser;
+    - turn emission OFF when the state is unknown (they never guess);
+    - can't turn it on while the interlock is open (the driver refuses and the
+      panel says why; "Reset interlock" appears when it needs one).
+    Disconnect turns emission off first; the server also turns it off if the
+    canvas closes. Emission can't be linked; the power level (0–100 %) can."""
+
+    TYPE = "superk"
+    MENU_LABEL = "Add SuperK laser"
+    NAME = "SuperK laser"
+    DRIVER = "superk_laser"
+    DEFAULT_DEVICE = "superk"
+    SIZE = (340, 150)
+    DOT_COLOR = SK_RED
+    PROPS = [Prop("port", "Port", "str", "auto",
+                  prompt="The laser's COM port (auto scans for it, as the lab GUIs do; sim:// to simulate):")]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._phase = 0.0
+        self._pending = None        # (asked-for emission, when, message then) after a click, until confirmed
+        self._on_asked = 0.0        # when emission was last asked to go on (for "STARTING…")
+        self._switch_hover = False
+
+    def device_options(self):
+        return {"port": self.port or "auto"}
+
+    def laser_state(self):
+        """(emitting: True / False / None=unknown, interlock_ok, interlock text, status text, power %)."""
+        info = self.info() if self.connect else None
+        if not info or info.get("status") != "ok":
+            return None, None, "", "", None
+        v = info["values"]
+        emission = v.get("emission")
+        return (None if emission is None else bool(emission), v.get("interlock_ok"),
+                v.get("interlock", ""), v.get("status", ""),
+                info["params"].get("power_level", {}).get("value"))
+
+    def live(self):
+        return self.connect and self.status() == "ok"
+
+    def tick(self, dt):
+        super().tick(dt)
+        self._phase += dt
+        if self._pending is not None:
+            wanted, since, message_then = self._pending
+            message = (self.info() or {}).get("message", "")
+            refused = message != message_then and message.startswith("emission_")
+            if (self.laser_state()[0] == wanted or refused
+                    or time.monotonic() - since > SK_PENDING_SECONDS):
+                self._pending = None              # confirmed — or refused / timed out: show the truth
+
+    def update(self, mouse_pos, mouse_pressed, camera, dt):
+        super().update(mouse_pos, mouse_pressed, camera, dt)
+        self._switch_hover = (self.live() and self.is_hovered and
+                              self._layout(self.screen_rect(camera))["switch"].collidepoint(mouse_pos))
+
+    # --- Emission (the only ways it changes) ---------------------------------------
+    def toggle_emission(self, app):
+        emitting = self.laser_state()[0]
+        wanted = not (emitting is None or emitting)       # unknown counts as on: never guess
+        self._pending = (wanted, time.monotonic(), (self.info() or {}).get("message", ""))
+        self._on_asked = time.monotonic() if wanted else 0.0
+        self.run_action(app, "emission_on" if wanted else "emission_off")   # on is refused if interlocked
+
+    def on_click(self, pos, app):
+        """A click on the built-in switch toggles emission (and doesn't select);
+        anywhere else selects as usual."""
+        if self.live() and self._layout(self.screen_rect(app.camera))["switch"].inflate(6, 6).collidepoint(pos):
+            self.toggle_emission(app)
+            return True
+        return False
+
+    def disconnect(self, app):
+        if self.connect and self.info() is not None:
+            self.run_action(app, "emission_off")  # no beam left running without its controls
+        super().disconnect(app)
+
+    def buttons(self, app):
+        out = []
+        emitting, interlock_ok, _i, _s, _p = self.laser_state()
+        if self.live():
+            if emitting is None or emitting:
+                out.append(Btn("Turn emission OFF", self.toggle_emission, style="stop"))
+            else:
+                out.append(Btn("Turn emission ON", self.toggle_emission, style="go"))
+            if interlock_ok == 0:
+                out.append(Btn("Reset interlock", lambda app: self.run_action(app, "reset_interlock")))
+        if self.links:
+            out.append(Btn("Unlink all", self.unlink_all))
+        out.append(Btn("Disconnect", self.disconnect) if self.connect
+                   else Btn("Connect", self.connect_now, style="go"))
+        return out
+
+    # --- Layout (shared by drawing and clicking) -----------------------------------------
+    def _layout(self, rect):
+        s = rect.height
+        body = pygame.Rect(rect.x, rect.y, round(rect.width * 0.8), rect.height)
+        pad = max(2, round(s * 0.08))
+        header_h = round(s * 0.18)
+        port_r = max(2, s // 16)
+        panel = pygame.Rect(body.x + pad, body.y + pad + header_h + pad // 2, body.width - 2 * pad - port_r,
+                            body.bottom - pad - (body.y + pad + header_h + pad // 2))
+        tri_h = round(panel.height * 0.5)
+        sw_h = max(4, round(panel.height * 0.34))
+        switch = pygame.Rect(0, 0, round(sw_h * 2.1), sw_h)
+        switch.midright = (panel.right - pad, panel.y + pad + tri_h // 2)
+        return {"body": body, "pad": pad, "header_h": header_h, "port_r": port_r, "panel": panel,
+                "tri": pygame.Rect(panel.x + pad, panel.y + pad, tri_h, tri_h), "switch": switch}
+
+    # --- Drawing ----------------------------------------------------------------------
+    def draw_shape(self, surface, rect, camera):
+        status = self.status()
+        led_color = DEVICE_STATUS_COLORS.get(status, (110, 110, 120))
+        emitting, interlock_ok, interlock, issues, power = self.laser_state()
+        s = rect.height
+        lay = self._layout(rect)
+        body, pad, panel, port_r = lay["body"], lay["pad"], lay["panel"], lay["port_r"]
+        radius = max(2, s // 12)
+        if s < 24:                                   # tiny: the head, red if emitting
+            draw_rect(surface, SK_RED if emitting else SK_BODY, body, border_radius=radius)
+            return
+
+        # The beam first (under the head): a rainbow fan out of the output port.
+        port = (body.right, body.centery)
+        if emitting:
+            length = rect.right - body.right
+            spread = max(2, round(s * 0.12))
+            flicker = 0.85 + 0.15 * math.sin(self._phase * 9)
+            for i, color in enumerate(SK_RAINBOW):
+                off = (i - (len(SK_RAINBOW) - 1) / 2) / (len(SK_RAINBOW) - 1) * spread
+                pygame.draw.line(surface, shade(color, flicker), port, (rect.right, round(port[1] + off)),
+                                 max(1, s // 45))
+            pygame.draw.line(surface, (255, 255, 255), port, (port[0] + max(4, length // 3), port[1]),
+                             max(1, s // 60))
+
+        # Head: housing, the output port, a header with name + light.
+        draw_rect(surface, (12, 12, 16), body.move(0, max(1, s // 30)), border_radius=radius)
+        draw_rect(surface, SK_BODY, body, border_radius=radius)
+        draw_rect(surface, shade(SK_BODY, 1.6), body, width=max(1, s // 70), border_radius=radius)
+        pygame.draw.circle(surface, (70, 74, 86), port, port_r + max(1, s // 40))
+        pygame.draw.circle(surface, (255, 250, 240) if emitting else (10, 10, 12), port, port_r)
+        led_r = max(2, s // 28)
+        led = (body.right - pad - led_r - port_r, body.y + pad + lay["header_h"] // 2)
+        if status in ("ok", "starting", "error", "missing", "connecting"):
+            pygame.draw.circle(surface, shade(led_color, 0.4), led, round(led_r * 1.8))
+        pygame.draw.circle(surface, led_color, led, led_r)
+        size = round(lay["header_h"] * 0.8)
+        if size >= 8:
+            font = get_font(size, "bahnschrift")
+            ts = font.render(clip_text(self.text or "SuperK", font, body.width - 4 * pad), True, (200, 204, 218))
+            surface.blit(ts, (body.x + pad, led[1] - ts.get_height() // 2))
+
+        # Panel: warning triangle, state word, the emission switch.
+        draw_rect(surface, SK_PANEL, panel, border_radius=max(2, radius - 2))
+        tri_r = lay["tri"]
+        tri = [(tri_r.centerx, tri_r.y), (tri_r.right, tri_r.bottom), (tri_r.x, tri_r.bottom)]
+        pygame.draw.polygon(surface, SK_WARN if emitting else shade(SK_WARN, 0.3), tri)
+        pygame.draw.polygon(surface, (20, 20, 20), tri, max(1, s // 70))
+        bang = max(8, round(tri_r.height * 0.6))
+        bs = get_font(bang, "bahnschrift", True).render("!", True, (20, 20, 20))
+        surface.blit(bs, bs.get_rect(center=(tri_r.centerx, tri_r.y + round(tri_r.height * 0.62))))
+
+        if status != "ok":
+            word, color = DEVICE_STATUS_TEXT.get(status, status).upper(), shade(led_color, 1.1)
+        elif emitting is None:                    # between states: right after "on" it's ramping up
+            starting = time.monotonic() - self._on_asked < SK_STARTING_SECONDS
+            word, color = ("STARTING…" if starting else "UNKNOWN"), (240, 190, 60)
+        else:
+            word, color = ("EMITTING", SK_RED) if emitting else ("IDLE", (150, 152, 166))
+        text_x = tri_r.right + pad
+        room = lay["switch"].x - pad - text_x if status == "ok" else panel.right - pad - text_x
+        size = round(tri_r.height * 0.62)          # one size for every state: fit the longest word
+        longest = max(("EMITTING", "STARTING…", word), key=lambda w: get_font(size, "bahnschrift", True).size(w)[0])
+        while size >= 8 and get_font(size, "bahnschrift", True).size(longest)[0] > room:
+            size -= 1
+        if size >= 8:
+            ws = get_font(size, "bahnschrift", True).render(word, True, color)
+            surface.blit(ws, ws.get_rect(midleft=(text_x, tri_r.centery)))
+        if status == "ok":
+            self._draw_switch(surface, lay["switch"], emitting, s)
+
+        # Power bar, interlock / status lines.
+        small = round(panel.height * 0.13)
+        if small >= 8 and status == "ok":
+            font = get_font(small, "bahnschrift")
+            bar = pygame.Rect(panel.x + pad, tri_r.bottom + pad // 2, panel.width - 2 * pad, max(3, small // 2))
+            draw_rect(surface, (40, 42, 52), bar, border_radius=max(1, bar.height // 2))
+            if power is not None:
+                draw_rect(surface, (90, 170, 240), (bar.x, bar.y, max(1, round(bar.width * power / 100)), bar.height),
+                          border_radius=max(1, bar.height // 2))
+            y = bar.bottom + max(2, small // 4)
+            surface.blit(font.render("power —" if power is None else f"power {power:.1f} %", True,
+                                     (170, 190, 220)), (panel.x + pad, y))
+            ls = font.render(clip_text(f"interlock: {interlock or '?'}", font, panel.width // 2), True,
+                             (150, 152, 166) if interlock_ok else (240, 190, 60))
+            surface.blit(ls, (panel.right - pad - ls.get_width(), y))
+            if issues and issues != "ok":
+                y += round(small * 1.1)
+                if y + small <= panel.bottom:
+                    surface.blit(font.render(clip_text(issues, font, panel.width - 2 * pad), True, (240, 190, 60)),
+                                 (panel.x + pad, y))
+
+    def _draw_switch(self, surface, sw, emitting, s):
+        """The emission switch: red track + knob right = emitting, dark + knob left =
+        idle, amber "?" in the middle = unknown. Just clicked: the knob shows where
+        it was asked to go (amber ring) until the laser confirms."""
+        pending = self._pending[0] if self._pending is not None else None
+        shown = pending if pending is not None else emitting
+        r = sw.height // 2
+        if shown is None:
+            track = (120, 90, 30)
+        elif shown:
+            track = SK_RED
+        else:
+            track = (44, 46, 56)
+        if self._switch_hover:
+            track = shade(track, 1.2)
+        draw_rect(surface, track, sw, border_radius=r)
+        draw_rect(surface, (8, 8, 10), sw, width=max(1, s // 80), border_radius=r)
+        size = round(sw.height * 0.48)
+        if size >= 8:
+            font = get_font(size, "bahnschrift", True)
+            if shown is None:
+                label, x = "?", sw.centerx
+            elif shown:
+                label, x = "ON", sw.x + (sw.width - sw.height) // 2
+            else:
+                label, x = "OFF", sw.right - (sw.width - sw.height) // 2
+            ts = font.render(label, True, (250, 240, 230) if shown else (150, 152, 166))
+            surface.blit(ts, ts.get_rect(center=(x, sw.centery)))
+        knob_r = max(2, r - max(2, sw.height // 8))
+        if shown is None:
+            return                                  # unknown: no knob position to claim
+        kx = sw.right - r if shown else sw.x + r
+        pygame.draw.circle(surface, (120, 120, 130), (kx, sw.centery + max(1, knob_r // 5)), knob_r)   # side
+        pygame.draw.circle(surface, (240, 240, 244), (kx, sw.centery), knob_r)
+        if pending is not None:
+            pygame.draw.circle(surface, (240, 190, 60), (kx, sw.centery), knob_r, max(1, knob_r // 4))
+
+
+
+# ---- Flip mirror: a New Focus flipper on the NI 6363 --------------------------
+FM_BODY = (40, 42, 50)
+FM_BEAM = (110, 230, 160)
+FM_MIRROR = (205, 215, 230)
+FM_PENDING_SECONDS = 3.0
+
+
+class FlipMirror(Device):
+    """A New Focus motorized flip mirror (driver: flip_mirror), drawn as a flip
+    mount with the beam: up = the mirror at 45° sending the beam to the up path,
+    down = the mirror lying flat and the beam going straight on to the down
+    path. The path names come from flipper.py (e.g. PM100D / sphere).
+
+    There's no readback, so every position is ASSUMED (the last one commanded),
+    and connecting doesn't move the mirror — its position starts unknown. Then:
+    "It's at …" (you looked; nothing moves) or "Find position" (flips down then
+    up — it moves, so it asks first). After that, click the mirror (or Flip) to
+    flip it; the `up` param (1/0) can also be linked."""
+
+    TYPE = "flip_mirror"
+    MENU_LABEL = "Add flip mirror"
+    NAME = "Flip mirror"
+    DRIVER = "flip_mirror"
+    DEFAULT_DEVICE = "flipper"
+    SIZE = (250, 170)
+    DOT_COLOR = FM_MIRROR
+    PROPS = [Prop("mirror", "Mirror", "choice", "detection", choices=["detection", "excitation"]),
+             Prop("channel", "Channel", "str", "auto",
+                  prompt="DAQ channel (auto = the one flipper.py gives this mirror; sim:// to simulate):")]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pending = None       # (asked-for is_up, when) after a click, until it reports back
+
+    def device_options(self):
+        return {"mirror": self.mirror, "channel": self.channel or "auto"}
+
+    def mirror_state(self):
+        """(is_up: True / False / None=unknown, up_label, down_label, flips) — None labels if not live."""
+        info = self.info() if self.connect else None
+        if not info or info.get("status") != "ok":
+            return None, None, None, None
+        v = info["values"]
+        is_up = v.get("is_up")
+        return (None if is_up is None else bool(is_up), v.get("up_label"), v.get("down_label"), v.get("flips"))
+
+    def live(self):
+        return self.connect and self.status() == "ok"
+
+    def tick(self, dt):
+        super().tick(dt)
+        if self._pending is not None:
+            wanted, since = self._pending
+            message = (self.info() or {}).get("message", "")
+            if self.mirror_state()[0] == wanted or message or time.monotonic() - since > FM_PENDING_SECONDS:
+                self._pending = None
+
+    # --- Moving it -------------------------------------------------------------------
+    def flip(self, app):
+        is_up = self.mirror_state()[0]
+        if is_up is None:
+            return                                   # unknown: sync or find it first
+        self._pending = (not is_up, time.monotonic())
+        self.run_action(app, "flip")
+
+    def find_position(self, app):
+        up = self.mirror_state()[1] or "up"
+        app.confirm(f"Find the {self.mirror} mirror's position?",
+                    f"It will MOVE: flip down, then up, ending at {up}.",
+                    lambda: self.run_action(app, "find_position"), ok_label="Flip it")
+
+    def on_click(self, pos, app):
+        """A click on the mirror itself flips it (when its position is known)."""
+        if self.live() and self.mirror_state()[0] is not None:
+            hub, reach = self._mirror_spot(self.screen_rect(app.camera))
+            if (pygame.Vector2(pos) - hub).length() <= reach:
+                self.flip(app)
+                return True
+        return False
+
+    def buttons(self, app):
+        out = []
+        is_up, up, down, _f = self.mirror_state()
+        if self.live():
+            if is_up is not None:
+                out.append(Btn(f"Flip (to {down if is_up else up})", self.flip, style="go"))
+            out.append(Btn(f"It's at {up}", lambda app: self.run_action(app, "sync_up")))
+            out.append(Btn(f"It's at {down}", lambda app: self.run_action(app, "sync_down")))
+            out.append(Btn("Find position (moves it)", self.find_position))
+        if self.links:
+            out.append(Btn("Unlink all", self.unlink_all))
+        out.append(Btn("Disconnect", self.disconnect) if self.connect
+                   else Btn("Connect", self.connect_now, style="go"))
+        return out
+
+    def inspector(self, app):
+        rows = super().inspector(app)
+        if self.live():
+            is_up = self.mirror_state()[0]
+            rows.append(Field("Note", "position unknown: say where it is, or Find position" if is_up is None
+                              else "assumed — there's no readback (the handpad rocker overrides it)",
+                              color=WARN_COLOR if is_up is None else None))
+        return rows
+
+    # --- Drawing ----------------------------------------------------------------------
+    def _mirror_spot(self, rect):
+        """(hub, reach): where the mirror's hinge sits on screen, and the click radius."""
+        s = rect.height
+        pad = max(2, round(s * 0.08))
+        header_h = round(s * 0.16)
+        area = pygame.Rect(rect.x + pad, rect.y + pad + header_h + pad // 2, rect.width - 2 * pad,
+                           rect.bottom - pad - (rect.y + pad + header_h + pad // 2))
+        hub = pygame.Vector2(area.x + area.width * 0.42, area.y + area.height * 0.62)
+        return hub, area.height * 0.3
+
+    def draw_shape(self, surface, rect, camera):
+        status = self.status()
+        led_color = DEVICE_STATUS_COLORS.get(status, (110, 110, 120))
+        is_up, up, down, flips = self.mirror_state()
+        if self._pending is not None:
+            is_up = self._pending[0]                     # show the asked-for side until it reports
+        s = rect.height
+        radius = max(2, s // 12)
+        if s < 24:
+            draw_rect(surface, FM_BODY, rect, border_radius=radius)
+            return
+        draw_rect(surface, (12, 12, 16), rect.move(0, max(1, s // 30)), border_radius=radius)
+        draw_rect(surface, FM_BODY, rect, border_radius=radius)
+        draw_rect(surface, shade(FM_BODY, 1.45), rect, width=max(1, s // 70), border_radius=radius)
+
+        pad = max(2, round(s * 0.08))
+        header_h = round(s * 0.16)
+        led_r = max(2, s // 28)
+        led = (rect.right - pad - led_r, rect.y + pad + header_h // 2)
+        if status in ("ok", "starting", "error", "missing", "connecting"):
+            pygame.draw.circle(surface, shade(led_color, 0.4), led, round(led_r * 1.8))
+        pygame.draw.circle(surface, led_color, led, led_r)
+        size = round(header_h * 0.85)
+        if size >= 8:
+            font = get_font(size, "bahnschrift")
+            title = self.text or self.mirror.upper()
+            ts = font.render(clip_text(title, font, rect.width - 4 * pad), True, (200, 204, 218))
+            surface.blit(ts, (rect.x + pad, led[1] - ts.get_height() // 2))
+
+        hub, reach = self._mirror_spot(rect)
+        area_top = rect.y + pad + header_h + pad // 2
+        live = status == "ok"
+        small = round(s * 0.085)
+        font = get_font(max(8, small), "bahnschrift")
+        beam_w = max(2, s // 45)
+        up, down = up or "up", down or "down"
+        up_end = pygame.Vector2(hub.x, area_top + small * 1.6)
+        down_end = pygame.Vector2(rect.right - pad, hub.y)
+        start = pygame.Vector2(rect.x + pad, hub.y)
+
+        # The two paths (faint), then the beam on the one in use.
+        pygame.draw.line(surface, (60, 64, 76), hub, up_end, max(1, beam_w // 2))
+        pygame.draw.line(surface, (60, 64, 76), hub, down_end, max(1, beam_w // 2))
+        if live:
+            pygame.draw.line(surface, FM_BEAM, start, hub, beam_w)
+            if is_up is True:
+                pygame.draw.line(surface, FM_BEAM, hub, up_end, beam_w)
+            elif is_up is False:
+                pygame.draw.line(surface, FM_BEAM, hub, down_end, beam_w)
+
+        # Path names: the one in use bright, the other dim.
+        if small >= 8:
+            for label, at, active, anchor in ((up, up_end, is_up is True, "midbottom"),
+                                              (down, down_end, is_up is False, "bottomright")):
+                ts = font.render(label, True, (230, 240, 236) if (live and active) else (110, 114, 128))
+                r = ts.get_rect(**{anchor: (round(at.x), round(at.y) - max(2, small // 3))})
+                surface.blit(ts, r)
+
+        # The mount and its mirror: 45° in the beam (up), flat below it (down), grey "?" (unknown).
+        base = pygame.Rect(0, 0, round(reach * 1.6), round(reach * 0.45))
+        base.midtop = (round(hub.x), round(hub.y + reach * 0.55))
+        draw_rect(surface, (28, 30, 36), base, border_radius=max(2, base.height // 3))
+        length = reach * 1.15
+        if is_up is True:
+            d = pygame.Vector2(1, -1).normalize()
+            a, b = hub - d * length / 2, hub + d * length / 2
+            color = FM_MIRROR
+        elif is_up is False:
+            a = pygame.Vector2(hub.x - length / 2, hub.y + reach * 0.5)
+            b = pygame.Vector2(hub.x + length / 2, hub.y + reach * 0.5)
+            color = FM_MIRROR
+        else:
+            d = pygame.Vector2(1, -0.4).normalize()
+            a, b = hub - d * length / 2, hub + d * length / 2
+            color = (110, 112, 124)
+        if self._pending is not None:
+            pygame.draw.line(surface, (240, 190, 60), a, b, max(4, s // 14))      # amber: on its way
+        pygame.draw.line(surface, color, a, b, max(2, s // 22))
+        pygame.draw.circle(surface, (90, 94, 108), (round(hub.x), round(hub.y)), max(2, s // 40))
+        if live and is_up is None and small >= 8:
+            q = get_font(round(reach * 0.9), "bahnschrift", True).render("?", True, (240, 190, 60))
+            surface.blit(q, q.get_rect(center=(round(hub.x + reach * 0.9), round(hub.y - reach * 0.2))))
+
+        # Bottom line: "assumed" (no readback) / unknown / not connected.
+        if small >= 8:
+            if not live:
+                note, color = DEVICE_STATUS_TEXT.get(status, status), shade(led_color, 1.1)
+            elif is_up is None:
+                note, color = "position unknown", (240, 190, 60)
+            else:
+                n = int(flips or 0)
+                note, color = f"assumed · {n} flip{'' if n == 1 else 's'}", (130, 134, 148)
+            ns = font.render(note, True, color)
+            surface.blit(ns, ns.get_rect(bottomleft=(rect.x + pad, rect.bottom - pad // 2)))
 
 
 def server_object(scene):
