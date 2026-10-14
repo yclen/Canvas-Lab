@@ -2353,6 +2353,161 @@ class PowerMeter(Device):
 
 
 
+# ---- PDA45 photodetector: one detector, read by the Time Tagger and the NI DAQ ----
+PDA_BODY = (36, 38, 46)
+PDA_SCREEN = (10, 12, 16)
+PDA_COUNTS = (110, 200, 255)    # count rate (Time Tagger)
+PDA_VOLTS = (120, 230, 150)     # mean voltage (NI DAQ)
+PDA_HALF_COLORS = {"connected": (90, 220, 120), "connecting…": (240, 190, 60)}   # else: an error (red)
+
+
+def format_si(value, unit, digits=4):
+    """A number with an SI prefix and `digits` significant digits: ('-4.598', 'mV'),
+    ('295.6', 'k counts/s') — a prefix on a word unit gets a space."""
+    if value is None:
+        return "—", unit
+    magnitude = abs(value)
+    for scale, prefix in ((1e9, "G"), (1e6, "M"), (1e3, "k"), (1.0, ""), (1e-3, "m"), (1e-6, "µ"), (1e-9, "n")):
+        if magnitude >= scale * 0.99995:
+            break
+    if not magnitude:
+        scale, prefix = 1.0, ""
+    scaled = value / scale
+    decimals = max(0, digits - 1 - int(math.floor(math.log10(abs(scaled))))) if scaled else digits - 1
+    space = " " if prefix and len(unit) > 2 else ""
+    return f"{scaled:.{decimals}f}", prefix + space + unit
+
+
+class PDA45(Device):
+    """The Thorlabs PDA45 photodetector (driver: pda45), whose output goes to
+    two instruments read over the same gate: the Swabian Time Tagger counts its
+    pulses (count_rate, counts/s) and the NI 6363 averages its voltage on ai0
+    (voltage, V — the mean, a charge-like signal; see ni6363.py). Each half has
+    its own status light and connects on its own, so one keeps reading while the
+    other is missing. Both numbers are outputs for readouts, functions, …; an
+    overflow (counts lost) or a clipped sample (input range too narrow) is
+    flagged on the screen. The gate (s) can be set by hand or linked."""
+
+    TYPE = "pda45"
+    MENU_LABEL = "Add PDA45 photodetector"
+    NAME = "PDA45"
+    DRIVER = "pda45"
+    DEFAULT_DEVICE = "pda45"
+    SIZE = (250, 180)
+    DOT_COLOR = PDA_COUNTS
+    PROPS = [Prop("tagger", "Time Tagger", "str", "auto",
+                  prompt="Time Tagger serial (auto finds it; sim:// to simulate):"),
+             Prop("daq", "NI DAQ", "str", "auto",
+                  prompt="NI device name, e.g. Dev1 (auto finds it; sim:// to simulate):"),
+             Prop("ai_range", "AI range", "float", 0.5, min=0.1, max=10, unit="± V",
+                  prompt="Analog input range, ± volts (the card snaps to ±0.1 … ±10 V):")]
+
+    def device_options(self):
+        return {"tagger": self.tagger or "auto", "daq": self.daq or "auto", "ai_range": self.ai_range}
+
+    def draw_shape(self, surface, rect, camera):
+        status = self.status()
+        led_color = DEVICE_STATUS_COLORS.get(status, (110, 110, 120))
+        info = self.info() if self.connect else None
+        live = status == "ok" and info is not None
+        values = info["values"] if live else {}
+        if live and not (values.get("tagger_status") == values.get("daq_status") == "connected"):
+            led_color = DEVICE_STATUS_COLORS["starting"]    # running, but one half isn't reading
+        s = min(rect.width, rect.height)
+        radius = max(2, s // 10)
+        if s < 24:                                   # tiny: the body and its status
+            draw_rect(surface, PDA_BODY, rect, border_radius=radius)
+            pygame.draw.circle(surface, led_color, rect.center, max(1, s // 4))
+            return
+
+        draw_rect(surface, (14, 14, 18), rect.move(0, max(1, s // 30)), border_radius=radius)
+        draw_rect(surface, PDA_BODY, rect, border_radius=radius)
+        draw_rect(surface, shade(PDA_BODY, 1.45), rect, width=max(1, s // 70), border_radius=radius)
+
+        pad = max(2, round(s * 0.06))
+        header_h = round(s * 0.13)
+        led_r = max(2, s // 34)
+        led = (rect.right - pad - led_r, rect.y + pad + header_h // 2)
+        if status in ("ok", "starting", "error", "missing", "connecting"):
+            pygame.draw.circle(surface, shade(led_color, 0.4), led, round(led_r * 1.8))
+        pygame.draw.circle(surface, led_color, led, led_r)
+        size = round(header_h * 0.8)
+        if size >= 8:
+            font = get_font(size, "bahnschrift")
+            ts = font.render(clip_text(self.text or "PDA45", font, rect.width - 4 * pad - 2 * led_r),
+                             True, (214, 216, 228))
+            surface.blit(ts, (rect.x + pad, led[1] - ts.get_height() // 2))
+
+        gate = info["params"].get("gate", {}).get("value") if live else None
+        footer_h = round(s * 0.09)
+        body = pygame.Rect(rect.x + pad, rect.y + pad + header_h + pad // 2, rect.width - 2 * pad,
+                           rect.bottom - pad - footer_h - (rect.y + pad + header_h + pad // 2))
+        gap = max(1, pad // 2)
+        panels = [pygame.Rect(body.x, body.y, body.width, (body.height - gap) // 2),
+                  pygame.Rect(body.x, body.y + (body.height + gap) // 2, body.width, (body.height - gap) // 2)]
+        halves = [("TIME TAGGER", "tagger_status", "count_rate", "counts/s", PDA_COUNTS,
+                   "OVERFLOW" if values.get("overflows") else ""),
+                  ("NI DAQ · mean", "daq_status", "voltage", "V", PDA_VOLTS,
+                   "OVER RANGE" if values.get("clipped") else "")]
+        for panel, (label, status_key, key, unit, color, warning) in zip(panels, halves):
+            self._draw_half(surface, panel, pad, label, live, status, values.get(status_key),
+                            values.get(key), unit, color, warning)
+
+        size = round(footer_h * 0.75)
+        if size >= 8:
+            text = f"gate {gate:g} s" if gate is not None else DEVICE_STATUS_TEXT.get(status, status)
+            ts = get_font(size, "consolas").render(text, True, (150, 152, 166))
+            surface.blit(ts, ts.get_rect(midleft=(rect.x + pad, rect.bottom - pad - footer_h // 2)))
+
+    def _draw_half(self, surface, panel, pad, label, live, status, half_status, value, unit, color, warning):
+        """One instrument's screen: its own status light and label, then its number."""
+        radius = max(2, panel.height // 8)
+        draw_rect(surface, PDA_SCREEN, panel, border_radius=radius)
+        draw_rect(surface, (4, 4, 6), panel, width=1, border_radius=radius)
+        inner = panel.inflate(-2 * pad, -pad)
+        if live:
+            half_color = PDA_HALF_COLORS.get(half_status, DEVICE_STATUS_COLORS["error"])
+        else:
+            half_color = DEVICE_STATUS_COLORS.get(status, (110, 110, 120))
+        label_h = round(inner.height * 0.28)
+        dot_r = max(1, label_h // 3)
+        dot = (inner.x + dot_r, inner.y + label_h // 2)
+        pygame.draw.circle(surface, half_color, dot, dot_r)
+        if label_h >= 8:
+            font = get_font(label_h, "bahnschrift")
+            ls = font.render(label, True, shade(color, 0.7))
+            surface.blit(ls, (dot[0] + 2 * dot_r, dot[1] - ls.get_height() // 2))
+            if warning:
+                ws = font.render(warning, True, (255, 150, 60))
+                surface.blit(ws, ws.get_rect(midright=(inner.right, dot[1])))
+
+        area = pygame.Rect(inner.x, inner.y + label_h, inner.width, inner.height - label_h)
+        if not live or half_status != "connected":   # why there's no number
+            text = (half_status or "—") if live else DEVICE_STATUS_TEXT.get(status, status)
+            size = round(area.height * 0.32)
+            if size >= 8:
+                font = get_font(size, "bahnschrift")
+                ts = font.render(clip_text(text, font, area.width), True,
+                                 shade(half_color, 0.8) if live else (130, 130, 142))
+                surface.blit(ts, ts.get_rect(center=area.center))
+            return
+        number, unit_text = format_si(value, unit)
+        big = round(area.height * 0.78)
+        if big >= 8:
+            ufont = get_font(max(8, round(area.height * 0.34)), "bahnschrift")
+            us = ufont.render(unit_text, True, shade(color, 0.8))
+            room = area.width - us.get_width() - pad
+            nfont = get_font(big, "bahnschrift")
+            while big > 8 and nfont.size(number)[0] > room:
+                big -= 1
+                nfont = get_font(big, "bahnschrift")
+            ns = nfont.render(number, True, color)
+            base = area.bottom
+            surface.blit(us, us.get_rect(bottomright=(area.right, base - max(1, big // 8))))
+            surface.blit(ns, ns.get_rect(bottomright=(area.right - us.get_width() - pad // 2, base)))
+
+
+
 # ---- SuperK supercontinuum laser: a Device with an emission switch ------------
 SK_BODY = (30, 34, 44)
 SK_PANEL = (14, 16, 22)

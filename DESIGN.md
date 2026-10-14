@@ -280,6 +280,21 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
     it). The object is a display: the handheld console with a backlit LCD, power auto-scaled to
     nW / µW / mW / W (4 significant digits, `format_power`), the wavelength, and a log level
     bar from 1 nW to 1 W.
+  - **PDA45 photodetector** (`drivers/pda45.py`, canvas object *PDA45*): one detector, two
+    instruments — wraps the lab drivers `../hardware drivers/timetagger.py` (Swabian, counts
+    pulses) and `ni6363.py` (`NI6363`, analog in). Each reading starts both over the same
+    `gate` (param, s, default 0.2), then reads `count_rate` (counts/s — counts over the
+    tagger's *measured* capture time) and `voltage` (V, the mean on ai0 — per ni6363.py the
+    only meaningful voltage number for ns pulses). Also `overflows` (lost events: the rate is a
+    lower bound) and `clipped` (samples at the range ends: the mean is wrong); text
+    `tagger_status` / `daq_status`. The halves connect **independently** — a missing one is
+    retried every 3 s inside `read()` while the other keeps reading (a failure never restarts
+    the device), so its number just drops out (readouts show dashes). Options: `tagger` /
+    `daq` (`auto`, serial / device name, or `sim://`), `ai_range` (±V, default 0.5),
+    `tt_channel` (2), `trigger_v` (2.5), `ai_channel` (ai0). The object has a status light
+    per half (the header light is amber while only one is reading) and big SI-scaled numbers
+    (`format_si`: 295.6 k counts/s, -4.598 mV), with OVERFLOW / OVER RANGE flags. The
+    `pda45.py` the lab drivers mention never existed; this is it, for the canvas.
   - **SuperK laser** (`drivers/superk_laser.py`, canvas object *SuperK laser*): wraps the lab driver
     `../hardware drivers/superk.py` (nkt_tools / NKT DLL). Safety rules from the Quantum Yield
     control GUI: emission changes **only** through actions (`emission_on` / `emission_off`) —
