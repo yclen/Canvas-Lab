@@ -367,6 +367,19 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
     a band is never half-applied. The object is a **color picker**: a spectrum strip — click / drag
     sets the center (unless center is linked), the passed band stays lit, the requested band shows
     as an orange outline while the stages move. Its panel says where the calibration lives.
+  - **Filter wheel** (`drivers/filter_wheel.py`, canvas object *Filter wheel*): wraps the lab driver
+    `../hardware drivers/fw102c.py` (Thorlabs FW102C, 6 slots, USB serial). Param `position` (1 …
+    slots, read from the unit; any number is rounded to a slot, so it can follow a slider or a
+    Function) starts where the wheel is — connecting never moves it. Readings `position` (what the
+    wheel reports), `slots`. A move blocks ~1 s a slot; the server applies only the newest request.
+    Port `auto` only takes a port whose USB serial starts "TP" (Thorlabs) — never the lab driver's
+    *idn? sweep over every FTDI port (the Zaber chain, maybe the laser); `sim://` pretends. **Quirk:**
+    on this unit the first command after the port opens comes back CMD_NOT_DEFINED, so the lab
+    driver's identify always failed; the canvas driver sends a bare CR first (a subclass —
+    fw102c.py is unchanged). Slot **names** live on the object (a hidden `names` list, blank =
+    unnamed / open), set from the panel. The object draws the wheel face-on with the slot in the
+    beam at the top (it turns there, the short way); click a slot to go (amber ring until the wheel
+    reports, as the flip mirror does), off while `position` is linked ("follows …" shown instead).
   - **Scripts** (`scripts/`): standalone procedures with their own window, run from a terminal —
     not wired to canvas objects yet. **`calibrate_excitation_filters.py`** (tkinter; `--port
     sim://` to try it): a panel per filter — stage picker (by serial; stage 0 is the ND), ◀ ▶ jog

@@ -3031,6 +3031,247 @@ class FlipMirror(Device):
             surface.blit(ns, ns.get_rect(bottomleft=(rect.x + pad, rect.bottom - pad // 2)))
 
 
+
+# ---- Filter wheel: a Device you click a slot on ---------------------------------------
+FW_BODY = (38, 40, 48)
+FW_WHEEL = (66, 70, 82)
+FW_FILTER = (120, 170, 235)      # a slot with a name (a filter in it)
+FW_BEAM = (235, 70, 70)
+FW_PENDING_SECONDS = 4.0         # longest a clicked slot shows before the wheel must report it
+FW_TURN_SPEED = 240.0            # deg/sec the drawn wheel turns toward its slot
+
+
+class FilterWheel(Device):
+    """A Thorlabs FW102C motorized filter wheel (driver: filter_wheel), drawn
+    face-on with the slot in the beam at the top. Click a slot to move there.
+    Each slot has a name of your own ("OD 1", "550 LP"), and a blank one is just
+    its number (an open slot). Its input is the `position` param (1–6, rounded
+    to a slot): link it to a slider, switch or function in the panel and the
+    wheel follows (clicking slots is off while linked). Its outputs are the
+    position the wheel reports and the slot count. Connecting never moves it.
+
+    If every filter looks off by a fixed number of slots, check the A/B
+    aperture switch on the side of the unit (software can't read it)."""
+
+    TYPE = "filter_wheel"
+    MENU_LABEL = "Add filter wheel"
+    NAME = "Filter wheel"
+    DRIVER = "filter_wheel"
+    DEFAULT_DEVICE = "wheel"
+    SIZE = (250, 170)
+    DOT_COLOR = FW_FILTER
+    PROPS = [Prop("port", "Port", "str", "auto",
+                  prompt="COM port (auto finds the Thorlabs wheel; sim:// to simulate):"),
+             Prop("names", kind="data", default=[""] * 6, hidden=True)]   # slot names, "" = blank
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pending = None       # (asked-for slot, when) after a click, until it reports back
+        self._angle = None         # drawn wheel rotation, degrees (None = not drawn yet)
+
+    def device_options(self):
+        return {"port": self.port or "auto"}
+
+    @property
+    def title(self):
+        return self.text or "Filter wheel"
+
+    def rename(self, app):
+        def submit(text):
+            if text.strip():
+                self.text = text.strip()
+                app.save()
+        app.ask("Name:", submit, value=self.title)
+
+    def live(self):
+        return self.connect and self.status() == "ok"
+
+    def slot_count(self):
+        info = self.info() if self.live() else None
+        n = (info or {}).get("values", {}).get("slots")
+        return int(n) if n else 6
+
+    def position(self):
+        """The slot the wheel reports (1-based), or None when it isn't live."""
+        info = self.info() if self.live() else None
+        p = (info or {}).get("values", {}).get("position")
+        return int(p) if p is not None else None
+
+    def shown_slot(self):
+        """Where to draw it: the clicked slot until the wheel reports, else where it is."""
+        return self._pending[0] if self._pending is not None else self.position()
+
+    def slot_name(self, slot):
+        return self.names[slot - 1] if 0 < slot <= len(self.names) else ""
+
+    def label(self, slot):
+        """A slot's name, or 'slot 3' when it's blank."""
+        return self.slot_name(slot) or f"slot {slot}"
+
+    # --- Moving it -------------------------------------------------------------------
+    def go_to(self, app, slot):
+        if not self.live() or "position" in self.links:
+            return
+        self._pending = (slot, time.monotonic())
+        instruments.client.set(self.device, "position", slot)
+
+    def tick(self, dt):
+        super().tick(dt)
+        if self._pending is not None:
+            wanted, since = self._pending
+            message = (self.info() or {}).get("message", "")
+            if self.position() == wanted or message or time.monotonic() - since > FW_PENDING_SECONDS:
+                self._pending = None
+        slot = self.shown_slot()
+        if slot is not None:                  # turn the drawn wheel (the short way) toward its slot
+            target = -(slot - 1) * 360.0 / self.slot_count()
+            if self._angle is None:
+                self._angle = target
+            diff = (target - self._angle + 180.0) % 360.0 - 180.0
+            step = FW_TURN_SPEED * dt
+            self._angle = target if abs(diff) <= step else self._angle + math.copysign(step, diff)
+
+    # --- Panel --------------------------------------------------------------------------
+    def rename_slot(self, app, slot):
+        def submit(text):
+            names = list(self.names) + [""] * max(0, slot - len(self.names))
+            names[slot - 1] = text.strip()
+            self.names = names
+            app.save()
+        app.ask(f"Name of slot {slot} (blank = open / unnamed):", submit, value=self.slot_name(slot))
+
+    def inspector(self, app):
+        rows = [Row("Name", self.title, on_click=self.rename)] + super().inspector(app)
+        rows.append(Gap(6))
+        here = self.position()
+        for slot in range(1, self.slot_count() + 1):
+            name = self.slot_name(slot)
+            rows.append(Row(f"Slot {slot}" + ("  ◀ here" if slot == here else ""), name or "— (blank)",
+                            on_click=lambda app, s=slot: self.rename_slot(app, s)))
+        return rows
+
+    def buttons(self, app):
+        out = []
+        if self.live() and "position" not in self.links:
+            here = self.position()
+            if here is not None:
+                n = self.slot_count()
+                out.append(Btn("Next slot", lambda app: self.go_to(app, here % n + 1)))
+        return out + super().buttons(app)
+
+    # --- Drawing / clicking --------------------------------------------------------------
+    def _layout(self, rect):
+        """(header_h, pad, wheel center, wheel radius, hole radius, hole orbit)."""
+        s = rect.height
+        pad = max(2, round(s * 0.07))
+        header_h = round(s * 0.15)
+        top = rect.y + pad + header_h + pad // 2
+        radius = (rect.bottom - pad - top) / 2
+        center = pygame.Vector2(rect.x + pad + radius, top + radius)
+        n = self.slot_count()
+        orbit = radius * 0.62
+        hole = min(radius * 0.27, orbit * math.sin(math.pi / n) * 0.82)
+        return header_h, pad, center, radius, hole, orbit
+
+    def _hole_centers(self, center, orbit):
+        n = self.slot_count()
+        angle = self._angle or 0.0
+        for slot in range(1, n + 1):
+            a = math.radians(90.0 + (slot - 1) * 360.0 / n + angle)
+            yield slot, pygame.Vector2(center.x + orbit * math.cos(a), center.y - orbit * math.sin(a))
+
+    def on_click(self, pos, app):
+        """A click on a slot moves the wheel there (live, and not following a link)."""
+        if not self.live() or "position" in self.links:
+            return False
+        rect = self.screen_rect(app.camera)
+        _h, _p, center, _r, hole, orbit = self._layout(rect)
+        for slot, at in self._hole_centers(center, orbit):
+            if (pygame.Vector2(pos) - at).length() <= hole * 1.25:
+                self.go_to(app, slot)
+                return True
+        return False
+
+    def draw_shape(self, surface, rect, camera):
+        status = self.status()
+        led_color = DEVICE_STATUS_COLORS.get(status, (110, 110, 120))
+        s = min(rect.width, rect.height)
+        radius = max(2, s // 12)
+        if s < 24:
+            draw_rect(surface, FW_BODY, rect, border_radius=radius)
+            pygame.draw.circle(surface, FW_WHEEL, rect.center, max(1, s // 3))
+            return
+        draw_rect(surface, (12, 12, 16), rect.move(0, max(1, s // 30)), border_radius=radius)
+        draw_rect(surface, FW_BODY, rect, border_radius=radius)
+        draw_rect(surface, shade(FW_BODY, 1.45), rect, width=max(1, s // 70), border_radius=radius)
+
+        header_h, pad, center, wheel_r, hole, orbit = self._layout(rect)
+        led_r = max(2, s // 28)
+        led = (rect.right - pad - led_r, rect.y + pad + header_h // 2)
+        if status in ("ok", "starting", "error", "missing", "connecting"):
+            pygame.draw.circle(surface, shade(led_color, 0.4), led, round(led_r * 1.8))
+        pygame.draw.circle(surface, led_color, led, led_r)
+        size = round(header_h * 0.8)
+        if size >= 8:
+            font = get_font(size, "bahnschrift")
+            ts = font.render(clip_text(self.title, font, rect.width - 4 * pad - 2 * led_r), True, (214, 216, 228))
+            surface.blit(ts, (rect.x + pad, led[1] - ts.get_height() // 2))
+
+        # The wheel, with its slots; the one at the top is in the beam.
+        live = self.live()
+        shown = self.shown_slot()
+        moving = self._pending is not None
+        pygame.draw.circle(surface, (16, 16, 20), center + (0, max(1, s // 40)), wheel_r)
+        pygame.draw.circle(surface, FW_WHEEL if live else shade(FW_WHEEL, 0.7), center, wheel_r)
+        pygame.draw.circle(surface, shade(FW_WHEEL, 1.4), center, wheel_r, max(1, s // 80))
+        pygame.draw.circle(surface, shade(FW_WHEEL, 0.6), center, max(2, wheel_r * 0.14))
+        num_size = round(hole * 0.95)
+        num_font = get_font(num_size, "bahnschrift") if num_size >= 8 else None
+        for slot, at in self._hole_centers(center, orbit):
+            named = bool(self.slot_name(slot))
+            fill = shade(FW_FILTER, 0.9 if live else 0.45) if named else (14, 15, 19)
+            pygame.draw.circle(surface, fill, at, hole)
+            ring = (240, 190, 60) if moving and slot == shown else shade(FW_WHEEL, 1.5)
+            pygame.draw.circle(surface, ring, at, hole, max(1, round(hole * 0.14)))
+            if num_font is not None:
+                ns = num_font.render(str(slot), True, (20, 24, 32) if named else (150, 154, 168))
+                surface.blit(ns, ns.get_rect(center=(round(at.x), round(at.y))))
+        # The beam: a red mark through the top of the wheel.
+        top = pygame.Vector2(center.x, center.y - orbit)
+        beam_w = max(1, round(s * 0.012))
+        pygame.draw.line(surface, FW_BEAM, (top.x, center.y - wheel_r - pad * 0.6),
+                         (top.x, top.y - hole - 1), beam_w)
+        pygame.draw.circle(surface, FW_BEAM, top, hole + max(2, round(hole * 0.2)), beam_w)
+
+        # Right: which slot is in the beam, big, and its name.
+        text_x = round(center.x + wheel_r + pad * 1.4)
+        area = pygame.Rect(text_x, round(center.y - wheel_r), rect.right - pad - text_x, round(2 * wheel_r))
+        if area.width < 12:
+            return
+        if not live:
+            lines = [(DEVICE_STATUS_TEXT.get(status, status), 0.16, shade(led_color, 1.1))]
+        elif shown is None:
+            lines = [("position unknown", 0.16, (240, 190, 60))]
+        else:
+            name = self.slot_name(shown)
+            lines = [("MOVING TO" if moving else "IN THE BEAM", 0.12, (240, 190, 60) if moving else (140, 144, 160)),
+                     (f"slot {shown}", 0.3, (232, 234, 242)),
+                     (name or "(blank)", 0.18, FW_FILTER if name else (120, 124, 138))]
+            link = self.links.get("position")
+            src = self.scene.by_id.get(link.get("id")) if link and self.scene else None
+            if src is not None:
+                lines.append((f"follows {src.display_name}", 0.11, (120, 220, 150)))
+        y = area.y + area.height * 0.08
+        for text, frac, color in lines:
+            size = round(area.height * frac)
+            if size < 8:
+                continue
+            font = get_font(size, "bahnschrift")
+            ts = font.render(clip_text(text, font, area.width), True, color)
+            surface.blit(ts, (area.x, round(y)))
+            y += ts.get_height() * 1.05
+
+
 def server_object(scene):
     """The canvas's Instrument server object, or None."""
     return next((o for o in scene.objects if isinstance(o, InstrumentServer)), None)
