@@ -124,6 +124,26 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   uses an object's `output_point()` if it has one, else its center (Output and Device wires
   use it too). Chains and loops are fine — each Function computes once a frame in `tick` and
   `outputs()` returns the stored value, so a loop just runs a frame behind
+- **Data collector** (E menu ▸ Data, `things.py`): a spreadsheet that records values. Columns
+  (built-in `#` and `time`, then named ones) each follow a source — click a header, then the
+  source (a green dot once linked); **+** adds a column (name, then pick its source); rename /
+  relink / *reads* / remove are in the panel. **Collect** (the drawn button, or the panel's) adds a
+  row with every column's value right then (`None` → "—") and an ISO timestamp. The **collect**
+  chip on the left edge is an optional input: on a **rising edge** (≤ 0.5 → > 0.5, e.g. a push
+  button's `pressed`) it collects once; a source that's already high when the canvas loads or the
+  link is made doesn't count. Rows are saved with the canvas (hidden `rows`, values keyed by a
+  stable column id `cid`, so renaming keeps data; a removed column's values stay saved but aren't
+  shown or exported); the sheet shows *Rows shown* (default 8) — the newest, unless scrolled back
+  with the **scrollbar** (drag the thumb, or click the track to jump) or the **mouse wheel** over the
+  sheet (3 rows a notch; the title then says "rows a-b of n"). Scrolling to the bottom follows new
+  rows again; the scroll position isn't saved. The wheel gets there through a general hook,
+  `on_wheel(pos, steps, app)`: the loop asks the object under the mouse (after the inspector's
+  list) and zooms only if it returns False — the collector takes it only over a sheet with more
+  rows than fit, so zooming over anything else is unchanged. Each one is a named **data set** ("Data set 1", …,
+  renamed from the panel's first row); the name is on the title bar and in the export's file name.
+  *Export CSV* writes `data/<name> <date time>.csv` (row, time, columns; `data/` is git-ignored); *Clear rows…*
+  confirms first. Output: `rows` (the count). Each collect saves the canvas — fine for hand /
+  button collects; a very fast trigger on a big table would mean big, frequent saves
 - **Label** (E menu ▸ Annotations): a world-space title for a region — scales with zoom like a
   node (unlike a NameTag), with **Size** and a width that follows its text. Two independent
   looks to click through — frame **Style** (`LABEL_STYLES`, each with its own padding): *plate*
@@ -222,7 +242,8 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
     set a param by hand, or link it (*follows* → click a source, e.g. a slider); its params and
     readings are `outputs()`, so a Readout can show e.g. the servo's actual position. Links are
     saved as a hidden `"data"` Prop (`Prop(kind="data")` holds any JSON; defaults are deep-copied
-    per object). When offline it offers *Connect instrument server* (or *Place* one, if none).
+    per object, and so is the value written by `to_json` — before that, a copy made with **C**
+    shared the original's link dicts, so relinking one rewired both). When offline it offers *Connect instrument server* (or *Place* one, if none).
   - **Instrument server object** (E menu ▸ Devices, one only — `SINGLETON`, picking it again
     goes to it): a radio with an antenna (signal waves while connected, blinking amber while
     connecting). It's the on/off switch for the hardware side: `instruments.client` only

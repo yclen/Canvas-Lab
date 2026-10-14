@@ -260,6 +260,9 @@ while running:
         if event.type == pygame.MOUSEWHEEL:
             if inspector.scroll_list(mouse_pos, event.y):
                 pass          # wheel over the inspector's list scrolls it instead of zooming
+            elif ((under := scene.hit_test(mouse_pos, camera)) is not None
+                    and under.on_wheel(mouse_pos, event.y, app)):
+                pass          # an object that scrolls (a data collector's rows) took it
             else:
                 # LOD lives in each object's draw(), so no post-zoom sync needed.
                 camera.zoom_at(getattr(event, "pos", mouse_pos), 1 + event.y * canvas.SCROLL_STEP)

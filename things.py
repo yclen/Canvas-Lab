@@ -34,8 +34,11 @@ app.ask(prompt, on_submit), app.confirm(...), app.place(obj).
 See "Adding an object type" in DESIGN.md.
 """
 
+import csv
 import math
+import os
 import time
+from datetime import datetime
 
 import numpy as np
 import pygame
@@ -1040,6 +1043,505 @@ class Function(Thing):
                 surface.blit(ts, ts.get_rect(midright=(screen.right - pad, screen.centery)))
             else:
                 surface.blit(ts, ts.get_rect(midleft=(screen.x + pad, screen.centery)))
+
+
+# ============================================================================
+# DATA — things that record other objects' values (E menu ▸ Data)
+# ============================================================================
+DC_PAD = 10                     # Data collector layout, in world units at Size 1
+DC_TITLE_H = 40                 # title bar: name, row count, Collect button
+DC_CELL_H = 26                  # column-header and data row height
+DC_NUM_W, DC_TIME_W = 44, 92    # the built-in # and time columns
+DC_COL_W = 120                  # each named column
+DC_ADD_W = 34                   # the "+" cell that adds a column
+DC_CHIP_W = 80                  # the collect input chip, left of the title bar
+DC_TEXT = 14
+DC_BUTTON_W = 96
+DC_SCROLL_W = 14                # the scrollbar, right of the sheet
+DC_WHEEL_ROWS = 3               # rows per wheel notch
+DC_EDGE = 0.5                   # collect input above this = high (a rising edge collects)
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+
+class DataCollector(Thing):
+    """A spreadsheet that records values. Each column follows a source (a
+    readout, device, function, …): click its header, then the source. Press
+    Collect — or give its `collect` input a rising edge (0 → 1, e.g. from a
+    push button) — and a new row is added with every column's value right then,
+    plus the time. Rows keep growing (all are saved): the sheet follows the
+    newest, and the scrollbar or the mouse wheel over it scrolls back. Name the
+    data set in the panel; Export CSV writes it to the data folder under that
+    name. "+" adds a column; names, links and removing are in the panel.
+    Ctrl+click selects it."""
+
+    TYPE = "data_collector"
+    MENU_LABEL = "Add data collector"
+    NAME = "Data collector"
+    CATEGORY = "Data"
+    DOT_COLOR = (240, 200, 90)
+    PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
+                  prompt="Size (1 = normal, 2 = twice as big):"),
+             Prop("color", "Color", "color", (240, 200, 90)),
+             Prop("shown_rows", "Rows shown", "int", 8, min=1, max=60,
+                  prompt="How many rows to show (the latest; all are kept):"),
+             Prop("columns", kind="data", default=[], hidden=True),  # [{"cid", "name", "id", "key"}]
+             Prop("rows", kind="data", default=[], hidden=True),     # [{"time": iso, "values": {cid: v}}]
+             Prop("trigger", kind="data", default={}, hidden=True)]  # collect input: {"id", "key"}
+    WIRE_COLOR = (120, 220, 150)
+
+    @classmethod
+    def create(cls, app):
+        def make(x, y):
+            used = {o.text for o in app.scene.objects if isinstance(o, DataCollector)}
+            name = next(f"Data set {i}" for i in range(1, 1000) if f"Data set {i}" not in used)
+            return cls(x, y, name, columns=[{"cid": 1, "name": "A"}, {"cid": 2, "name": "B"}])
+        app.start_placing(make)
+
+    @classmethod
+    def icon_sample(cls):
+        sample = cls(0, 0, columns=[{"cid": 1, "name": "power"}, {"cid": 2, "name": "counts"}])
+        sample.rows = [{"time": "", "values": {"1": 1.5 * i, "2": 300 * i}} for i in range(1, 4)]
+        sample.shown_rows = 3
+        return sample
+
+    def __init__(self, x, y, text="", *, columns=None, **kwargs):
+        super().__init__(x, y, text, **kwargs)
+        if columns is not None:
+            self.columns = columns
+        self._last_high = None      # the collect input last frame (None = not read yet: no edge)
+        self._flash = 0.0           # seconds the Collect button stays lit after a collect
+        self._top = None            # first row shown (0-based); None = follow the newest rows
+        self._grab = None           # while dragging the scrollbar thumb: the click's offset in it
+
+    @property
+    def title(self):
+        return self.text or "Data set"
+
+    def rename(self, app):
+        def submit(text):
+            if text.strip():
+                self.text = text.strip()
+                app.save()
+        app.ask("Data set name:", submit, value=self.title)
+
+    # --- Sources and collecting -----------------------------------------------------
+    def _source(self, link):
+        return self.scene.by_id.get(link.get("id")) if link and link.get("id") and self.scene else None
+
+    def column_value(self, col):
+        src = self._source(col)
+        return src.outputs().get(col.get("key")) if src is not None else None
+
+    def trigger_value(self):
+        src = self._source(self.trigger)
+        return src.outputs().get(self.trigger.get("key")) if src is not None else None
+
+    def collect(self, app=None):
+        """Add a row: every column's value right now (None where it has none), and the time."""
+        self.rows = self.rows + [{"time": datetime.now().isoformat(timespec="milliseconds"),
+                                  "values": {str(c["cid"]): self.column_value(c) for c in self.columns}}]
+        self._flash = 0.25
+        if app is not None:
+            app.save()
+        elif self.scene is not None:
+            self.scene.save()
+
+    def tick(self, dt):
+        self._flash = max(0.0, self._flash - dt)
+        value = self.trigger_value()
+        high = None if value is None else value > DC_EDGE
+        if high and self._last_high is False:        # a rising edge (not just "high when loaded")
+            self.collect()
+        self._last_high = high if high is not None else self._last_high
+
+    def outputs(self):
+        return {"rows": float(len(self.rows))}
+
+    # --- Editing --------------------------------------------------------------------------
+    def _column(self, cid):
+        return next((c for c in self.columns if c["cid"] == cid), None)
+
+    def add_column(self, app):
+        def named(text):
+            cid = max((c["cid"] for c in self.columns), default=0) + 1
+            name = text.strip() or chr(ord("A") + (cid - 1) % 26)
+            self.columns = self.columns + [{"cid": cid, "name": name}]
+            app.save()
+            self.pick_source(app, cid)
+        app.ask("New column name:", named)
+
+    def rename_column(self, app, cid):
+        col = self._column(cid)
+        def submit(text):
+            if text.strip():
+                col["name"] = text.strip()
+                app.save()
+        app.ask("Column name:", submit, value=col["name"])
+
+    def remove_column(self, app, cid):
+        col = self._column(cid)
+        def remove():
+            self.columns = [c for c in self.columns if c["cid"] != cid]
+            app.save()                 # its values stay in the saved rows, just not shown / exported
+        app.confirm(f"Remove column '{col['name']}'?", "Its recorded values are no longer shown.",
+                    remove, ok_label="Remove")
+
+    def _pick(self, app, prompt, current, set_link, origin):
+        def link(src):
+            if src is self:                          # clicked itself: unlink
+                set_link({})
+            else:
+                keys = list(src.outputs())
+                set_link({"id": src.id, "key": "value" if "value" in keys else keys[0]})
+            app.save()
+        linked = self._source(current) is not None
+        hint = " — or click this collector to unlink" if linked else ""
+        app.start_picking(prompt + hint, link,
+                          accept=lambda obj: (obj is self and linked) or (obj is not self and bool(obj.outputs())),
+                          origin=origin)
+
+    def pick_source(self, app, cid):
+        col = self._column(cid)
+        def set_link(link):
+            col.pop("id", None)
+            col.pop("key", None)
+            col.update(link)
+        self._pick(app, f"Click what column '{col['name']}' records (a readout, device, …)", col,
+                   set_link, self.column_point(cid))
+
+    def pick_trigger(self, app):
+        def set_link(link):
+            self.trigger = link
+            self._last_high = None
+        self._pick(app, "Click what triggers Collect (a push button, switch, …) — 0 → 1 collects",
+                   self.trigger, set_link, self.trigger_point())
+
+    def _next_key(self, app, link):
+        src = self._source(link)
+        keys = list(src.outputs()) if src is not None else []
+        if keys:
+            i = keys.index(link.get("key")) if link.get("key") in keys else -1
+            link["key"] = keys[(i + 1) % len(keys)]
+            if link is self.trigger:
+                self._last_high = None
+            app.save()
+
+    def clear_rows(self, app):
+        def clear():
+            self.rows = []
+            self._top = None
+            app.save()
+        app.confirm(f"Clear all {len(self.rows)} rows?", "The recorded data is deleted (export it first).",
+                    clear, ok_label="Clear")
+
+    def export_csv(self, app):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        safe = "".join(ch if ch.isalnum() or ch in "-_ " else "_" for ch in self.title).strip() or "data"
+        path = os.path.join(DATA_DIR, f"{safe} {datetime.now():%Y-%m-%d %H-%M-%S}.csv")
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["row", "time"] + [c["name"] for c in self.columns])
+            for i, row in enumerate(self.rows, 1):
+                values = row.get("values", {})
+                writer.writerow([i, row.get("time", "")] +
+                                ["" if values.get(str(c["cid"])) is None else repr(values[str(c["cid"])])
+                                 for c in self.columns])
+        self.last_export = path
+        app.confirm("Exported", f"{len(self.rows)} rows to {path}", lambda: None, ok_label="OK")
+
+    # --- Scrolling ------------------------------------------------------------------------
+    def first_shown(self):
+        """Index of the first row on the sheet (the newest rows unless scrolled back)."""
+        last = max(0, len(self.rows) - self.shown_rows)
+        return last if self._top is None else max(0, min(last, self._top))
+
+    def scroll_to(self, first):
+        last = max(0, len(self.rows) - self.shown_rows)
+        first = max(0, min(last, round(first)))
+        self._top = None if first >= last else first     # at the bottom: follow new rows again
+
+    def _thumb(self, track):
+        """The scrollbar thumb's screen rect within the track rect."""
+        n, shown = len(self.rows), self.shown_rows
+        if n <= shown:
+            return track.copy()
+        h = max(min(track.height, round(track.width * 1.5)), round(track.height * shown / n))
+        y = track.y + round((track.height - h) * self.first_shown() / (n - shown))
+        return pygame.Rect(track.x, y, track.width, h)
+
+    def _drag_scroll(self, y, track):
+        n, shown = len(self.rows), self.shown_rows
+        room = track.height - self._thumb(track).height
+        if n > shown and room > 0:
+            self.scroll_to((y - self._grab - track.y) / room * (n - shown))
+
+    def on_wheel(self, pos, steps, app):
+        """The wheel over the sheet scrolls its rows (when there are more than fit)."""
+        if len(self.rows) <= self.shown_rows:
+            return False
+        boxes, _k = self._screen_boxes(self.screen_rect(app.camera))
+        if not boxes["sheet"].union(boxes["scroll"]).collidepoint(pos):
+            return False
+        self.scroll_to(self.first_shown() - steps * DC_WHEEL_ROWS)
+        return True
+
+    # --- Panel ------------------------------------------------------------------------
+    def inspector(self, app):
+        rows = [Row("Data set", self.title, on_click=self.rename),
+                Row("Rows", str(len(self.rows)))]
+        src = self._source(self.trigger)
+        rows.append(Row("Collect input", src.display_name if src else "— click to link (optional)",
+                        on_click=self.pick_trigger))
+        if src is not None:
+            rows.append(Row("   reads", self.trigger.get("key"), on_click=lambda app: self._next_key(app, self.trigger)))
+        for col in self.columns:
+            cid = col["cid"]
+            rows.append(Gap(6))
+            rows.append(Row("Column", col["name"], on_click=lambda app, c=cid: self.rename_column(app, c)))
+            src = self._source(col)
+            rows.append(Row("   records", src.display_name if src else "— click to link",
+                            on_click=lambda app, c=cid: self.pick_source(app, c)))
+            if src is not None:
+                value = self.column_value(col)
+                rows.append(Row("   reads", f"{col.get('key')}  ({'—' if value is None else f'{value:.6g}'})",
+                                on_click=lambda app, c=col: self._next_key(app, c)))
+            rows.append(Row("   remove", "✕", on_click=lambda app, c=cid: self.remove_column(app, c)))
+        return rows + [Gap(6)] + self.prop_rows()
+
+    def buttons(self, app):
+        out = super().buttons(app) + [Btn("Collect", self.collect, style="go"),
+                                      Btn("Add column…", self.add_column)]
+        if self.rows:
+            out += [Btn("Export CSV", self.export_csv), Btn("Clear rows…", self.clear_rows, style="stop")]
+        return out
+
+    # --- Layout (world units at Size 1 from the top-left; shared by drawing, clicks, wires) --
+    def _layout_w(self):
+        return (DC_CHIP_W + DC_PAD + DC_NUM_W + DC_TIME_W + DC_COL_W * len(self.columns) + DC_ADD_W
+                + DC_SCROLL_W + DC_PAD)
+
+    @property
+    def world_width(self):
+        return max(DC_CHIP_W + DC_PAD + DC_BUTTON_W * 2.4 + DC_PAD, self._layout_w()) * self.scale
+
+    @property
+    def world_height(self):
+        return (DC_PAD + DC_TITLE_H + DC_CELL_H * (1 + self.shown_rows) + DC_PAD) * self.scale
+
+    def _to_world(self, x, y):
+        c = self.world_center
+        return (c.x - self.world_width / 2 + x * self.scale, c.y - self.world_height / 2 + y * self.scale)
+
+    def _boxes(self):
+        """{name: (x, y, w, h)} at Size 1: 'chip', 'button', 'add', 'scroll' (the scrollbar
+        track), 'sheet' (header + rows), and each column header by cid."""
+        table_x = DC_CHIP_W + DC_PAD
+        head_y = DC_PAD + DC_TITLE_H
+        width = self.world_width / self.scale
+        boxes = {"chip": (DC_PAD * 0.4, DC_PAD + 8, DC_CHIP_W - DC_PAD * 0.8, DC_TITLE_H - 16),
+                 "button": (width - DC_PAD - DC_BUTTON_W, DC_PAD + 6, DC_BUTTON_W, DC_TITLE_H - 12)}
+        x = table_x + DC_NUM_W + DC_TIME_W
+        for col in self.columns:
+            boxes[col["cid"]] = (x, head_y, DC_COL_W, DC_CELL_H)
+            x += DC_COL_W
+        boxes["add"] = (x, head_y, DC_ADD_W, DC_CELL_H)
+        body_h = DC_CELL_H * self.shown_rows
+        boxes["scroll"] = (x + DC_ADD_W, head_y + DC_CELL_H, DC_SCROLL_W, body_h)
+        boxes["sheet"] = (table_x, head_y, x + DC_ADD_W - table_x, DC_CELL_H + body_h)
+        return boxes
+
+    def column_point(self, cid):
+        """World point a column's wire ends at: the top of its header."""
+        x, y, w, _h = self._boxes().get(cid, (0, 0, 0, 0))
+        return self._to_world(x + w / 2, y)
+
+    def trigger_point(self):
+        x, y, _w, h = self._boxes()["chip"]
+        return self._to_world(x, y + h / 2)
+
+    def _screen_boxes(self, rect):
+        k = rect.width / (self.world_width / self.scale)
+        return {name: pygame.Rect(rect.x + round(x * k), rect.y + round(y * k), max(1, round(w * k)),
+                                  max(1, round(h * k)))
+                for name, (x, y, w, h) in self._boxes().items()}, k
+
+    def on_click(self, pos, app):
+        boxes, _k = self._screen_boxes(self.screen_rect(app.camera))
+        track = boxes["scroll"]
+        if track.inflate(4, 0).collidepoint(pos):
+            thumb = self._thumb(track)
+            # On the thumb: drag it from where it was grabbed. On the track: jump there.
+            self._grab = pos[1] - thumb.y if thumb.collidepoint(pos) else thumb.height // 2
+            self._drag_scroll(pos[1], track)
+            return True                                  # the loop sends the drag here
+        hit = next((name for name, r in boxes.items()
+                    if name not in ("sheet", "scroll") and r.inflate(4, 4).collidepoint(pos)), None)
+        if hit == "button":
+            self.collect(app)
+        elif hit == "chip":
+            self.pick_trigger(app)
+        elif hit == "add":
+            self.add_column(app)
+        elif hit is not None:
+            self.pick_source(app, hit)
+        return hit is not None
+
+    def on_drag(self, pos, app):
+        if self._grab is not None:
+            boxes, _k = self._screen_boxes(self.screen_rect(app.camera))
+            self._drag_scroll(pos[1], boxes["scroll"])
+
+    def on_release(self, pos, app):
+        self._grab = None
+
+    # --- Drawing ----------------------------------------------------------------------
+    def draw_links(self, surface, camera):
+        if self.scene is None:
+            return
+        for col in self.columns:
+            src = self._source(col)
+            if src is not None and src.center is not None:
+                draw_wire(surface, camera, output_point(src), self.column_point(col["cid"]), self.WIRE_COLOR)
+        src = self._source(self.trigger)
+        if src is not None and src.center is not None:
+            draw_wire(surface, camera, output_point(src), self.trigger_point(), self.color)
+
+    def draw_shape(self, surface, rect, camera):
+        s = min(rect.width, rect.height)
+        radius = max(2, s // 14)
+        draw_rect(surface, (14, 14, 18), rect.move(0, max(1, s // 40)), border_radius=radius)
+        draw_rect(surface, INPUT_HOUSING, rect, border_radius=radius)
+        draw_rect(surface, shade(INPUT_HOUSING, 1.35), rect, width=max(1, s // 80), border_radius=radius)
+        boxes, k = self._screen_boxes(rect)
+        if DC_CELL_H * k < 6:                         # too small for a table: a grid hint
+            inner = rect.inflate(-max(2, s // 6), -max(2, s // 6))
+            draw_rect(surface, (238, 238, 232), inner)
+            return
+        mouse = pygame.mouse.get_pos() if self.is_hovered else None
+        text = round(DC_TEXT * k)
+        font = get_font(text, "consolas", True) if text >= 7 else None
+
+        # Title bar: the collect input chip, the name and row count, the Collect button.
+        chip = boxes["chip"]
+        linked = self._source(self.trigger) is not None
+        hot = mouse is not None and chip.inflate(4, 4).collidepoint(mouse)
+        color = shade(self.color, 1.2) if hot else self.color
+        cr = max(2, chip.height // 2)
+        if linked:
+            draw_rect(surface, color, chip, border_radius=cr)
+        else:
+            draw_rect(surface, INPUT_WELL, chip, border_radius=cr)
+            draw_rect(surface, color, chip, width=max(1, round(2 * k)), border_radius=cr)
+        if font is not None:
+            ts = font.render(clip_text("collect", font, chip.width - 4), True, INPUT_WELL if linked else color)
+            surface.blit(ts, ts.get_rect(center=chip.center))
+        button = boxes["button"]
+        lit = self._flash > 0
+        hot = mouse is not None and button.collidepoint(mouse)
+        draw_rect(surface, shade(self.color, 1.25) if lit else shade(self.color, 0.85 if hot else 0.65),
+                  button, border_radius=max(2, button.height // 4))
+        if font is not None:
+            ts = get_font(round(text * 1.1), "bahnschrift").render("Collect", True, (24, 22, 16))
+            surface.blit(ts, ts.get_rect(center=button.center))
+        table_x = boxes[self.columns[0]["cid"]].x - round((DC_NUM_W + DC_TIME_W) * k) if self.columns \
+            else boxes["add"].x - round((DC_NUM_W + DC_TIME_W) * k)
+        title_size = round(DC_TEXT * 1.3 * k)
+        if title_size >= 7:
+            tfont = get_font(title_size, "bahnschrift")
+            n = len(self.rows)
+            if self._top is not None:                # scrolled back: which rows are showing
+                a = self.first_shown() + 1
+                count = f"rows {a}-{min(n, a + self.shown_rows - 1)} of {n}"
+            else:
+                count = f"{n} row{'' if n == 1 else 's'}"
+            ts = tfont.render(clip_text(f"{self.title}  ·  {count}", tfont,
+                                        button.x - table_x - round(DC_PAD * k)), True, (226, 228, 236))
+            surface.blit(ts, ts.get_rect(midleft=(table_x, button.centery)))
+
+        # The sheet.
+        head = boxes["add"]
+        sheet = boxes["sheet"]
+        draw_rect(surface, (244, 244, 238), sheet)
+        cell_h = head.height
+        header = pygame.Rect(sheet.x, head.y, sheet.width, cell_h)
+        draw_rect(surface, (214, 216, 222), header)
+        line = (190, 192, 198)
+        cols = [("#", DC_NUM_W, None), ("time", DC_TIME_W, None)] + \
+               [(c["name"], DC_COL_W, c) for c in self.columns]
+        x = sheet.x
+        lines_x = []
+        for name, w, col in cols:
+            cell = pygame.Rect(x, head.y, round(w * k), cell_h)
+            if col is not None:
+                hot = mouse is not None and cell.collidepoint(mouse)
+                if hot:
+                    draw_rect(surface, (198, 204, 220), cell)
+                dot_r = max(2, round(4 * k))
+                dot = (cell.right - dot_r * 2 - 1, cell.centery)
+                if self._source(col) is not None:
+                    pygame.draw.circle(surface, (60, 170, 90), dot, dot_r)
+                else:
+                    pygame.draw.circle(surface, (150, 152, 160), dot, dot_r, max(1, dot_r // 2))
+            if font is not None:
+                room = cell.width - round(6 * k) - (round(12 * k) if col is not None else 0)
+                ts = font.render(clip_text(name, font, room), True, (40, 42, 50))
+                surface.blit(ts, ts.get_rect(midleft=(cell.x + round(4 * k), cell.centery)))
+            x = cell.right
+            lines_x.append(x)
+        add = boxes["add"]
+        hot = mouse is not None and add.collidepoint(mouse)
+        draw_rect(surface, (198, 204, 220) if hot else (226, 228, 234), add)
+        if font is not None:
+            ts = get_font(round(text * 1.3), "consolas", True).render("+", True, (70, 74, 90))
+            surface.blit(ts, ts.get_rect(center=add.center))
+
+        # The latest rows, oldest at the top.
+        start = self.first_shown()
+        shown = self.rows[start:start + self.shown_rows]
+        first = start + 1
+        y = header.bottom
+        for i, row in enumerate(shown):
+            r = pygame.Rect(sheet.x, y, sheet.width, cell_h)
+            if (first + i) % 2 == 0:
+                draw_rect(surface, (232, 234, 238), r)
+            if font is not None:
+                values = row.get("values", {})
+                cells = [str(first + i), row.get("time", "")[11:19]] + \
+                        ["—" if values.get(str(c["cid"])) is None else f"{values[str(c['cid'])]:.6g}"
+                         for c in self.columns]
+                x = sheet.x
+                for (name, w, col), value in zip(cols, cells):
+                    cw = round(w * k)
+                    ts = font.render(clip_text(value, font, cw - round(6 * k)), True,
+                                     (120, 122, 132) if col is None else (24, 26, 32))
+                    if col is None:
+                        surface.blit(ts, ts.get_rect(midleft=(x + round(4 * k), r.centery)))
+                    else:
+                        surface.blit(ts, ts.get_rect(midright=(x + cw - round(4 * k), r.centery)))
+                    x += cw
+            y += cell_h
+        for i in range(self.shown_rows + 1):        # grid
+            gy = header.bottom + i * cell_h
+            if gy <= sheet.bottom:
+                pygame.draw.line(surface, line, (sheet.x, gy), (sheet.right - 1, gy), 1)
+        for gx in lines_x:
+            pygame.draw.line(surface, line, (gx, sheet.y), (gx, sheet.bottom - 1), 1)
+        draw_rect(surface, (120, 122, 130), sheet, width=1)
+
+        # The scrollbar: a thumb sized to the share of rows on the sheet.
+        track = boxes["scroll"]
+        draw_rect(surface, INPUT_WELL, track, border_radius=max(1, track.width // 2))
+        if len(self.rows) > self.shown_rows:
+            thumb = self._thumb(track).inflate(-max(2, track.width // 4), -2)
+            hot = self._grab is not None or (mouse is not None and track.collidepoint(mouse))
+            draw_rect(surface, shade(self.color, 1.15 if hot else 0.8), thumb,
+                      border_radius=max(1, thumb.width // 2))
+        if not self.rows and font is not None:
+            hint = "press Collect to add a row" if self.columns else "click + to add a column"
+            ts = font.render(clip_text(hint, font, sheet.width - 8), True, (140, 142, 150))
+            at = ts.get_rect(center=(sheet.centerx, header.bottom + cell_h))
+            draw_rect(surface, (244, 244, 238), at.inflate(round(8 * k), 2))
+            surface.blit(ts, at)
 
 
 # ============================================================================

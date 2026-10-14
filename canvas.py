@@ -481,6 +481,8 @@ class Prop:
         return text + self.unit if unit else text
 
     def to_json(self, value):
+        if self.kind == "data":
+            return copy.deepcopy(value)      # a copy (C key) must not share the original's dicts/lists
         return list(value) if self.kind == "color" else value
 
     def from_json(self, value):
@@ -717,6 +719,11 @@ class CanvasObject:
     def on_release(self, pos, app):
         """The button came up after a handled click."""
         pass
+
+    def on_wheel(self, pos, steps, app):
+        """The mouse wheel turned over this object (steps > 0 = away from you).
+        Return True to use it (e.g. scroll a list) instead of zooming. Default: zoom."""
+        return False
 
     def draw(self, surface, camera):
         raise NotImplementedError

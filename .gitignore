@@ -6,3 +6,6 @@ Nodes.json
 
 # error log the app writes (it has no console)
 errors.log
+
+# exported data (Data collector CSVs)
+data/
