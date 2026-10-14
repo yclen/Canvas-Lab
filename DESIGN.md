@@ -184,6 +184,12 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   the box (+ walls fully inside). Arrow keys move all of them; Edit ▸ Delete / **Delete** key
   removes all after one confirm. `scene.selection` is the list; `scene.selected` is the single
   object or None when 0 or 2+, so rename/copy/goto/inspector only apply to one object
+- **Right-click menu**: a right-*click* (the mouse moves ≤ `RIGHT_CLICK_SLOP` px between press
+  and release; more is a right-drag pan) opens a `ContextMenu` at the cursor for the selection
+  — right-clicking an unselected object selects just it first; nothing selected, no menu. Its
+  one item, *Delete 'name'* / *Delete N objects* (red), goes through the same confirm as the
+  Delete key. `App.context_menu(pos, [(label, callback, style)])` opens one; it's a modal, so
+  a click elsewhere or Esc closes it. Not while a mode (placing, picking, building) is active
 - **Remembers your view**: on close, the world point at screen center + zoom are written to
   `Nodes.json` as `"view"`; on launch the camera is restored there. Normal saves keep it
 - **Text boxes** have a movable cursor: Left/Right, Home/End, Backspace/Delete,

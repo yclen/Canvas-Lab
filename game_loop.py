@@ -63,6 +63,8 @@ inspector = canvas.InspectorPanel()
 marquee = canvas.MarqueeSelect()    # left-drag on empty canvas selects many
 
 panning = False
+right_down = None           # where the right button went down: a click (not a pan) opens the menu
+RIGHT_CLICK_SLOP = 5        # px the mouse may move during a right-click before it counts as a pan
 dt = 0.0
 was_moving = False          # tracks arrow-key movement so we save on release
 last_click_time = 0         # for hand-rolled double-click detection
@@ -99,6 +101,23 @@ def handle_menu_command(command):
     elif command == "goto":
         if sel is not None and sel.center is not None:
             camera.look_at(sel.center, canvas.GOTO_ZOOM, screen.get_size())
+
+
+def open_context_menu(pos):
+    """Right-click menu: for the selection (right-clicking an unselected
+    object selects just it first). Nothing selected, nothing opens."""
+    if pos[1] <= canvas.MENU_BAR_HEIGHT or (scene.selected is not None
+                                            and inspector.contains(pos, screen.get_size())):
+        return
+    clicked = scene.hit_test(pos, camera)
+    if clicked is not None and clicked.selectable and not clicked.is_selected:
+        scene.select_only(clicked)
+    objs = scene.selection
+    if not objs:
+        return
+    label = (f"Delete '{objs[0].display_name}'" if len(objs) == 1
+             else f"Delete {len(objs)} objects")
+    app.context_menu(pos, [(label, lambda: handle_menu_command("delete_node"), "danger")])
 
 
 # ---- Main loop -------------------------------------------------------------
@@ -256,8 +275,13 @@ while running:
 
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
             panning = True
+            right_down = event.pos
         elif event.type == pygame.MOUSEBUTTONUP and event.button == 3:
             panning = False
+            if (right_down is not None and not app.building
+                    and (pygame.Vector2(event.pos) - right_down).length() <= RIGHT_CLICK_SLOP):
+                open_context_menu(event.pos)      # a right-click, not a right-drag pan
+            right_down = None
         elif event.type == pygame.MOUSEMOTION and panning:
             camera.pan(*event.rel)
 

@@ -2486,6 +2486,60 @@ class ConfirmModal:
         surface.blit(dl, dl.get_rect(center=delete.center))
 
 
+CONTEXT_DANGER = (255, 120, 110)     # a destructive context-menu item's text
+
+
+class ContextMenu:
+    """A small right-click menu at the cursor (usually opened via
+    app.context_menu). items: [(label, callback, style)], style "danger" (red
+    text) or None. A click on an item picks it — the loop calls commit(), which
+    runs its callback (it may open another modal, e.g. a confirm). A click
+    anywhere else, or Esc, closes it."""
+
+    def __init__(self, pos, items):
+        self.pos = pos
+        self.items = items
+        self.chosen = None
+
+    def commit(self):
+        if self.chosen is not None:
+            self.chosen[1]()
+
+    def layout(self, screen_size):
+        """[(rect, item)] — opens down-right of the cursor, kept on screen."""
+        font = get_font(MENU_FONT_SIZE)
+        h = MENU_BAR_HEIGHT
+        width = max([140] + [font.size(label)[0] + 28 for label, _cb, _st in self.items])
+        x = min(self.pos[0], screen_size[0] - width - 2)
+        y = min(self.pos[1], screen_size[1] - h * len(self.items) - 2)
+        return [(pygame.Rect(x, y + i * h, width, h), item) for i, item in enumerate(self.items)]
+
+    def handle_event(self, event, screen_size):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button in (1, 3):
+            for rect, item in self.layout(screen_size):
+                if rect.collidepoint(event.pos) and event.button == 1:
+                    self.chosen = item
+                    return "submit"
+            return "cancel"
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            return "cancel"
+        return None
+
+    def draw(self, surface):
+        font = get_font(MENU_FONT_SIZE)
+        rows = self.layout(surface.get_size())
+        if not rows:
+            return
+        frame = rows[0][0].unionall([r for r, _i in rows])
+        pygame.draw.rect(surface, (14, 14, 18), frame.move(2, 3), border_radius=4)   # shadow
+        mouse = pygame.mouse.get_pos()
+        for rect, (label, _cb, style) in rows:
+            pygame.draw.rect(surface, MENU_HOVER if rect.collidepoint(mouse) else MENU_BG, rect)
+            ts = font.render(label, True, CONTEXT_DANGER if style == "danger" else MENU_TEXT)
+            surface.blit(ts, ts.get_rect(midleft=(rect.x + 14, rect.centery)))
+        pygame.draw.rect(surface, MENU_BORDER, frame, width=1, border_radius=4)
+
+
 # ---- Inspector panel (right-side overlay; shows the selected object) --------
 INSPECTOR_WIDTH = 280
 INSPECTOR_BG = (34, 34, 42)
@@ -3258,3 +3312,7 @@ class App:
     def confirm(self, message, sub, on_confirm, ok_label="Delete"):
         """Open a Cancel / <ok_label> dialog; on_confirm() runs if they confirm."""
         self.modal = ConfirmModal(message, sub, on_confirm, ok_label)
+
+    def context_menu(self, pos, items):
+        """Open a right-click menu at screen pos; items: [(label, callback, style)]."""
+        self.modal = ContextMenu(pos, items)
