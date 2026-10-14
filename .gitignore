@@ -9,3 +9,6 @@ errors.log
 
 # exported data (Data collector CSVs)
 data/
+
+# saved machines (E menu > Machines), personal like Nodes.json
+machines.json

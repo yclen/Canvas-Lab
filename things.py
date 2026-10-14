@@ -1088,6 +1088,7 @@ class DataCollector(Thing):
              Prop("rows", kind="data", default=[], hidden=True),     # [{"time": iso, "values": {cid: v}}]
              Prop("trigger", kind="data", default={}, hidden=True)]  # collect input: {"id", "key"}
     WIRE_COLOR = (120, 220, 150)
+    COPY_SKIP = ("rows",)           # a copy (C key, or a placed machine) starts with no data
 
     @classmethod
     def create(cls, app):

@@ -2138,9 +2138,14 @@ class Scene:
         return None
 
     def add(self, obj):
-        obj.scene = self
-        self.objects.append(obj)
-        self.by_id[obj.id] = obj
+        self.add_many([obj])
+
+    def add_many(self, objs):
+        """Add several objects (a placed machine) with one save."""
+        for obj in objs:
+            obj.scene = self
+            self.objects.append(obj)
+            self.by_id[obj.id] = obj
         self.sync_weights()
         self.save()
 
@@ -2232,6 +2237,165 @@ def copy_object(obj, at=None):
         c = new.center
         new.move(at[0] - c[0], at[1] - c[1])
     return new
+
+
+# ---- Machines: a saved group of objects, placed again as a whole ------------
+# Select objects, right-click ▸ Create machine…: their saved data goes into
+# machines.json (next to Nodes.json). The E menu's Machines tab lists them;
+# placing one builds fresh objects — new ids, with links between its own
+# objects rewired to the new copies (links to anything outside stay as they
+# were). Once placed they're ordinary objects, selected together.
+MACHINES_FILE = os.path.join(SCRIPT_DIR, "machines.json")
+_machines = None        # loaded on first use, then kept in step with the file
+
+
+def machines():
+    """The saved machines: [{"name", "created", "center": [x, y], "objects": [saved dicts]}]."""
+    global _machines
+    if _machines is None:
+        try:
+            with open(MACHINES_FILE, "r", encoding="utf-8") as f:
+                _machines = list(json.load(f).get("machines", []))
+        except (OSError, ValueError, AttributeError):
+            _machines = []
+    return _machines
+
+
+def _save_machines():
+    with open(MACHINES_FILE, "w", encoding="utf-8") as f:
+        json.dump({"machines": machines()}, f, indent=2)
+
+
+def group_bounds(objs):
+    """World (left, top, right, bottom) around the objects: a wall's own rect, else
+    its center ± half its size."""
+    boxes = []
+    for o in objs:
+        if all(hasattr(o, a) for a in ("x", "y", "w", "h")) and not hasattr(o, "world_width"):
+            boxes.append((o.x, o.y, o.x + o.w, o.y + o.h))
+            continue
+        c = o.center
+        if c is None:
+            continue
+        hw, hh = getattr(o, "world_width", 0) / 2, getattr(o, "world_height", 0) / 2
+        boxes.append((c[0] - hw, c[1] - hh, c[0] + hw, c[1] + hh))
+    if not boxes:
+        return 0.0, 0.0, 0.0, 0.0
+    return (min(b[0] for b in boxes), min(b[1] for b in boxes),
+            max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+
+def machine_parts(objs):
+    """(kept, skipped): what can go in a machine — anything copyable that isn't one-only."""
+    kept = [o for o in objs if o.copyable and not o.SINGLETON]
+    return kept, [o for o in objs if o not in kept]
+
+
+def save_machine(name, objs):
+    """Save the copyable objects among objs as a new machine (a taken name gets
+    " (2)", …). Returns the machine dict, or None if none of them can go in one."""
+    kept, _skipped = machine_parts(objs)
+    if not kept:
+        return None
+    taken = {m["name"] for m in machines()}
+    base, n = name.strip() or "Machine", 2
+    name = base
+    while name in taken:
+        name, n = f"{base} ({n})", n + 1
+    left, top, right, bottom = group_bounds(kept)
+    saved = []
+    for o in kept:
+        d = o.to_dict()
+        for key in o.COPY_SKIP:
+            d.pop(key, None)
+        saved.append(d)
+    machine = {"name": name, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+               "center": [(left + right) / 2, (top + bottom) / 2], "objects": saved}
+    machines().append(machine)
+    _save_machines()
+    return machine
+
+
+def rename_machine(machine, name):
+    if name.strip() and name.strip() not in {m["name"] for m in machines() if m is not machine}:
+        machine["name"] = name.strip()
+        _save_machines()
+        return True
+    return False
+
+
+def delete_machine(machine):
+    if machine in machines():
+        machines().remove(machine)
+        _save_machines()
+
+
+def _remap_ids(value, mapping):
+    """value with every string that's an old id swapped for its new one."""
+    if isinstance(value, dict):
+        return {k: _remap_ids(v, mapping) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_remap_ids(v, mapping) for v in value]
+    if isinstance(value, str):
+        return mapping.get(value, value)
+    return value
+
+
+def build_machine(machine, at):
+    """Fresh objects for a machine, centered on world point `at`."""
+    mapping = {d["id"]: new_id() for d in machine["objects"] if d.get("id")}
+    objs = [object_from_dict(_remap_ids(d, mapping)) for d in machine["objects"]]
+    cx, cy = machine.get("center", (0, 0))
+    for o in objs:
+        if o.movable:
+            o.move(at[0] - cx, at[1] - cy)
+    return objs
+
+
+class MachineGroup:
+    """A machine in hand while placing: its objects, moved and drawn together
+    (PlaceMode adds them all when it's dropped)."""
+
+    SINGLETON = False
+
+    def __init__(self, machine, at):
+        self.machine = machine
+        self.members = build_machine(machine, at)
+
+    @property
+    def center(self):
+        left, top, right, bottom = group_bounds(self.members)
+        return ((left + right) / 2, (top + bottom) / 2)
+
+    def move(self, dx, dy):
+        for o in self.members:
+            if o.movable:
+                o.move(dx, dy)
+
+    def draw(self, surface, camera):
+        for o in self.members:
+            try:
+                o.draw(surface, camera)
+            except Exception:          # one odd object shouldn't break the preview
+                pass
+
+    def place_name(self):
+        return f"machine '{self.machine['name']}'"
+
+
+def draw_machine_preview(machine, surface):
+    """Draw the machine's objects scaled to fit `surface` (its E menu icon)."""
+    objs = build_machine(machine, (0, 0))
+    left, top, right, bottom = group_bounds(objs)
+    w, h = max(1.0, right - left), max(1.0, bottom - top)
+    size = surface.get_size()
+    camera = Camera()
+    camera.look_at(((left + right) / 2, (top + bottom) / 2), min(size[0] / w, size[1] / h) * 0.9, size)
+    for o in objs:
+        try:
+            o.draw(surface, camera)
+        except Exception:
+            pass
 
 
 # ============================================================================
@@ -2787,12 +2951,13 @@ class PlaceMode:
     def place(self, world, scene, keep_going=False):
         self.follow(world)
         obj = self.obj
-        scene.add(obj)
+        placed = obj.members if isinstance(obj, MachineGroup) else [obj]   # a machine drops all of its objects
+        scene.add_many(placed)
         if keep_going and not obj.SINGLETON:
             self.obj = self.factory(*world)
         else:
             self.cancel()
-            scene.select_only(obj)
+            scene.select_many(placed)
         return obj
 
     def draw(self, surface, camera):
@@ -2804,8 +2969,8 @@ class PlaceMode:
         self.obj.draw(self._layer, camera)
         self._layer.set_alpha(self.GHOST_ALPHA)
         surface.blit(self._layer, (0, 0))
-        draw_hint(surface, f"Place {self.obj.type_name().lower()} — click to drop     "
-                           "Shift+click: keep placing     Esc: cancel")
+        name = self.obj.place_name() if hasattr(self.obj, "place_name") else self.obj.type_name().lower()
+        draw_hint(surface, f"Place {name} — click to drop     Shift+click: keep placing     Esc: cancel")
 
 
 class PickMode:
@@ -3096,18 +3261,50 @@ INV_TILE_BG = (56, 56, 70)
 INV_TILE_HOVER = (74, 74, 94)
 
 
+class MachineTile:
+    """A saved machine's tile in the E menu: stands in for a class there (a name,
+    an icon — a miniature of its objects — and create(), which picks it up)."""
+
+    CATEGORY = "Machines"
+
+    def __init__(self, machine):
+        self.machine = machine
+
+    def __eq__(self, other):
+        return isinstance(other, MachineTile) and self._key() == other._key()
+
+    def __hash__(self):
+        return hash(self._key())
+
+    def _key(self):
+        return ("machine", self.machine["name"], self.machine.get("created"))
+
+    def type_name(self):
+        return self.machine["name"]
+
+    def draw_icon(self, surface):
+        draw_machine_preview(self.machine, surface)
+
+    def create(self, app):
+        machine = self.machine
+        app.start_placing(lambda x, y: MachineGroup(machine, (x, y)))
+
+
 class InventoryPanel:
     """Press E (or Objects (E) in the menu bar): a window with a tile per
     placeable object type — its icon (drawn by the type's own draw_icon) and
     name. Wheel scrolls; clicking a tile picks that type (the loop then calls
     commit() -> on_pick(cls), which runs cls.create). E / Esc / a click outside
-    closes it. Tabs: "All", plus one per CATEGORY that any type sets.
+    closes it. Tabs: "All", plus one per CATEGORY that any type sets, plus
+    "Machines" (saved groups of objects; right-click one to rename / delete it).
 
     It's a modal (same handle_event/commit/draw interface as the dialogs), and
     the App keeps one instance, so the tab and scroll position stick around."""
 
-    def __init__(self, on_pick):
+    def __init__(self, on_pick, on_context=None):
         self.on_pick = on_pick
+        self.on_context = on_context   # on_context(machine, pos): a right-click on a machine
+        self.context = None
         self.tab = "All"
         self.scroll = 0          # px scrolled down in the grid
         self.picked = None
@@ -3123,11 +3320,13 @@ class InventoryPanel:
         for cls in self._all_types():
             if cls.CATEGORY and cls.CATEGORY not in cats:
                 cats.append(cls.CATEGORY)
-        return ["All"] + cats
+        return ["All"] + cats + ["Machines"]
 
     def types(self):
         if self.tab not in self.tabs():
             self.tab = "All"
+        if self.tab == "Machines":
+            return [MachineTile(m) for m in machines()]
         return [cls for cls in self._all_types()
                 if self.tab == "All" or cls.CATEGORY == self.tab]
 
@@ -3195,9 +3394,20 @@ class InventoryPanel:
                     if rect.collidepoint(event.pos):
                         self.picked = cls
                         return "submit"
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3 and self.on_context is not None:
+            _box, _tabs, area, tiles, _h = self.layout(screen_size)
+            if area.collidepoint(event.pos):
+                for rect, tile in tiles:
+                    if isinstance(tile, MachineTile) and rect.collidepoint(event.pos):
+                        self.context = (tile.machine, event.pos)
+                        return "submit"
         return None
 
     def commit(self):
+        if self.context is not None:
+            (machine, pos), self.context = self.context, None
+            self.on_context(machine, pos)
+            return
         cls, self.picked = self.picked, None
         if cls is not None:
             self.on_pick(cls)
@@ -3207,8 +3417,9 @@ class InventoryPanel:
         _draw_modal_frame(surface, box)
         font = get_font(MENU_FONT_SIZE)
         surface.blit(get_font(30).render("Objects", True, INSPECTOR_TITLE), (box.x + 16, box.y + 14))
-        hint = get_font(18).render("Click to pick up     Wheel: scroll     E / Esc: close",
-                                   True, (150, 150, 160))
+        text = ("Click to pick up     Right-click: rename / delete     E / Esc: close"
+                if self.tab == "Machines" else "Click to pick up     Wheel: scroll     E / Esc: close")
+        hint = get_font(18).render(text, True, (150, 150, 160))
         surface.blit(hint, (box.x + 16, box.bottom - 24))
 
         for rect, name in tabs:
@@ -3236,7 +3447,9 @@ class InventoryPanel:
         surface.set_clip(prev_clip)
 
         if not tiles:
-            es = font.render("— nothing here yet", True, INSPECTOR_LABEL)
+            text = ("— no machines yet: select some objects, right-click ▸ Create machine…"
+                    if self.tab == "Machines" else "— nothing here yet")
+            es = font.render(clip_text(text, font, area.width), True, INSPECTOR_LABEL)
             surface.blit(es, (area.x, area.y))
         elif content_h > area.height:                        # scrollbar
             track = pygame.Rect(box.right - 10, area.y, 4, area.height)
@@ -3265,7 +3478,8 @@ class App:
         self.wall_builder = WallBuilder()
         self.placer = PlaceMode()
         self.picker = PickMode()
-        self.inventory = InventoryPanel(on_pick=lambda cls: cls.create(self))
+        self.inventory = InventoryPanel(on_pick=lambda cls: cls.create(self),
+                                        on_context=lambda machine, pos: self.machine_menu(machine, pos))
 
     @property
     def building(self):
@@ -3323,3 +3537,37 @@ class App:
     def context_menu(self, pos, items):
         """Open a right-click menu at screen pos; items: [(label, callback, style)]."""
         self.modal = ContextMenu(pos, items)
+
+    def create_machine(self, objs):
+        """Name the objects as a machine and save it (E menu ▸ Machines)."""
+        kept, skipped = machine_parts(objs)
+        if not kept:
+            self.confirm("Can't make a machine from these",
+                         "Trains and one-only objects (the instrument server) can't go in one.",
+                         lambda: None, ok_label="OK")
+            return
+
+        def named(text):
+            machine = save_machine(text, kept)
+            note = f"{len(kept)} object{'' if len(kept) == 1 else 's'} — place it from the E menu ▸ Machines."
+            if skipped:
+                kinds = sorted({o.type_name().lower() for o in skipped})
+                note += f" Left out {len(skipped)}: {', '.join(kinds)} can't go in a machine."
+            self.confirm(f"Saved machine '{machine['name']}'", note, lambda: None, ok_label="OK")
+        self.ask(f"Name for this machine ({len(kept)} object{'' if len(kept) == 1 else 's'}):", named)
+
+    def machine_menu(self, machine, pos):
+        """Right-click on a machine in the E menu: rename or delete it (then back to the menu)."""
+        def rename():
+            def submit(text):
+                rename_machine(machine, text)
+                self.open_inventory()
+            self.ask("Machine name:", submit, value=machine["name"])
+
+        def delete():
+            def gone():
+                delete_machine(machine)
+                self.open_inventory()
+            self.confirm(f"Delete machine '{machine['name']}'?",
+                         "The saved machine only — objects already placed stay.", gone)
+        self.context_menu(pos, [("Rename…", rename, None), (f"Delete '{machine['name']}'", delete, "danger")])

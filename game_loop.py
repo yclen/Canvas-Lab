@@ -117,7 +117,8 @@ def open_context_menu(pos):
         return
     label = (f"Delete '{objs[0].display_name}'" if len(objs) == 1
              else f"Delete {len(objs)} objects")
-    app.context_menu(pos, [(label, lambda: handle_menu_command("delete_node"), "danger")])
+    app.context_menu(pos, [("Create machine…", lambda: app.create_machine(objs), None),
+                           (label, lambda: handle_menu_command("delete_node"), "danger")])
 
 
 # ---- Main loop -------------------------------------------------------------

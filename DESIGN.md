@@ -76,7 +76,7 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   should bail out to a simple shape, as Thing's LOD dot and the Readout now do.)
 - **E menu (inventory)**: **E** (or *Objects (E)* in the menu bar) opens a window with a
   tile per placeable type — its icon + name — wheel-scrollable for a long catalog, with
-  tabs ("All" + one per `CATEGORY` any type sets). Icons draw themselves: the default
+  tabs ("All" + one per `CATEGORY` any type sets, + "Machines" — see *Machines*). Icons draw themselves: the default
   `draw_icon` draws a sample object (`icon_sample()`) scaled to fit, so a new type gets an
   icon for free (Train/Wall hand-draw theirs; a crashing icon shows a "?" tile instead).
   Picking a tile runs the type's `create`. Remembers its tab + scroll
@@ -239,10 +239,27 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   object or None when 0 or 2+, so rename/copy/goto/inspector only apply to one object
 - **Right-click menu**: a right-*click* (the mouse moves ≤ `RIGHT_CLICK_SLOP` px between press
   and release; more is a right-drag pan) opens a `ContextMenu` at the cursor for the selection
-  — right-clicking an unselected object selects just it first; nothing selected, no menu. Its
-  one item, *Delete 'name'* / *Delete N objects* (red), goes through the same confirm as the
-  Delete key. `App.context_menu(pos, [(label, callback, style)])` opens one; it's a modal, so
-  a click elsewhere or Esc closes it. Not while a mode (placing, picking, building) is active
+  — right-clicking an unselected object selects just it first; nothing selected, no menu. Items:
+  *Create machine…* (below), then *Delete 'name'* / *Delete N objects* (red), which goes through
+  the same confirm as the Delete key. `App.context_menu(pos, [(label, callback, style)])` opens
+  one; it's a modal, so a click elsewhere or Esc closes it. Not while a mode (placing, picking,
+  building) is active
+- **Machines** (`canvas.py`, "Machines" section): a saved group of objects, placed again as a
+  whole. Select objects, right-click ▸ *Create machine…*, name it: the selection's saved data
+  (`to_dict`, minus each type's `COPY_SKIP` — a data collector's `rows`, a neuron's weights) goes
+  into `machines.json` next to Nodes.json (git-ignored, like it) with the group's center. Only
+  copyable, non-`SINGLETON` objects go in — trains and the instrument server are left out (the
+  confirmation says which). A taken name gets " (2)". The E menu's **Machines** tab (always shown;
+  empty, it says how to make one) has a tile per machine — its icon a miniature of its objects
+  (`draw_machine_preview`) — and right-click on one renames / deletes it (`App.machine_menu`,
+  back to the E menu after). Picking one puts a `MachineGroup` in hand: PlaceMode moves and ghosts
+  all its objects together and drops them all with one save (`Scene.add_many`), selected as a group
+  (Shift+click keeps placing more copies). `build_machine` gives every object a new id and rewires
+  links between the machine's own objects to the new copies by swapping every old-id string in the
+  saved data (`_remap_ids`) — so any link style works without each type listing its links; links
+  to objects *outside* the machine are kept (they reconnect if that object exists, else show as
+  unlinked). Once placed they're ordinary objects — there's no lasting "machine" object. Device
+  objects keep their server device name, so a placed copy drives the same hardware
 - **Remembers your view**: on close, the world point at screen center + zoom are written to
   `Nodes.json` as `"view"`; on launch the camera is restored there. Normal saves keep it
 - **Text boxes** have a movable cursor: Left/Right, Home/End, Backspace/Delete,
