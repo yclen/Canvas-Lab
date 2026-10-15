@@ -4622,198 +4622,17 @@ class App:
 # HOME SCREEN — what a canvas window opens to: join the world (it runs on its
 # own, in world_server.py), launch it, or work on your own (Nodes.json
 # directly, the way the canvas always worked — only while no world is running).
-# Drawn in the app's own look: a drifting dot-grid canvas with faint linked
-# shapes, and the logo — a little node graph — drawn live with flowing wires.
 # ============================================================================
 APP_NAME = "Canvas Lab"
-HOME_TAGLINE = "A living canvas for the lab — build it, wire it, share it."
+HOME_W = 460                        # the column's width, px
+HOME_CARD = (34, 34, 42)
+HOME_GO = (56, 140, 84)
+HOME_GO_HOVER = (68, 165, 100)
+HOME_PLAIN = (58, 58, 70)
+HOME_PLAIN_HOVER = (74, 74, 90)
 HOME_DIM = (140, 140, 155)
 HOME_OK = (90, 220, 120)
 HOME_WARN = (240, 190, 90)
-HOME_TEXT = (238, 238, 244)
-HOME_TITLE_FONT = "Bahnschrift"     # system font (falls back to the default if missing)
-# The logo's four shapes, in four of the player colors (blue, amber, green, pink).
-LOGO_COLORS = [(80, 170, 255), (240, 200, 70), (110, 220, 120), (255, 110, 190)]
-HOME_GRID = 34                      # dot-grid spacing, px
-HOME_DRIFT = (14.0, 6.0)            # how the background canvas drifts, px/s
-
-
-def _lerp_color(a, b, t):
-    return tuple(int(x + (y - x) * t) for x, y in zip(a, b))
-
-
-def draw_logo(surface, center, size, t, *, glow=True):
-    """The Canvas Lab logo, drawn live: a square, a diamond, a square and a ring
-    joined by right-angle links (D → C → B → A), each shape in its own color,
-    with dots flowing along the links like the canvas's wires."""
-    cx, cy = center
-    s = size
-
-    def P(u, v):
-        return pygame.Vector2(cx + (u - 0.5) * s, cy + (v - 0.5) * s)
-
-    stroke = max(2, round(s * 0.065))
-    a, b, c, d = P(0.25, 0.25), P(0.75, 0.25), P(0.75, 0.74), P(0.25, 0.74)
-    path = [d, c, b, a]                                   # the way the value flows
-    key = (round(s), "logo")
-    layer = _LOGO_CACHE.get(key)
-    if layer is None:
-        layer = _render_logo_shapes(s, stroke)
-        _LOGO_CACHE.clear()
-        _LOGO_CACHE[key] = layer
-    shapes, halo = layer
-    # links: a dim line, then flowing dots (drawn under the shapes, which hide the ends)
-    for p, q in zip(path, path[1:]):
-        pygame.draw.line(surface, (70, 74, 92), p, q, max(2, stroke // 2))
-    total = sum((q - p).length() for p, q in zip(path, path[1:]))
-    dots = 7
-    for k in range(dots):
-        f = ((t * 0.18 + k / dots) % 1.0) * total
-        for i, (p, q) in enumerate(zip(path, path[1:])):
-            seg = (q - p).length()
-            if f <= seg:
-                color = _lerp_color(LOGO_COLORS[[3, 2, 1][i]], LOGO_COLORS[[2, 1, 0][i]], f / max(1, seg))
-                pygame.draw.circle(surface, color, p.lerp(q, f / max(1, seg)), max(2, stroke * 0.42))
-                break
-            f -= seg
-    top_left = (cx - s / 2, cy - s / 2)
-    if glow:
-        surface.blit(halo, (top_left[0] - s * 0.25, top_left[1] - s * 0.25), special_flags=pygame.BLEND_RGB_ADD)
-    surface.blit(shapes, top_left)
-
-
-_LOGO_CACHE = {}
-
-
-def _render_logo_shapes(s, stroke):
-    """(shapes, halo): the logo's four shapes on a clear layer, and a blurred,
-    larger copy to add on as a glow."""
-    size = max(8, round(s))
-    shapes = pygame.Surface((size, size), pygame.SRCALPHA)
-
-    def P(u, v):
-        return pygame.Vector2(u * size, v * size)
-    fill = (16, 16, 22)
-    # A: square (blue)
-    half = size * 0.115
-    for center, color in ((P(0.25, 0.25), LOGO_COLORS[0]), (P(0.75, 0.74), LOGO_COLORS[2])):
-        r = pygame.Rect(0, 0, round(half * 2), round(half * 2))
-        r.center = center
-        pygame.draw.rect(shapes, fill, r, border_radius=max(1, stroke // 2))
-        pygame.draw.rect(shapes, color, r, width=stroke, border_radius=max(1, stroke // 2))
-    # B: diamond (amber)
-    bc, rad = P(0.75, 0.25), size * 0.155
-    diamond = [bc + (0, -rad), bc + (rad, 0), bc + (0, rad), bc + (-rad, 0)]
-    pygame.draw.polygon(shapes, fill, diamond)
-    pygame.draw.polygon(shapes, LOGO_COLORS[1], diamond, stroke)
-    # D: ring (pink)
-    dc = P(0.25, 0.74)
-    pygame.draw.circle(shapes, fill, dc, size * 0.115)
-    pygame.draw.circle(shapes, LOGO_COLORS[3], dc, size * 0.115, stroke)
-    # the glow: the shapes, blurred (scaled way down and back up), on a wider layer
-    pad = round(size * 0.25)
-    wide = pygame.Surface((size + 2 * pad, size + 2 * pad), pygame.SRCALPHA)
-    wide.blit(shapes, (pad, pad))
-    small = pygame.transform.smoothscale(wide, (max(1, wide.get_width() // 10), max(1, wide.get_height() // 10)))
-    halo = pygame.transform.smoothscale(small, wide.get_size())
-    halo.fill((150, 150, 150, 255), special_flags=pygame.BLEND_RGBA_MULT)   # softer
-    return shapes, halo
-
-
-class HomeBackdrop:
-    """The home screen's background: a dark gradient, a drifting dot grid,
-    faint shapes linked by flowing wires (the canvas, idling), and a vignette.
-    The parts that only depend on the window size are drawn once per size."""
-
-    SHAPES = 16
-
-    def __init__(self):
-        rng = random.Random(7)
-        self.nodes = [{"u": rng.random(), "v": rng.random(), "kind": rng.choice(("square", "diamond", "ring", "tile")),
-                       "color": rng.choice(LOGO_COLORS), "size": rng.uniform(16, 34),
-                       "speed": rng.uniform(0.6, 1.3)} for _ in range(self.SHAPES)]
-        self.links = [(i, j) for i in range(self.SHAPES) for j in range(i + 1, self.SHAPES)
-                      if rng.random() < 0.13]
-        self._size = None
-
-    def _build(self, size):
-        w, h = size
-        self._size = size
-        top, bottom = (17, 17, 23), (26, 23, 36)
-        self.base = pygame.Surface(size)
-        for y in range(h):
-            pygame.draw.line(self.base, _lerp_color(top, bottom, y / max(1, h - 1)), (0, y), (w, y))
-        g = HOME_GRID
-        self.grid = pygame.Surface((w + g, h + g), pygame.SRCALPHA)
-        for gx in range(0, w + g, g):
-            for gy in range(0, h + g, g):
-                pygame.draw.circle(self.grid, (54, 54, 70, 255), (gx, gy), 1)
-        self.vignette = pygame.Surface(size, pygame.SRCALPHA)
-        try:
-            import numpy as np
-            yy, xx = np.mgrid[0:h, 0:w]
-            r = np.hypot((xx - w / 2) / (w / 2), (yy - h / 2) / (h / 2))
-            alpha = np.clip((r - 0.55) * 230, 0, 190).astype(np.uint8)
-            self.vignette.fill((6, 6, 10, 0))
-            pygame.surfarray.pixels_alpha(self.vignette)[:] = alpha.T
-        except Exception:
-            pass
-
-    def draw(self, surface, t, clear=()):
-        """clear: screen rects (the logo, the panel) the drifting shapes keep out of."""
-        size = surface.get_size()
-        if size != self._size:
-            self._build(size)
-        w, h = size
-        surface.blit(self.base, (0, 0))
-        g = HOME_GRID
-        ox, oy = (t * HOME_DRIFT[0]) % g, (t * HOME_DRIFT[1]) % g
-        surface.blit(self.grid, (ox - g, oy - g))
-        # the idle canvas: shapes drifting with the grid (a little parallax each), wrapping around
-        span_w, span_h = w + 300, h + 300
-        pos = []
-        for n in self.nodes:
-            x = (n["u"] * span_w + t * HOME_DRIFT[0] * n["speed"]) % span_w - 150
-            y = (n["v"] * span_h + t * HOME_DRIFT[1] * n["speed"]) % span_h - 150
-            pos.append(pygame.Vector2(x, y))
-        zones = [pygame.Rect(r).inflate(60, 60) for r in clear]
-        hidden = [any(z.collidepoint(p) for z in zones) for p in pos]
-        for i, j in self.links:
-            p, q = pos[i], pos[j]
-            if abs(p.x - q.x) > 520 or abs(p.y - q.y) > 360:
-                continue                                    # one of them just wrapped: no stretched wire
-            corner = pygame.Vector2(q.x, p.y)
-            if hidden[i] or hidden[j] or any(z.clipline(p, corner) or z.clipline(corner, q) for z in zones):
-                continue                                    # keep wires out from behind the logo / panel
-            for a, b in ((p, corner), (corner, q)):
-                pygame.draw.line(surface, (40, 41, 54), a, b, 2)
-            color = _lerp_color((26, 24, 34), self.nodes[i]["color"], 0.55)
-            total = (corner - p).length() + (q - corner).length()
-            for k in range(max(1, int(total / 70))):
-                f = ((t * 0.12 * self.nodes[i]["speed"] + k / max(1, int(total / 70))) % 1.0) * total
-                seg = (corner - p).length()
-                spot = p.lerp(corner, f / seg) if f <= seg and seg > 0 else corner.lerp(q, (f - seg) / max(1, total - seg))
-                pygame.draw.circle(surface, color, spot, 2)
-        for n, p, hide in zip(self.nodes, pos, hidden):
-            if hide:
-                continue
-            color = _lerp_color((26, 24, 34), n["color"], 0.32)
-            s = n["size"]
-            if n["kind"] == "square":
-                r = pygame.Rect(0, 0, s, s)
-                r.center = p
-                pygame.draw.rect(surface, color, r, width=2, border_radius=3)
-            elif n["kind"] == "tile":
-                r = pygame.Rect(0, 0, s * 2.2, s * 1.2)
-                r.center = p
-                pygame.draw.rect(surface, (24, 24, 32), r, border_radius=6)
-                pygame.draw.rect(surface, color, r, width=2, border_radius=6)
-            elif n["kind"] == "diamond":
-                d = s * 0.7
-                pygame.draw.polygon(surface, color, [p + (0, -d), p + (d, 0), p + (0, d), p + (-d, 0)], 2)
-            else:
-                pygame.draw.circle(surface, color, p, s * 0.55, 2)
-        surface.blit(self.vignette, (0, 0))
 
 
 class HomeScreen:
@@ -4829,8 +4648,6 @@ class HomeScreen:
         self.checked = False        # has the first check come back?
         self.starting_until = 0.0   # after Launch world: wait for it until then (monotonic)
         self.modal = None
-        self.backdrop = HomeBackdrop()
-        self._t0 = time.monotonic()
         self._buttons = []          # (rect, action) from the last draw
         self._stop = False
         threading.Thread(target=self._poll, daemon=True, name="home-poll").start()
@@ -4916,77 +4733,33 @@ class HomeScreen:
                         self.message = "The world didn't start — see errors.log."
                 self.draw(pygame.display.get_surface())
                 pygame.display.flip()
-                clock.tick(60)
+                clock.tick(30)
         finally:
             self._stop = True
 
     # --- Drawing ------------------------------------------------------------------------
-    @property
-    def t(self):
-        return time.monotonic() - self._t0
-
     def _draw_wait(self, text):
         surface = pygame.display.get_surface()
-        self.backdrop.draw(surface, self.t)
-        c = pygame.Vector2(surface.get_rect().center)
-        draw_logo(surface, c - (0, 40), 110, self.t)
-        ts = get_font(26).render(text, True, HOME_TEXT)
-        surface.blit(ts, ts.get_rect(center=(c.x, c.y + 50)))
+        surface.fill(BG_COLOR)
+        ts = get_font(28).render(text, True, (230, 230, 235))
+        surface.blit(ts, ts.get_rect(center=surface.get_rect().center))
         pygame.display.flip()
 
-    @staticmethod
-    def _panel(surface, rect, edge=None, alpha=215):
-        """A glassy dark panel; `edge` = a colored strip down its left side."""
-        layer = pygame.Surface(rect.size, pygame.SRCALPHA)
-        pygame.draw.rect(layer, (28, 28, 38, alpha), layer.get_rect(), border_radius=14)
-        pygame.draw.rect(layer, (70, 70, 92, 255), layer.get_rect(), width=1, border_radius=14)
-        surface.blit(layer, rect.topleft)
-        if edge is not None:
-            strip = pygame.Rect(rect.x + 1, rect.y + 12, 4, rect.height - 24)
-            pygame.draw.rect(surface, edge, strip, border_radius=2)
-
-    def _button(self, surface, rect, label, action, *, primary=False, enabled=True, hint=None):
+    def _button(self, surface, rect, label, action, *, go=False, enabled=True):
         hover = enabled and rect.collidepoint(pygame.mouse.get_pos())
-        if primary:
-            if enabled:
-                top, bottom = ((96, 205, 128), (52, 150, 86)) if hover else ((80, 186, 112), (44, 130, 74))
-                if hover:                                   # a soft glow around it
-                    glow = pygame.Surface(rect.inflate(24, 24).size, pygame.SRCALPHA)
-                    pygame.draw.rect(glow, (90, 220, 120, 40), glow.get_rect(), border_radius=18)
-                    surface.blit(glow, rect.inflate(24, 24).topleft)
-            else:
-                top, bottom = (54, 56, 64), (44, 46, 54)
-            fill = pygame.Surface(rect.size, pygame.SRCALPHA)
-            for y in range(rect.height):
-                pygame.draw.line(fill, _lerp_color(top, bottom, y / max(1, rect.height - 1)), (0, y), (rect.width, y))
-            mask = pygame.Surface(rect.size, pygame.SRCALPHA)
-            pygame.draw.rect(mask, (255, 255, 255, 255), mask.get_rect(), border_radius=12)
-            fill.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
-            surface.blit(fill, rect.topleft)
-            ink = (14, 30, 20) if enabled else (120, 122, 132)
-            font = get_font(26, HOME_TITLE_FONT, bold=True)
-        else:
-            glass = pygame.Surface(rect.size, pygame.SRCALPHA)
-            pygame.draw.rect(glass, (52, 52, 68, 235) if hover else (28, 28, 38, 225), glass.get_rect(), border_radius=12)
-            surface.blit(glass, rect.topleft)
-            pygame.draw.rect(surface, (100, 100, 124) if enabled else (58, 58, 70), rect, width=2, border_radius=12)
-            ink = HOME_TEXT if enabled else (100, 100, 112)
-            font = get_font(23, HOME_TITLE_FONT)
-        ts = font.render(label, True, ink)
+        color = (HOME_GO_HOVER if hover else HOME_GO) if go else (HOME_PLAIN_HOVER if hover else HOME_PLAIN)
+        if not enabled:
+            color = (44, 44, 52)
+        draw_rect(surface, color, rect, border_radius=8)
+        ts = get_font(26, bold=go).render(label, True, (245, 245, 250) if enabled else (110, 110, 120))
         surface.blit(ts, ts.get_rect(center=rect.center))
-        if hint and enabled:                                # a little key cap: "Enter"
-            hs = get_font(15, bold=True).render(hint, True, (14, 30, 20))
-            cap = pygame.Rect(0, 0, hs.get_width() + 12, hs.get_height() + 4)
-            cap.midright = (rect.right - 12, rect.centery)
-            pygame.draw.rect(surface, (150, 230, 170), cap, border_radius=5)
-            surface.blit(hs, hs.get_rect(center=cap.center))
-        if enabled and action is not None:
+        if enabled:
             self._buttons.append((rect, action))
 
     @staticmethod
-    def _text(surface, text, pos, size=20, color=HOME_DIM, bold=False, width=420, font_name=None):
+    def _text(surface, text, pos, size=20, color=HOME_DIM, bold=False, width=HOME_W):
         """Wrapped text at pos; returns the y below it."""
-        font = get_font(size, font_name, bold=bold)
+        font = get_font(size, bold=bold)
         x, y = pos
         for line in wrap_text(text, font, width, max_lines=4):
             ts = font.render(line, True, color)
@@ -4994,92 +4767,48 @@ class HomeScreen:
             y += ts.get_height() + 2
         return y
 
-    def _hero(self, surface, x, y, logo_size, title_size, width):
-        """Logo, "Canvas Lab", tagline at (x, y). Returns the y below it."""
-        t = self.t
-        bob = math.sin(t * 1.4) * 2
-        draw_logo(surface, (x + logo_size / 2, y + logo_size / 2 + bob), logo_size, t)
-        tx = x + logo_size + 18
-        big = get_font(title_size, HOME_TITLE_FONT, bold=True)
-        a = big.render("Canvas", True, HOME_TEXT)
-        b = big.render(" Lab", True, HOME_OK)
-        ty = y + logo_size / 2 - a.get_height() / 2 - 8
-        surface.blit(a, (tx, ty))
-        surface.blit(b, (tx + a.get_width(), ty))
-        self._text(surface, HOME_TAGLINE, (tx + 2, ty + a.get_height() + 2), 18, HOME_DIM,
-                   width=max(160, width - logo_size - 20))
-        return y + logo_size
-
-    def _status_card(self, surface, rect):
-        t = self.t
-        x, y = rect.x + 22, rect.y + 16
-        caps = get_font(15, bold=True).render("THE WORLD", True, (120, 120, 140))
-        if self.status is not None:
-            edge, title, color = HOME_OK, "Running", HOME_OK
-            names = [p if isinstance(p, str) else p.get("name", "?") for p in self.status.get("players", [])]
-            detail = ((f"In it: {', '.join(names)}" if names else "Nobody's in it yet")
-                      + f"  ·  {self.status.get('objects', 0)} objects")
-        elif self.starting_until:
-            edge, title, color = HOME_WARN, "Starting…", HOME_WARN
-            detail = "It opens a small window of its own."
-        elif not self.checked:
-            edge, title, color = (110, 110, 125), "Looking for it…", HOME_DIM
-            detail = ""
-        else:
-            edge, title, color = (110, 110, 125), "Not running", (205, 205, 215)
-            detail = "Launch it and it keeps running on its own until you stop it — closing this window won't."
-        self._panel(surface, rect, edge)
-        surface.blit(caps, (x, y))
-        y += caps.get_height() + 6
-        dot = pygame.Vector2(x + 7, y + 14)
-        if self.status is not None:                          # a ring pulsing out of the dot
-            phase = (t * 0.8) % 1.0
-            ring = pygame.Surface((60, 60), pygame.SRCALPHA)
-            pygame.draw.circle(ring, (*HOME_OK, int(150 * (1 - phase))), (30, 30), 6 + 16 * phase, 2)
-            surface.blit(ring, (dot.x - 30, dot.y - 30))
-            pygame.draw.circle(surface, HOME_OK, dot, 6)
-        elif self.starting_until:
-            pygame.draw.circle(surface, HOME_WARN, dot, 6 if int(t * 3) % 2 else 4)
-        else:
-            pygame.draw.circle(surface, color, dot, 6, width=2)
-        y = self._text(surface, title, (x + 22, y), 26, color, bold=True, font_name=HOME_TITLE_FONT)
-        if detail:
-            self._text(surface, detail, (x, y + 4), 18, HOME_DIM, width=rect.width - 44)
-
     def draw(self, surface):
         self._buttons = []
-        t = self.t
+        surface.fill(BG_COLOR)
         w, h = surface.get_size()
-        wide = w >= 980 and h >= 520
-        col_w = min(440, w - 48)
-        if wide:                                            # logo + title on the left, the panel on the right
-            left_w = min(540, w - col_w - 130)
-            gap = 60
-            hx = (w - (left_w + gap + col_w)) // 2
-            logo, title, hy = 176, 66, h // 2 - 128
-            px, py = hx + left_w + gap, max(30, h // 2 - 200)
-        else:                                               # stacked: a smaller header, then the panel
-            hx = px = (w - col_w) // 2
-            logo, title, hy = 84, 44, max(16, h // 2 - 250)
-            left_w = col_w
-            py = hy + logo + 18
-        self.backdrop.draw(surface, t, clear=[(hx, hy, logo, logo), (px, py, col_w, 380)])
-        self._hero(surface, hx, hy, logo, title, left_w)
+        x = (w - HOME_W) // 2
+        y = max(24, h // 2 - 230)
+        y = self._text(surface, APP_NAME, (x, y), 52, (235, 235, 240), bold=True) + 18
 
-        card = pygame.Rect(px, py, col_w, 118)
-        self._status_card(surface, card)
-        y = card.bottom + 16
-        big = pygame.Rect(px, y, col_w, 56)
+        # The world
+        card = pygame.Rect(x - 16, y, HOME_W + 32, 92)
+        draw_rect(surface, HOME_CARD, card, border_radius=10)
+        cy = card.y + 14
         if self.status is not None:
-            self._button(surface, big, "Join world", self.join, primary=True, hint="Enter")
+            names = [p if isinstance(p, str) else p.get("name", "?") for p in self.status.get("players", [])]
+            pygame.draw.circle(surface, HOME_OK, (x + 7, cy + 13), 6)
+            cy = self._text(surface, "The world is running", (x + 22, cy), 24, HOME_OK, bold=True)
+            self._text(surface, (f"In it: {', '.join(names)}" if names else "Nobody's in it yet")
+                       + f"  ·  {self.status.get('objects', 0)} objects", (x, cy + 4))
         elif self.starting_until:
-            self._button(surface, big, "Starting…", None, primary=True, enabled=False)
+            cy = self._text(surface, "Starting the world…", (x, cy), 24, HOME_WARN, bold=True)
+            self._text(surface, "It opens a small window of its own.", (x, cy + 4))
+        elif not self.checked:
+            self._text(surface, "Looking for the world…", (x, cy), 24, HOME_DIM, bold=True)
         else:
-            self._button(surface, big, "Launch world", self.launch, primary=True,
-                         enabled=self.checked and not self.solo, hint="Enter")
+            pygame.draw.circle(surface, (200, 200, 210), (x + 7, cy + 13), 6, width=2)
+            cy = self._text(surface, "The world isn't running", (x + 22, cy), 24, (200, 200, 210), bold=True)
+            self._text(surface, "Launch it, and it keeps running on its own until you stop it — "
+                                "closing this window won't.", (x, cy + 4))
+        y = card.bottom + 18
+
+        # Buttons
+        big = pygame.Rect(x, y, HOME_W, 52)
+        if self.status is not None:
+            self._button(surface, big, "Join world", self.join, go=True)
+        elif self.starting_until:
+            self._button(surface, big, "Starting…", None, go=True, enabled=False)
+        else:
+            self._button(surface, big, "Launch world", self.launch, go=True,
+                         enabled=self.checked and not self.solo)
         y = big.bottom + 12
         alone_ok = self.checked and self.status is None and not self.solo and not self.starting_until
-        small = pygame.Rect(px, y, col_w, 46)
+        small = pygame.Rect(x, y, HOME_W, 44)
         self._button(surface, small, "Work on my own", self.work_alone, enabled=alone_ok)
         y = small.bottom + 8
         if self.solo:
@@ -5087,28 +4816,22 @@ class HomeScreen:
         elif self.status is not None:
             note = "Working on your own isn't possible while the world is running — join it instead."
         else:
-            note = "On your own: the canvas as it always was — no world running, nobody can join."
-        y = self._text(surface, note, (px + 4, y), 16, (120, 120, 138), width=col_w - 8) + 14
+            note = "On your own: the canvas as it always was, no world running, nobody can join."
+        y = self._text(surface, note, (x, y), 18) + 18
 
-        # Who you'll be: a chip with your name
-        chip = pygame.Rect(px, y, col_w, 40)
-        self._panel(surface, chip, alpha=170)
-        lts = get_font(18).render("Playing as", True, HOME_DIM)
-        nts = get_font(21, bold=True).render(self.name, True, HOME_TEXT)
-        hover = chip.collidepoint(pygame.mouse.get_pos())
-        cts = get_font(18).render("change", True, (150, 195, 255) if hover else INSPECTOR_ACCENT)
-        surface.blit(lts, (chip.x + 16, chip.centery - lts.get_height() // 2))
-        nx = chip.x + 16 + lts.get_width() + 10
-        surface.blit(nts, (nx, chip.centery - nts.get_height() // 2))
-        surface.blit(cts, (chip.right - cts.get_width() - 16, chip.centery - cts.get_height() // 2))
-        self._buttons.append((chip, self.rename))
-        y = chip.bottom + 12
+        # Name
+        lts = get_font(22).render("Playing as ", True, HOME_DIM)
+        nts = get_font(22, bold=True).render(self.name, True, (235, 235, 240))
+        cts = get_font(20).render("  change", True, INSPECTOR_ACCENT)
+        surface.blit(lts, (x, y))
+        surface.blit(nts, (x + lts.get_width(), y))
+        change = pygame.Rect(x + lts.get_width() + nts.get_width(), y, cts.get_width(), nts.get_height())
+        surface.blit(cts, (change.x, y + 1))
+        self._buttons.append((change.inflate(8, 6), self.rename))
+        y += nts.get_height() + 14
 
         if self.message:
-            pygame.draw.circle(surface, HOME_WARN, (px + 8, y + 10), 4)
-            self._text(surface, self.message, (px + 20, y), 18, HOME_WARN, width=col_w - 24)
-        foot = get_font(15).render(f"{APP_NAME}  ·  worlds on this PC", True, (90, 90, 108))
-        surface.blit(foot, (w - foot.get_width() - 16, h - foot.get_height() - 10))
+            self._text(surface, self.message, (x, y), 20, HOME_WARN)
         if self.modal is not None:
             self.modal.draw(surface)
 

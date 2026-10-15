@@ -544,15 +544,9 @@ Step 2 (MULTIPLAYER_STUDY.md): the world runs as its own program, and canvas win
 the world window is "Canvas Lab — World"). The Start-menu shortcut made by make_shortcut.ps1 is
 still called "Canvas App" (same AppUserModelID, so a pinned icon keeps working).
 
-**The home screen's look** is the app's own: a dark canvas with a drifting dot grid and faint
-squares / diamonds / rings / tiles linked by flowing-dot wires (`HomeBackdrop`, kept out from
-behind the content), a vignette, and the **logo drawn live** (`draw_logo`) — its node graph
-(square, diamond, square, ring) in four of the player colors with a soft glow, dots flowing
-along its links, bobbing gently — beside "Canvas **Lab**" (Bahnschrift) and a tagline. On the
-right (stacked under it in a narrow window): a glassy status card (a colored edge; the dot
-pulses while the world runs), the green **Join / Launch world** button (with an *Enter* key
-cap), *Work on my own*, and a *Playing as* chip (click to change your name). 60 fps, ~5 ms a
-frame at 1180×740. The window now opens at 1180×740 (or 85% / 80% of a smaller screen).
+**The home screen's look** stays plain pygame shapes, like the rest of the app: the name, a
+status card, the buttons and the name row — tried a drifting backdrop and a live logo, but
+plain fits the app better. The window opens at 1180×740 (or 85% / 80% of a smaller screen).
 
 **Using it.** The taskbar canvas opens to a **home screen** (`canvas.HomeScreen`): the world's
 status (running or not, who's in it, how many objects), then
