@@ -46,8 +46,9 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
 - `CanvasObject` thin master → `Node` → `Button` / `NameTag`; `OBJECT_TYPES` registry
 - **Object toolkit** — a new type is one class, no loop/menu/inspector edits (see *Adding an
   object type*): self-registering types, an Add menu built from the registry, `Prop`
-  (saved + inspector-editable fields), inspector rows returned by the object
-  (`inspector()` / `buttons()` / `@panel_button`), callback dialogs via `App.ask` /
+  (saved + inspector-editable fields), the standard panel filled in by the object
+  (`state_rows()` / `info_rows()` / `actions()` / `@panel_button` — see *The panel*),
+  inputs / outputs (`takes()` / `gives()` — see *Inputs and outputs*), callback dialogs via `App.ask` /
   `App.confirm`, the `Thing` base for simple drawn objects, and the `things.py` catalog
   (examples: Rock, Lamp). Clicks hit the topmost object; a saved object whose type no
   longer exists is kept as an inert `UnknownObject` (written back unchanged)
@@ -99,25 +100,22 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   with color below the cap and a readout shows the value. Drag is handled in the object's own
   `update()` (it gets the mouse + camera), saving once on release. Size, length, min, max,
   step, value, color editable. `value` is the parameter other objects will read later
-- **Outputs + links**: any object can publish live values with `outputs()` → `{name: number}`
-  (Slider `value`, Switch `on`/`flips`, PushButton `pressed`/`presses`, Lamp `on`, Neuron
-  `firing` / `clock t` / `input W`). The `Output` base (E menu ▸ Outputs) links to one source
-  — *Link to source…*, then click it (`App.start_picking` / `PickMode`: green ring + rubber
-  band, Esc cancels) — and reads `source.outputs()[source_key]` into `reading` every frame.
-  *Reads* cycles which value; *Unlink* clears it. The link is saved as hidden Props
-  (`Prop(..., hidden=True)`: saved, not shown). A wire with flowing dots is drawn via the
-  `draw_links` hook (all objects' links are drawn before any object, so wires sit under them).
-  First output: **Readout**, an LED display — seven-segment digits with unlit "ghost" segments,
-  a unit beside them (free text: mW, ms, V, …), decimals, digit slots, color, size, and the
-  object's name printed on the bezel. Dashes when unlinked
+- **Inputs and outputs (takes / gives)** — one model for every link; see *Inputs and outputs*
+  below. Objects give live values (`outputs()`: Slider `value`, Switch `on`/`flips`, PushButton
+  `pressed`/`presses`, Lamp `on`, Neuron `firing` / `clock t` / `input W`, …) and take them on
+  named inputs (`takes()`). The `Output` base (E menu ▸ **Displays**, was *Outputs*) has one
+  input, `in`, read into `reading` every frame and passed on as `value`. First display:
+  **Readout**, an LED display — seven-segment digits with unlit "ghost" segments, a unit
+  beside them (free text: mW, ms, V, …), decimals, digit slots, color, size, and the object's
+  name printed on the bezel. Dashes when unlinked
 - **Function** (E menu ▸ Math, `things.py`; evaluator in `expressions.py`): `y = <equation>`.
   It's placed empty ("(click to type)"); a click on it opens the equation's text box (Ctrl+click
   selects). Every name that isn't built in (`expressions.RESERVED`: sin cos tan asin acos atan
   atan2 sinh cosh tanh sqrt exp log log10 log2 abs min max round floor ceil sign clamp, pi, e,
   and `t` = seconds since the canvas started) becomes a variable *chip* on the left edge, in
-  the order it first appears — hollow until linked, filled once linked. Click a chip, then a
-  source (anything with outputs); clicking the function itself unlinks that variable. Links
-  are a hidden `links` dict keyed by variable name, so editing the equation never loses wiring
+  the order it first appears — hollow until linked, filled once linked. Each variable is an
+  input: click its chip (or **link** in the panel), then a source; clicking the function itself
+  unlinks it. Links are keyed by variable name, so editing the equation never loses wiring
   (a name that comes back reconnects; links for absent names are kept but not drawn). Output
   is `{"y": value}`; it's `None` while there's no value (unlinked variable, bad syntax, 1/0,
   sqrt(-1), NaN/inf), with the reason in red on its screen and in the inspector — a Readout
@@ -125,28 +123,30 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   drivers' job. The equation is parsed with `ast` against a whitelist and compiled once per
   text change; numbers are floats (so `9^9^9` overflows instead of hanging). `^` = power,
   `2P` = 2*P (not inside names like `log10`, not `1e-3`), a leading `y =` is ignored. Wires
-  from a source end at the chip and leave a Function from its output nub: `output_point(obj)`
-  uses an object's `output_point()` if it has one, else its center (Output and Device wires
-  use it too). Chains and loops are fine — each Function computes once a frame in `tick` and
+  end at a variable's chip (`input_point(port)`) and leave from the output nub on the right
+  (`output_point()`); drag from the nub to lay a wire to another object's input. Chains and
+  loops are fine — each Function computes once a frame in `tick` and
   `outputs()` returns the stored value, so a loop just runs a frame behind
-- **Counter** (E menu ▸ Math, `things.py`): a saved value that buttons step. Three input chips on
-  the left — **up** / **down** add / take away the Step, **reset** returns to Start — each linked
-  like a Function's chips (picking prefers a source's `pressed`, then `on`, then `value`). A press is
-  a rising edge (≤ 0.5 → > 0.5), so holding a button counts once and a switch counts each off → on;
-  a source already high when the canvas loads doesn't count. Optional Minimum / Maximum (hidden
+- **Counter** (E menu ▸ Math, `things.py`): a saved value that buttons step. Three *press* inputs,
+  chips on the left — **up** / **down** add / take away the Step, **reset** returns to Start —
+  linked like a Function's chips (the output menu lists `pressed`, `on`, `value` first). Each acts
+  once when its source goes 0 → 1 (on/off is just 0 or 1; anything not 0 is on), so holding a
+  button counts once and a switch counts each off → on; a source already on when the canvas loads
+  or the link is made doesn't count. Optional Minimum / Maximum (hidden
   `low` / `high`, blank = none): the value stops there, so presses past a limit do nothing (no
   "stored-up" presses, unlike `presses` → Function), and a new limit pulls the value inside it.
   Values are rounded to 12 places (0.1 × 3 = 0.3). Click the number to type one; the panel has
-  + / - / Reset buttons. The value is saved (a `value` Prop, saved on each change) and is the
+  + / - / Reset buttons (and Value / Minimum / Maximum under State). The value is saved (a `value` Prop, saved on each change) and is the
   output `value`. Drawn Function-style: chips, a screen with the number (brightens on a change,
   dims at a limit), an output nub, and the step / limits beside the name
 - **Data collector** (E menu ▸ Data, `things.py`): a spreadsheet that records values. Columns
-  (built-in `#` and `time`, then named ones) each follow a source — click a header, then the
-  source (a green dot once linked); **+** adds a column (name, then pick its source); rename /
-  relink / *reads* / remove are in the panel. **Collect** (the drawn button, or the panel's) adds a
+  (built-in `#` and `time`, then named ones) are inputs `col<cid>` that *record* a source — click
+  a header (or **link** in the panel), then the source (a green dot once linked); **+** (or
+  *+ add column* in the panel) adds one (name, then pick its source); click a column's name in
+  the panel to rename / remove it. **Collect** (the drawn button, or the panel's) adds a
   row with every column's value right then (`None` → "—") and an ISO timestamp. The **collect**
-  chip on the left edge is an optional input: on a **rising edge** (≤ 0.5 → > 0.5, e.g. a push
-  button's `pressed`) it collects once; a source that's already high when the canvas loads or the
+  chip on the left edge is an optional *press* input: each time it goes 0 → 1 (e.g. a push
+  button's `pressed`) it collects once; a source that's already on when the canvas loads or the
   link is made doesn't count. Rows are saved with the canvas (hidden `rows`, values keyed by a
   stable column id `cid`, so renaming keeps data; a removed column's values stay saved but aren't
   shown or exported); the sheet shows *Rows shown* (default 8) — the newest, unless scrolled back
@@ -158,7 +158,7 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   rows than fit, so zooming over anything else is unchanged. Each one is a named **data set** ("Data set 1", …,
   renamed from the panel's first row); the name is on the title bar and in the export's file name.
   *Export CSV* writes `data/<name> <date time>.csv` (row, time, columns; `data/` is git-ignored); *Clear rows…*
-  confirms first. Output: `rows` (the count). Each collect saves the canvas — fine for hand /
+  (in the ⋯ menu) confirms first. Output: `rows` (the count). Each collect saves the canvas — fine for hand /
   button collects; a very fast trigger on a big table would mean big, frequent saves
 - **Data relay** (E menu ▸ Data, `things.py`): a small junction for routing one value — so a wire
   can go where you want and split. Click it, then a source; it offers that value as `value`
@@ -171,33 +171,32 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   the source has no value, green when carrying one, and flares when the value changes. Nothing
   else: tried a value tag and port nozzles with arrows toward its source / readers — both cluttered
   the paths (the wires' flowing dots already show direction). The panel shows the value and what it
-  **Feeds**: readers are found every 0.25 s by `links_to(obj, id)`, which scans an object's
-  `source_id` and every `{"id": …}` inside its data props — it covers today's link styles without
-  each type listing its links. **Laying a path:** while linking a relay (or a tag), a click on
+  **Feeds**: readers are found every 0.25 s by `links_to(obj, id)` (does one of obj's inputs
+  follow id?). **Laying a path:** while linking a relay (or a tag), a click on
   *empty* canvas places a new relay there fed by it (`extend`) — the clicked one keeps its own
   source, the new one is selected, and clicking it then empty canvas again adds the next hop. A
   click on an object that can't be linked, or Esc, still just cancels. This is PickMode's
-  `on_empty(world point)` (via `App.start_picking(..., on_empty=)`), which draws a small ring at
+  `on_empty(world point)` (via `App.pick_link(..., on_empty=)`), which draws a small ring at
   the cursor over empty canvas; other picks (a function's chips, …) don't pass it
 - **Data tag** (E menu ▸ Data, `things.py`): a named data point — a `DataRelay` subclass, so it passes
   its value through the same way (no delay, loop guard, any number of readers), but it has a body
   you can read. Named after SCADA/PLC "tags" (a named live value with units). Shaped like a luggage
-  tag: the incoming wire ties into the grommeted hole in its pointed end (`input_point()`, a relay
-  hook that's the center for a plain relay), the output leaves from a nub on the right
+  tag: the incoming wire ties into the grommeted hole in its pointed end (`input_point("in")`; the
+  center for a plain relay), the output leaves from a nub on the right
   (`output_point()`), the name is printed across the top, and a screen shows the value
   Function-style (`.6g`, shrinking to fit) with its **Unit** (free text, display only) beside it.
   New ones are "Tag 1", "Tag 2", … — placed without asking; click the name to rename, anywhere else
   to link. The hole glows in the relay's state color; unlinked says "click to link", no value shows
   an amber dash, a loop says so in red. Color and Size are editable. 270 × 96 at Size 1
-  - **Streaming** (the ((•)) icon, top right): unlinked, the tag streams live. Click the icon, then
-    a button / switch (picks its `pressed`, `on` or `value`), and it streams only while that's
-    > 0.5, otherwise **holds** the value it last took — a push button takes one fresh reading per
+  - **Streaming** (the ((•)) icon, top right): an *on/off* input, `stream`. Unlinked, the tag
+    streams live ("always"). Click the icon (or **link** in the panel), then a button / switch, and
+    it streams only while that's on (not 0), otherwise **holds** the value it last took — a push button takes one fresh reading per
     press, a switch streams while on. The held value is a hidden `held` Prop, saved when streaming
     stops (so the reading survives a restart); readers downstream get the held value too, so a
     tag can gate a whole chain. Icon: green waves (outer one pulsing) while streaming, grey while
     holding (the screen then says HELD and the number dims); a ring (amber / grey) once linked,
     with an amber wire to it. Clicking the icon then the tag itself goes back to always streaming
-    (or *Always stream* in the panel). The stream lookup uses the same loop guard as the value
+    (or the x on its panel row). The stream lookup uses the same loop guard as the value
 - **Label** (E menu ▸ Annotations): a world-space title for a region — scales with zoom like a
   node (unlike a NameTag), with **Size** and a width that follows its text. Two independent
   looks to click through — frame **Style** (`LABEL_STYLES`, each with its own padding): *plate*
@@ -310,11 +309,14 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   - **Device** object (E menu ▸ Devices): name + status light (green connected, amber starting,
     red error / not on the server, grey server offline) + a screen of params (orange, what it's
     set to) and readings (green, what it reports). Inspector: cycle which server device it is,
-    set a param by hand, or link it (*follows* → click a source, e.g. a slider); its params and
-    readings are `outputs()`, so a Readout can show e.g. the servo's actual position. Links are
+    set a param by hand, or link it (each param is an input: **link** → click a source, e.g. a
+    slider); its number readings and its params' settings are outputs, so a Readout can show
+    e.g. the servo's actual position (a param that shares a reading's name gives
+    `<param> (set)`; text readings are shown under State, not linked). The names of its params /
+    readings are saved (hidden `catalog`), so it can be wired up while offline. Links are
     saved as a hidden `"data"` Prop (`Prop(kind="data")` holds any JSON; defaults are deep-copied
     per object, and so is the value written by `to_json` — before that, a copy made with **C**
-    shared the original's link dicts, so relinking one rewired both). When offline it offers *Connect instrument server* (or *Place* one, if none).
+    shared the original's link dicts, so relinking one rewired both).
   - **Instrument server object** (E menu ▸ Devices, one only — `SINGLETON`, picking it again
     goes to it): a radio with an antenna (signal waves while connected, blinking amber while
     connecting). It's the on/off switch for the hardware side: `instruments.client` only
@@ -574,9 +576,16 @@ different about it. The loop, menu and inspector just call the hooks.
 | `NAME`, `CATEGORY` | E-menu tile name; E-menu tab | label minus "Add "; just "All" |
 | `draw_icon(surface)`, `icon_sample()` | E-menu icon | draw a sample object, scaled |
 | `create(app)` | what picking it does | `app.start_placing(...)`: drop with the mouse |
-| `PROPS` | saved, inspector-editable fields | none (inherited lists merge) |
-| `inspector(app)` | rows for the panel | name + every Prop |
-| `buttons(app)` / `@panel_button` | panel buttons | every `@panel_button` method |
+| `PROPS` | saved, inspector-editable fields (`state=True`: under State) | none (inherited lists merge) |
+| `outputs()` / `gives()` | live values it offers; declared with units | none / one per `outputs()` key |
+| `TAKES` / `takes()` | its inputs (`Take`) | none |
+| `on_press(port)` | a *press* input went 0 → 1 | nothing |
+| `input_point(port)`, `output_point()` | where wires end / start | center |
+| `take_at` / `give_at(pos, camera)` | input chip / output nub under the mouse (wire drag) | none / the output_point nub |
+| `panel_status`, `state_rows`, `input_rows`, `more_sections`, `info_rows` | the panel's pieces | none / ID + position |
+| `actions(app)` / `@panel_button` | footer buttons | every `@panel_button` method |
+| `menu_items(app)` | its own ⋯ / right-click menu items | none |
+| `migrate(d)` | update an older save before loading | unchanged |
 | `center`, `in_box`, `copyable`, `COPY_SKIP` | Go To, drag-box select, copy | per family |
 | `on_prop_changed(key)` | react to an inspector edit | nothing |
 
@@ -603,14 +612,90 @@ Two-step, so a stray click can never fire a terminal command:
 - **Single click a node** → selects it and opens the **inspector panel** (right overlay).
 - **Activate** in the panel → runs the node's action.
 
-The panel is **object-driven**: it shows whatever rows the selected object returns from
-`inspector(app)` — `Field` (label over value), `Row` (label left, value right), `Stepper`
-(◀ value ▶), `Gap`, `ScrollList` (wheel-scrolled, fills to the buttons) — each optionally
-clickable with an `on_click(app)` callback, then the object's `buttons(app)` stacked at
-the bottom. The panel knows no types; the loop just runs whichever callback was clicked.
-Launchers (Button / NameTag) show name, position, id, description, command, with
-**Set command…** and **Activate** (green when the node has a command). Double-click any
-object with a `center` is a shortcut for Go To.
+The panel is **object-driven** and the same for every type (see *The panel* below); it
+knows no types, and the loop just runs whichever callback was clicked. Launchers (Button /
+NameTag) show their Command under State (click to set it) and **Activate** (green when the
+node has a command). Double-click any object with a `center` is a shortcut for Go To.
+
+---
+
+## The panel (built)
+
+Every panel has the same parts, always in this order (a section with nothing in it is left out):
+
+| Part | Holds | Comes from |
+|---|---|---|
+| **Header** | type name; the object's name if it has one (click to rename); a status line (device status, an equation's problem, a relay loop); the **⋯** menu | `panel_name()`, `rename(app)`, `panel_status(app)` |
+| **State** | what it is / shows now, and the main thing you edit (equation, counter value, slot names) | `state_rows(app)` + Props with `state=True` |
+| **Inputs / takes** | every input: its name, then **link** (and the value set by hand, if any) or *source · output* in green with an x to unlink, and the live value under it | `takes()` (+ `input_rows(app)`, e.g. *+ add column*) |
+| **Outputs / gives** | a plain list of what it gives, with live values; click one to link it into another object's input | `gives()` / `outputs()` |
+| (extra) | e.g. a neuron's W's, the instrument server's device / driver lists | `more_sections(app)` |
+| **Settings** | visible Props: size, color, unit, … | `PROPS` |
+| **Info** | ID, position, driver, port, file paths — folded by default | `info_rows(app)` |
+| **Footer** | buttons for doing the object's job: the main one first (green), connection last (Connect / Disconnect); past 4, the rest go in the ⋯ menu | `actions(app)` / `@panel_button` |
+
+- Rows: `Field` (label over value, wraps), `Row` (label left, value right; `sub=True` indents
+  it), `Stepper`, `Gap`, `ScrollList` (up to 10 rows, wheel-scrolled), inside `Section`s; plus
+  `PortRow` / `GiveRow`, which the panel draws itself from a Take / Give.
+- Clicking a section's title folds it; the panel remembers that **per type** (for this run).
+- The whole body scrolls with the wheel (a list under the mouse scrolls first), so rows never
+  get cut off behind the footer.
+- Hovering a linked input's row rings its source on the canvas.
+- **The ⋯ menu** (the same menu a right-click on the object opens): footer buttons that didn't
+  fit, the type's own items (`menu_items`: *Clear rows…*, *Remove from server…*, *Stop
+  server…* — red), then Rename…, Copy, Go to, Unlink all inputs, Create machine…, Delete.
+- Linking, editing and destructive actions are not footer buttons any more: *Link to source…*,
+  *Unlink*, *Unlink all*, *Always stream* became input rows; *Edit equation…*, *Set command…*,
+  *Add column…*, *Adjust speed…* became clickable rows; *Clear rows…*, *Remove from server*,
+  *Stop server* moved to the ⋯ menu.
+
+---
+
+## Inputs and outputs — takes / gives (built)
+
+**An output (Give) is a named value an object offers. An input (Take) is a named slot that
+follows one output.** Every wire runs from an output to an input; an output can feed any
+number of inputs, an input has at most one source. Every value is just a number; on/off is 0
+or 1 (anything that isn't 0 counts as on). Text stays display-only.
+
+- **Outputs:** `outputs()` → `{name: number or None}` is how values are read; `gives()`
+  declares them (name, unit), so the panel and the pickers can list them even while a value is
+  None. Every output is always listed — no value is `None`, never a missing key.
+- **Inputs:** `takes()` → `[Take(key, label, kind, unit=, current=, set_by_hand=, on_label=)]`.
+  The kind is the only real difference between the old link styles:
+
+  | Kind | What it does | Used by |
+  |---|---|---|
+  | `number` | follows the value | Readout, Function variables, device params, Relay, Tag value, collector columns ("records") |
+  | `onoff` | on while the source isn't 0 | Tag *streaming* |
+  | `press` | acts once each time the source goes 0 → 1 (`on_press(port)`); already on when first read doesn't count | Counter up / down / reset, collector *collect* |
+
+  Any input can link to any output.
+- **One storage shape:** every object's links are one hidden Prop, `links = {port: {"id", "key"}}`
+  (saved only when not empty). Older saves are converted on load by each type's `migrate(d)`:
+  a readout's `source_id` / `source_key`, a relay's `source`, a tag's `stream`, and a
+  collector's `trigger` and per-column `id` / `key`. Machines remap ids inside it like any
+  other saved data.
+- **Helpers (base class):** `take(port)` (the value, or None), `take_source(port)`,
+  `take_on(port)`, `link(port, src, key)`, `unlink(port)`, `unlink_all()`, `pick(app, port)`.
+  The scene calls `watch_presses(dt)` every frame, which fires `on_press` — so no type keeps
+  its own edge-tracking.
+- **Linking, one way everywhere:** click **link** on an input's row (or its chip on the
+  canvas), then click a source (`App.pick_link`, PickMode: rubber band + green ring; clicking
+  the object itself unlinks); if the source has several outputs, a menu at the cursor lists
+  them with live values (for press / on-off inputs `pressed`, `on`, `value` come first). Click
+  the output's name on a linked row to choose a different one. The other way round: click an
+  output in *Outputs / gives*, then the object to feed (`App.pick_target`, a menu of its
+  inputs), or **drag from an output nub** (Function, Counter, Tag — `give_at`) and let go on an
+  input chip (`take_at`) or anywhere on an object with inputs (`LinkDrag`).
+- **Wires** are drawn by the base class from `links`, from the source's `output_point()` to the
+  reader's `input_point(port)`: number = green flowing dots; on/off = amber, flowing while on;
+  press = dim amber that flashes when it fires.
+- **Devices:** every param is an input (set by hand while unlinked, or linked); number
+  readings and param settings are outputs. Their names are saved (`catalog`), so an offline
+  device can still be wired.
+- **Out of scope:** neuron W's (an all-to-all weight matrix, shown as their own section) and
+  text values.
 
 **Dialogs are callbacks.** `app.ask(prompt, on_submit)` opens a text box and calls
 `on_submit(text)` on Enter; `app.confirm(message, sub, on_confirm)` is the delete dialog.
@@ -731,9 +816,14 @@ the selection ring, hover, zoom-out dot and the rest.
 
 - **Prop kinds:** `"float"`, `"int"` (min/max clamp), `"str"`, `"bool"` (click toggles),
   `"color"` (`r, g, b` or `#rrggbb`), `"choice"` (`choices=[…]`, click cycles). Extra
-  `unit=`, `prompt=`, `editable=False`.
-- **Values:** return `{name: number}` from `outputs()` and any Output (e.g. a Readout) can
-  link to it and show it live. Subclass `Output` to make a new kind of display.
+  `unit=`, `prompt=`, `editable=False`, `state=True` (listed under State, not Settings).
+- **Outputs:** return `{name: number or None}` from `outputs()` and any input (a Readout's,
+  a device param, …) can link to it. Override `gives()` to give them units. Subclass
+  `Output` to make a new kind of display.
+- **Inputs:** list `TAKES = (Take("up", kind="press"), …)` (or override `takes()` when they
+  change), read one with `self.take(port)`, and for press inputs override `on_press(port)`.
+  Override `input_point(port)` / `take_at(pos, camera)` if it has chips. The panel rows,
+  linking and wires come for free.
 - **Resizable:** every Thing has `scale` (world size = `SIZE × scale`). List
   `Prop("scale", "Size", "float", 1.0, min=…, unit="×")` to make it editable + saved
   (the Inputs family does).
@@ -741,9 +831,9 @@ the selection ring, hover, zoom-out dot and the rest.
   `__init__` after `super().__init__`.
 - **Families:** subclass another Thing to share its look/props/behavior; add props with a
   `PROPS` list of its own (lists merge down the hierarchy; same key overrides).
-- **Custom panel:** override `inspector(app)` / `buttons(app)` (Neuron is the full example:
-  compact rows, clickable rows, a stepper, a scroll list). `self.prop_rows()` gives the
-  default Prop rows to mix in.
+- **Panel:** fill in the standard sections rather than building your own — `state_rows`,
+  `info_rows`, `panel_status`, `actions`, `menu_items`, `more_sections` (Neuron uses most of
+  them: clickable rows, a stepper, a Weights section with a scroll list).
 - **Not a point object?** Subclass `CanvasObject` directly (like Wall or Train) and
   implement `draw`, `hit`, `to_dict` / `from_dict`, plus `center` / `in_box` / `move` if
   it should Go To / drag-select / move.
@@ -793,5 +883,6 @@ to `{"objects": [...]}`).
   into a folder of themed modules.
 - **Animated connectors** — would need time passed into `draw`/`update` (flowing route,
   marching ants). Not plumbed yet.
-- **Inspector editing** — edit description (and maybe params) inline; a collapse/close control.
+- **Inspector editing** — edit description inline; a close control for the panel.
+- **Panel extras** — remember folded sections across restarts; list an output's readers.
 - **Nice-to-haves** — Esc-to-deselect, build-preview refinements.

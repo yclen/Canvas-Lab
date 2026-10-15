@@ -1,9 +1,14 @@
 # Inspector panel + Takes / Gives — design plan
 
-> A proposal, not built yet. Two linked questions: (1) one standard layout for the
-> inspector panel, and (2) one model for wiring values between objects. They're
-> one plan because most of today's panel mess *is* linking UI, done differently by
-> each type. Once decided, the outcome moves into DESIGN.md.
+> **Built 2026-10-14.** How it works now is in DESIGN.md (*The panel*, *Inputs and
+> outputs*); this file is kept as the record of the plan. Differences from the plan below:
+> Outputs / gives is a plain list (no reader counts — a relay still shows *Feeds*); clicking
+> an output links it into another object's input; folded sections are remembered per type
+> for the current run only; device params that share a reading's name give `<param> (set)`.
+>
+> Two linked questions: (1) one standard layout for the inspector panel, and (2) one
+> model for wiring values between objects. They're one plan because most of today's
+> panel mess *is* linking UI, done differently by each type.
 
 ---
 
