@@ -259,9 +259,11 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   object or None when 0 or 2+, so rename/copy/goto/inspector only apply to one object
 - **Right-click menu**: a right-*click* (the mouse moves ≤ `RIGHT_CLICK_SLOP` px between press
   and release; more is a right-drag pan) opens a `ContextMenu` at the cursor for the selection
-  — right-clicking an unselected object selects just it first; nothing selected, no menu. Items:
-  *Create machine…* (below), then *Delete 'name'* / *Delete N objects* (red), which goes through
-  the same confirm as the Delete key. `App.context_menu(pos, [(label, callback, style)])` opens
+  — right-clicking an unselected object selects just it first; nothing selected, no menu. One
+  object gets the same menu as its panel's ⋯ button. Several get *Align horizontally (same X)*
+  — their centers line up in a column at their average X, each keeping its Y — and *Align
+  vertically (same Y)* (a row), for the movable ones (`App.align`); then *Create machine…*
+  (below), then *Delete N objects* (red), which goes through the same confirm as the Delete key. `App.context_menu(pos, [(label, callback, style)])` opens
   one; it's a modal, so a click elsewhere or Esc closes it. Not while a mode (placing, picking,
   building) is active
 - **Machines** (`canvas.py`, "Machines" section): a saved group of objects, placed again as a

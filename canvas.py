@@ -4247,10 +4247,29 @@ class App:
                 items.append(("Go to", lambda: self.go_to(obj), None))
             if obj.links:
                 items.append(("Unlink all inputs", lambda: obj.unlink_all(self), None))
+        if len([o for o in objs if o.movable and o.center is not None]) > 1:
+            items.append(("Align horizontally (same X)", lambda: self.align(objs, 0), None))
+            items.append(("Align vertically (same Y)", lambda: self.align(objs, 1), None))
         items.append(("Create machine…", lambda: self.create_machine(objs), None))
         label = f"Delete '{objs[0].display_name}'" if len(objs) == 1 else f"Delete {len(objs)} objects"
         items.append((label, lambda: self.delete_objects(objs), "danger"))
         return items
+
+    def align(self, objs, axis):
+        """Line up the movable objects' centers on one axis (0: same X, so they
+        stand in a column; 1: same Y, a row), at their average. The other axis
+        is left alone."""
+        movers = [o for o in objs if o.movable and o.center is not None]
+        if len(movers) < 2:
+            return
+        target = sum(o.center[axis] for o in movers) / len(movers)
+        for o in movers:
+            delta = target - o.center[axis]
+            if axis == 0:
+                o.move(delta, 0)
+            else:
+                o.move(0, delta)
+        self.save()
 
     def delete_objects(self, objs):
         """Delete objects after one confirm."""
