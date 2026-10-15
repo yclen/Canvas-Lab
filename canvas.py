@@ -34,8 +34,37 @@ import world_link  # the world <-> players link (the home screen asks it what is
 # Anchor all file paths here, to this file's own folder — never bare relative
 # paths (they resolve against the process's working dir, not the script).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-NODES_FILE = os.environ.get("CANVAS_NODES_FILE") or os.path.join(SCRIPT_DIR, "Nodes.json")   # tests point it elsewhere
-ERRORS_FILE = os.path.join(SCRIPT_DIR, "errors.log")   # the app has no console: errors go here
+ASSETS_DIR = os.path.join(SCRIPT_DIR, "assets")        # icons
+SAVES_DIR = os.path.join(SCRIPT_DIR, "saves")          # everything the app writes (git-ignored)
+# What saves/ holds. They used to sit next to the code; move_old_saves() moves them in.
+SAVED_NAMES = ("Nodes.json", "player.json", "machines.json", "errors.log", "data")
+
+
+def move_old_saves():
+    """Make saves/ and move in anything still at its old place next to the code.
+    If both places have a file (an older copy of the app saved after the move),
+    the newer one wins. Runs at import, before anything reads or writes."""
+    os.makedirs(SAVES_DIR, exist_ok=True)
+    for name in SAVED_NAMES:
+        old, new = os.path.join(SCRIPT_DIR, name), os.path.join(SAVES_DIR, name)
+        try:
+            if os.path.isdir(old):              # data/: move each export not already there
+                os.makedirs(new, exist_ok=True)
+                for f in os.listdir(old):
+                    if not os.path.exists(os.path.join(new, f)):
+                        os.replace(os.path.join(old, f), os.path.join(new, f))
+                if not os.listdir(old):
+                    os.rmdir(old)
+            elif os.path.isfile(old):
+                if not os.path.exists(new) or os.path.getmtime(old) > os.path.getmtime(new):
+                    os.replace(old, new)
+        except OSError:
+            pass                                # left where it was; tried again next start
+
+
+move_old_saves()
+NODES_FILE = os.environ.get("CANVAS_NODES_FILE") or os.path.join(SAVES_DIR, "Nodes.json")   # tests point it elsewhere
+ERRORS_FILE = os.path.join(SAVES_DIR, "errors.log")   # the app has no console: errors go here
 
 # Scene
 BG_COLOR = (25, 25, 30)
@@ -2507,7 +2536,7 @@ class Scene:
 # world (Scene) is shared; each player window has its own Player.
 # ============================================================================
 PLAYER_FILE = (os.environ.get("CANVAS_PLAYER_FILE")      # players' own data on this PC, git-ignored
-               or os.path.join(SCRIPT_DIR, "player.json"))
+               or os.path.join(SAVES_DIR, "player.json"))
 # {"name": the name last played as, "views": {player name: view}} — a view per
 # name, so two windows on one PC (Yaakov, Yaakov 2) each reopen where they were.
 
@@ -2702,11 +2731,11 @@ def copy_object(obj, at=None):
 
 # ---- Machines: a saved group of objects, placed again as a whole ------------
 # Select objects, right-click ▸ Create machine…: their saved data goes into
-# machines.json (next to Nodes.json). The E menu's Machines tab lists them;
+# saves/machines.json (next to Nodes.json). The E menu's Machines tab lists them;
 # placing one builds fresh objects — new ids, with links between its own
 # objects rewired to the new copies (links to anything outside stay as they
 # were). Once placed they're ordinary objects, selected together.
-MACHINES_FILE = os.path.join(SCRIPT_DIR, "machines.json")
+MACHINES_FILE = os.path.join(SAVES_DIR, "machines.json")
 _machines = None        # loaded on first use, then kept in step with the file
 
 

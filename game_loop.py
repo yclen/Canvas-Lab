@@ -53,7 +53,7 @@ def _on_crash(exc_type, exc, tb):
 sys.excepthook = _on_crash
 pygame.init()
 
-icon = pygame.image.load(os.path.join(canvas.SCRIPT_DIR, "icon.ico"))
+icon = pygame.image.load(os.path.join(canvas.ASSETS_DIR, "icon.ico"))
 pygame.display.set_icon(icon)
 _desktop = (pygame.display.get_desktop_sizes() or [(1280, 800)])[0]
 pygame.display.set_mode((min(1180, int(_desktop[0] * 0.85)), min(740, int(_desktop[1] * 0.8))), pygame.RESIZABLE)

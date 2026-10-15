@@ -34,7 +34,7 @@
   / the server ~5–7 ms → 3–4 ms a frame; zooming near a device ~24 ms → ~16 ms. What's left
   while zooming is re-rendering big shapes and text at every new size — a software-rendering
   limit; the real fix is GPU drawing (see above)
-- **Error safety net**: the app runs without a console, so errors go to `errors.log` (git-
+- **Error safety net**: the app runs without a console, so errors go to `saves/errors.log` (git-
   ignored) via `report_error` — once per distinct error. Each object's `update` / `draw` /
   `draw_links` is guarded in `Scene`: a failing object is logged and drawn as a red X box
   instead of crashing the app. Anything else uncaught is logged by `sys.excepthook` (in
@@ -83,7 +83,7 @@
 - **Machines** (`canvas.py`, "Machines" section): a saved group of objects, placed again as a
   whole. Select objects, right-click ▸ *Create machine…*, name it: the selection's saved data
   (`to_dict`, minus each type's `COPY_SKIP` — a data collector's `rows`, a neuron's weights) goes
-  into `machines.json` next to Nodes.json (git-ignored, like it) with the group's center. Only
+  into `saves/machines.json` next to Nodes.json (git-ignored, like it) with the group's center. Only
   copyable, non-`SINGLETON` objects go in — trains and the instrument server are left out (the
   confirmation says which). A taken name gets " (2)". The E menu's **Machines** tab (always shown;
   empty, it says how to make one) has a tile per machine — its icon a miniature of its objects
@@ -97,7 +97,7 @@
   unlinked). Once placed they're ordinary objects — there's no lasting "machine" object. Device
   objects keep their server device name, so a placed copy drives the same hardware
 - **Remembers your view**: on close, the world point at screen center + zoom are written to
-  `player.json` (git-ignored — it's the player's, not the world's); on launch the camera is
+  `saves/player.json` (git-ignored — it's the player's, not the world's); on launch the camera is
   restored there. (It used to be `"view"` in `Nodes.json`; the first launch moves it over)
 
 - **Text boxes** have a movable cursor: Left/Right, Home/End, Backspace/Delete,
@@ -435,7 +435,7 @@ sent back as a `ui` request and the answer comes back with its token:
   shared when it's moved with the scrollbar (that runs in the world), not with the wheel
   (that's the window's own). Launchers' commands run on the PC the world runs on. Each action
   waits for the next world tick (≤ 16 ms) and its result shows with the next send (≤ 33 ms).
-- **World icon:** the world window uses `world.ico` (or `world.png`) from the project folder
+- **World icon:** the world window uses `world.ico` (or `world.png`) from `assets/`
   if there is one, else the canvas's icon.ico.
 
 ---

@@ -1,7 +1,7 @@
 <#
 make_shortcut.ps1 — create a Start Menu shortcut for Canvas App, ready to pin.
 
-The shortcut runs game_loop.py with pythonw (no console window), uses a local copy of taskbar.ico,
+The shortcut runs game_loop.py with pythonw (no console window), uses a local copy of assets\taskbar.ico,
 and carries the AppUserModelID "Yaakov.CanvasApp" — the same ID game_loop.py sets
 at startup — so the pinned icon and the running window share one taskbar button.
 
@@ -38,7 +38,7 @@ $IconDir = Join-Path $env:LOCALAPPDATA "CanvasApp"
 # The copy is named by its content, so a new icon gets a new path: Explorer caches icons by
 # path, and new bytes under an old path keep showing the old (or a blank) image.
 New-Item -ItemType Directory -Force $IconDir | Out-Null
-$IconSrc = Join-Path $AppDir "taskbar.ico"
+$IconSrc = Join-Path $AppDir "assets\taskbar.ico"
 $IconHash = (Get-FileHash $IconSrc -Algorithm SHA256).Hash.Substring(0, 8).ToLower()
 $Icon = Join-Path $IconDir "taskbar-$IconHash.ico"
 if (-not (Test-Path $Icon)) { Copy-Item $IconSrc $Icon }

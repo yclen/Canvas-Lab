@@ -58,7 +58,8 @@ object connects.
 | `instrument_server.py`, `instruments.py`, `drivers/`, `devices.json` | lab hardware |
 | `expressions.py` | the safe equation evaluator (Function objects) |
 | `scripts/`, `calibration/` | calibration procedures and their results |
-| `Nodes.json`, `player.json`, `machines.json` | your saved world, view and machines (not in git) |
+| `assets/` | icons (window, taskbar, world) |
+| `saves/` | everything the app writes: your world (`Nodes.json`), view (`player.json`), machines, CSV exports, `errors.log` — not in git |
 
 ## Docs
 

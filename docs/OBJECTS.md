@@ -100,7 +100,7 @@
   list) and zooms only if it returns False — the collector takes it only over a sheet with more
   rows than fit, so zooming over anything else is unchanged. Each one is a named **data set** ("Data set 1", …,
   renamed from the panel's first row); the name is on the title bar and in the export's file name.
-  *Export CSV* writes `data/<name> <date time>.csv` (row, time, columns; `data/` is git-ignored); *Clear rows…*
+  *Export CSV* writes `saves/data/<name> <date time>.csv` (row, time, columns; git-ignored); *Clear rows…*
   (in the ⋯ menu) confirms first. Output: `rows` (the count). Each collect saves the canvas — fine for hand /
   button collects; a very fast trigger on a big table would mean big, frequent saves
 - **Data relay** (E menu ▸ Data, `things.py`): a small junction for routing one value — so a wire

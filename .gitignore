@@ -1,20 +1,9 @@
 __pycache__/
 *.pyc
 
-# personal canvas data (the app recreates it if missing)
-Nodes.json
-
-# this player's own data (where the view was at last close)
-player.json
-
-# error log the app writes (it has no console)
-errors.log
-
-# exported data (Data collector CSVs)
-data/
-
-# saved machines (E menu > Machines), personal like Nodes.json
-machines.json
+# everything the app writes: the world (Nodes.json), your view (player.json),
+# saved machines, the error log, Data collector CSV exports (data/)
+saves/
 
 # calibration runs (calibrate_nd_filter.py / fit_nd_filter.py: CSVs, plots, fits)
 calibration/nd_filter/

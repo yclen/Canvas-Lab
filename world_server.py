@@ -428,13 +428,13 @@ class World:
 BG, FG, DIM, GREEN = "#19191e", "#e6e6eb", "#8c8c9b", "#5adc78"
 
 
-WORLD_ICONS = ("world.ico", "world.png")   # the world window's own icon, if one is in the folder
+WORLD_ICONS = ("world.ico", "world.png")   # the world window's own icon, if one is in assets/
 
 
 def set_icon(root):
-    """world.ico / world.png from this folder (the canvas's icon.ico until there is one)."""
+    """world.ico / world.png from assets/ (the canvas's icon.ico until there is one)."""
     for name in WORLD_ICONS + ("icon.ico",):
-        path = os.path.join(canvas.SCRIPT_DIR, name)
+        path = os.path.join(canvas.ASSETS_DIR, name)
         if not os.path.exists(path):
             continue
         try:

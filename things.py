@@ -52,8 +52,8 @@ import pygame
 
 import expressions
 import instruments
-from canvas import (OBJECT_TYPES, WARN_COLOR, Btn, Field, Give, Prop, Row, Section, Take, Thing,
-                    alpha_layer, clip_text, draw_arc, draw_rect, font_px, format_value, get_font,
+from canvas import (OBJECT_TYPES, SAVES_DIR, WARN_COLOR, Btn, Field, Give, Prop, Row, Section,
+                    Take, Thing, alpha_layer, clip_text, draw_arc, draw_rect, font_px, format_value, get_font,
                     panel_button, run_action, short_name)
 
 
@@ -1252,7 +1252,7 @@ DC_TEXT = 14
 DC_BUTTON_W = 96
 DC_SCROLL_W = 14                # the scrollbar, right of the sheet
 DC_WHEEL_ROWS = 3               # rows per wheel notch
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+DATA_DIR = os.path.join(SAVES_DIR, "data")    # CSV exports
 
 
 class DataCollector(Thing):
