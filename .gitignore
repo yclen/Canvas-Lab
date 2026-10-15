@@ -4,6 +4,9 @@ __pycache__/
 # personal canvas data (the app recreates it if missing)
 Nodes.json
 
+# this player's own data (where the view was at last close)
+player.json
+
 # error log the app writes (it has no console)
 errors.log
 

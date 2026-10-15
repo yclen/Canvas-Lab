@@ -20,7 +20,9 @@ Optional extras:
     PROPS        saved fields, editable in the inspector. kinds: "float", "int",
                  "str", "bool" (click toggles), "color", "choice" (click cycles).
     @panel_button("Label")  a method (self, app) shown as an inspector button.
-    tick(dt)     called every frame (dt = seconds) — animate here.
+    tick(dt)     called every frame (dt = seconds) — animate here. It's the
+                 world, so it never reads the mouse, camera or is_selected /
+                 is_hovered (those belong to one player's view, see hover()).
     DOT_COLOR    the color it shows as when zoomed far out.
     CATEGORY     an E-menu tab to also list it under (e.g. "Lights"); NAME = tile name.
     icon_sample() / draw_icon(surface)   customize its E-menu icon (default: draws
@@ -33,7 +35,8 @@ Optional extras:
                  fill in the standard panel (see "The panel" in DESIGN.md).
     Subclass another Thing to share its drawing/props/behavior.
 
-`app` (in buttons and callbacks) has: app.scene, app.camera, app.save(),
+`app` (in buttons and callbacks) has: app.scene (the world), app.player
+(this window's view: camera, selection), app.camera, app.save(),
 app.ask(prompt, on_submit), app.confirm(...), app.place(obj).
 See "Adding an object type" in DESIGN.md.
 """
@@ -144,8 +147,13 @@ class Input(Thing):
 
     @property
     def pressed(self):
-        """Drawn pushed in: held down on it, or just tapped."""
-        return (self._held and self.is_hovered) or self._flash > 0
+        """Pushed in: held down, or just tapped. World state (it's an output),
+        so it comes from presses and releases, never from where the mouse is."""
+        return self._held or self._flash > 0
+
+    def on_drag(self, pos, app):
+        if self._held and not self.hit(pos, app.camera):
+            self._held = False        # slid off it: that lets go
 
     def on_release(self, pos, app):
         self._held = False
@@ -3707,8 +3715,8 @@ class SuperK(Device):
                     or time.monotonic() - since > SK_PENDING_SECONDS):
                 self._pending = None              # confirmed — or refused / timed out: show the truth
 
-    def update(self, mouse_pos, mouse_pressed, camera, dt):
-        super().update(mouse_pos, mouse_pressed, camera, dt)
+    def hover(self, mouse_pos, mouse_pressed, camera):
+        super().hover(mouse_pos, mouse_pressed, camera)
         self._switch_hover = (self.live() and self.is_hovered and
                               self._layout(self.screen_rect(camera))["switch"].collidepoint(mouse_pos))
 
@@ -3732,6 +3740,14 @@ class SuperK(Device):
         if self.connect and self.info() is not None:
             self.run_action(app, "emission_off")  # no beam left running without its controls
         super().disconnect(app)
+
+    def on_no_players(self):
+        """The world keeps running when everyone leaves — but not the beam:
+        nobody's left watching it (unless the device's off_when_canvas_closes
+        option is off, as with the instrument server's own no-clients rule)."""
+        info = self.info()
+        if self.connect and info is not None and info.get("options", {}).get("off_when_canvas_closes", True):
+            self.run_action(None, "emission_off")
 
     def actions(self, app):
         out = []
@@ -4431,7 +4447,7 @@ class InstrumentServer(Thing):
     def create(cls, app):
         existing = server_object(app.scene)
         if existing is not None:                # only one: go to it instead
-            app.scene.select_only(existing)
+            app.player.select_only(existing)
             app.camera.look_at(existing.center, app.camera.zoom, app.screen_size)
             return
         app.start_placing(lambda x, y: cls(x, y))
@@ -4485,7 +4501,7 @@ class InstrumentServer(Thing):
         """Go to the canvas object for a server device, or pick one up to place."""
         existing = find_device_object(app.scene, name)
         if existing is not None:
-            app.scene.select_only(existing)
+            app.player.select_only(existing)
             app.camera.look_at(existing.center, app.camera.zoom, app.screen_size)
             return
         cls = device_class_for(driver)

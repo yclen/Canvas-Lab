@@ -111,6 +111,27 @@ class InstrumentClient:
         with self._lock:
             self._outbox.append(message)
 
+    # --- Sharing with players (world_link) ---------------------------------------
+    def snapshot(self):
+        """Everything the canvas reads from this client, for the world to pass
+        on to players (they never connect to the instrument server themselves)."""
+        with self._lock:                # a copy, made while nothing can change it
+            return json.loads(json.dumps(
+                {"connected": self.connected, "wants": sorted(map(str, self._wants)),
+                 "devices": self._devices, "drivers": self.drivers, "ports": self.ports,
+                 "last_error": self.last_error}))
+
+    def mirror(self, snap):
+        """A player's side: show what the world's client sees. Never started,
+        so it never connects anywhere."""
+        with self._lock:
+            self.connected = snap.get("connected", False)
+            self._wants = set(snap.get("wants", []))
+            self._devices = snap.get("devices", {})
+            self.drivers = snap.get("drivers", [])
+            self.ports = snap.get("ports", [])
+            self.last_error = snap.get("last_error", "")
+
     # --- Background thread --------------------------------------------------------
     def _run(self):
         while True:

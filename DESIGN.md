@@ -1,4 +1,4 @@
-# Canvas App — Design Notes
+# Canvas Lab — Design Notes
 
 > A record of the thinking behind this app, not a manual — what we're building, the
 > options we weighed for each design question, and where we landed. Kept alongside the
@@ -24,12 +24,15 @@ to spaghetti?*
 
 **Structure: split by concern, not by construct.**
 - `canvas.py` — everything about the world and the app: all the classes (canvas objects,
-  camera, scene, UI) plus the helper functions that serve them (fonts, actions,
+  camera, scene = the world, player = one view of it, UI) plus the helper functions that serve them (fonts, actions,
   persistence), and the object toolkit (`Prop`, inspector rows, `Thing`, `App`).
 - `things.py` — the **catalog**: the many simple object types, one small class each.
   Imports from `canvas.py`; `canvas.py` never imports it.
-- `game_loop.py` — the thin runner: pygame/window setup + the main-loop wiring, nothing
-  else, and nothing that names a specific object type. It imports `canvas` and `things`.
+- `game_loop.py` — the thin runner: pygame/window setup, the home screen, + the main-loop
+  wiring, nothing else, and nothing that names a specific object type. It imports `canvas`
+  and `things`.
+- `world_server.py` — the world running on its own (its own small window); `world_link.py`
+  — the link between it and player windows (see *The world server and players*).
 
 We considered splitting "all classes in one file, all non-class glue in the loop," but
 that cuts across concerns — it would exile actions/persistence into the loop file and turn
@@ -221,8 +224,8 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
 - **Wall** object: outline-only rectangular zone, drag-to-draw, fixed-size corner name tag,
   border scales with zoom
 - **Agent** object: a little orange square with eyes that idly wanders (walk/pause/walk),
-  confined to whichever Wall contains it — the first *animated* object, so `update()` now
-  carries frame-time (`dt`)
+  confined to whichever Wall contains it — the first *animated* object, so objects now
+  get frame-time (`dt`, in `tick`). It holds still while any player has it selected
 - **Neuron** object: a stationary Agent subclass drawn as a white square with one black
   oval center spot; Add ▸ Add neuron. Has a **firing equation** (inspector ▸ Set firing
   equation…) evaluated each frame against its own clock `t` (reset when the equation is set):
@@ -284,7 +287,10 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   unlinked). Once placed they're ordinary objects — there's no lasting "machine" object. Device
   objects keep their server device name, so a placed copy drives the same hardware
 - **Remembers your view**: on close, the world point at screen center + zoom are written to
-  `Nodes.json` as `"view"`; on launch the camera is restored there. Normal saves keep it
+  `player.json` (git-ignored — it's the player's, not the world's); on launch the camera is
+  restored there. (It used to be `"view"` in `Nodes.json`; the first launch moves it over)
+- **World and player are separate** (step 1 of MULTIPLAYER_STUDY.md) — see *The world and
+  the player's view* below
 - **Text boxes** have a movable cursor: Left/Right, Home/End, Backspace/Delete,
   Ctrl+Backspace (word); long text scrolls sideways. Key-repeat (`TEXT_KEY_REPEAT`) is
   switched on only while a text box is open, so held keys don't repeat on the canvas
@@ -500,6 +506,172 @@ wall resize handles · wall→node containment.
 
 ---
 
+## The world and the player's view (built)
+
+Step 1 toward multiplayer (MULTIPLAYER_STUDY.md): the world and what one person sees of
+it are now two things, still in one program.
+
+- **`Scene` is the world:** the objects, `by_id`, add / delete, `tick(dt)`, saving
+  `Nodes.json`. It has no camera and no selection list, so it can run with nobody looking
+  — checked: every object type ticks with no window and no `pygame.init()`.
+- **`Player` is one view of it:** its own `Camera`, selection (ids), `hover()`, `draw()`
+  (and the neuron mesh's cached drawing), and the view it remembers in `player.json`.
+  `App` gets the player (`app.player`, `app.camera`), and the world through it (`app.scene`).
+  Each player window will have its own Player.
+- **The rule:** an object's `tick` (world) never reads the mouse, the camera, or
+  `is_selected` / `is_hovered` — those are one view's drawing hints, never saved. `hover` /
+  `draw` (view) may read anything but change only view state. `Scene.update(mouse, camera,
+  dt)` became `scene.tick(dt)` + `player.hover(mouse, pressed)`.
+- **When the world does care about players**, it's told explicitly: `scene.selections`
+  (player name → ids) — an agent holds still while *anyone* has it selected
+  (`scene.selected_by_anyone`), not when "this window" does.
+- **Push button `pressed` is world state now:** held (from the click until release, or
+  until the mouse slides off it) or just tapped — it no longer checks hover, which made the
+  output depend on one window's mouse. Sliding off lets go, and sliding back on doesn't
+  press again (it used to show pressed again, which a Counter would count a second time).
+- `scene.hit_test` / `give_at` stay on the Scene: they take the camera as an argument and
+  keep no view state — a view asking the world what's under a point.
+- A `Button` measures its text with a font when it's made, so the world server calls
+  `pygame.font.init()` (no window needed).
+
+---
+
+## The world server and players (built)
+
+Step 2 (MULTIPLAYER_STUDY.md): the world runs as its own program, and canvas windows join it.
+
+**The name:** the app is **Canvas Lab** (`canvas.APP_NAME`: window titles, the home screen;
+the world window is "Canvas Lab — World"). The Start-menu shortcut made by make_shortcut.ps1 is
+still called "Canvas App" (same AppUserModelID, so a pinned icon keeps working).
+
+**The home screen's look** is the app's own: a dark canvas with a drifting dot grid and faint
+squares / diamonds / rings / tiles linked by flowing-dot wires (`HomeBackdrop`, kept out from
+behind the content), a vignette, and the **logo drawn live** (`draw_logo`) — its node graph
+(square, diamond, square, ring) in four of the player colors with a soft glow, dots flowing
+along its links, bobbing gently — beside "Canvas **Lab**" (Bahnschrift) and a tagline. On the
+right (stacked under it in a narrow window): a glassy status card (a colored edge; the dot
+pulses while the world runs), the green **Join / Launch world** button (with an *Enter* key
+cap), *Work on my own*, and a *Playing as* chip (click to change your name). 60 fps, ~5 ms a
+frame at 1180×740. The window now opens at 1180×740 (or 85% / 80% of a smaller screen).
+
+**Using it.** The taskbar canvas opens to a **home screen** (`canvas.HomeScreen`): the world's
+status (running or not, who's in it, how many objects), then
+- **Join world** (green, Enter) when it's running;
+- **Launch world** when it isn't: starts `world_server.py` (pythonw, no console), waits up to
+  20 s for it, then joins by itself;
+- **Work on my own**: the canvas as it always was — loads, ticks and saves Nodes.json itself.
+  Only while no world is running, so two programs never write the file;
+- **Playing as** *name* (click *change*): what other players see; saved in player.json.
+
+**The world app** (`world_server.py`, also runnable by hand) has a small window and its own
+taskbar icon (AppUserModelID `Yaakov.CanvasWorld`): *The world is running*, the players in it,
+object count, uptime, and **Stop world**. **Closing a player window never stops the world;
+closing the world's window (or Stop world) does** — it asks first if anyone's in it, saves, and
+sends players back to their home screen ("The world was stopped."). It refuses to start while
+a window is working on its own, and if a world is already running.
+
+**In the world, everything works as on your own** — pressing buttons, flipping switches,
+dragging sliders, typing equations, linking (panel *link*, chips, dragging a wire out of a
+nub), the E / Add menus and placing, C copies, Delete, arrow-key moves, right-click and ⋯
+menus, panel rows and buttons, trains and walls, machines — and everyone in the world sees
+the result. A list at the top-left (`draw_world_roster`, under a mode's hint while one shows)
+says *Connected to world* and lists everyone in it — a dot in their color and their name, yours
+first and marked *you*; the window title has your name.
+
+**Seeing the other players** (`canvas.OtherPlayers`). Each player gets a **color** when they
+join (`PLAYER_COLORS` in world_server.py, the first one nobody in the world has). In that
+color, every window draws each *other* player's
+- **view**: an outlined box (no fill) around the area their window shows, tagged "*name*'s view"
+  at its top-left corner — only when that corner is on screen (no tag when their view is bigger
+  than yours: the player list says who's here);
+- **cursor**: an arrow with a name tag, and a ring around its tip while their mouse button is
+  down — so you see them click, drag a slider, press a button;
+- **selection**: a ring around each object they have selected (what they're working on).
+
+Each window reports where it is (`{"op": "presence"}`: cursor in world units — None while the
+mouse is outside the window — the area it shows `[x, y, w, h]`, and whether the button is
+down), at most every `PRESENCE_SEND_S` (0.05 s) and only when it changed. The world passes
+everyone's on (`{"op": "presence", "players": [...]}`, 20×/s when something moved, with their
+selection from `scene.selections`). Drawn positions glide toward the newest ones
+(`PRESENCE_SMOOTH`), so cursors move smoothly between updates. Name tags use dark text on
+light colors.
+
+**How your actions reach the world.** Object code runs in one place only: the world. The
+game loop is the same in both modes because it does every change through an `App` method —
+`click` / `drag` / `release`, `panel_click`, `object_menu` / `selection_menu`, `menu_command`
+(was `handle_menu_command` in game_loop.py), `move_objects` / `moved`, `add`, `place`,
+`choose_take`. On your own, `App` does them. In the world, `JoinedApp` sends each to the
+world with this window's **view** (camera, screen size, mouse, selection), and there that
+player's **`WorldApp`** (world_server.py) runs the very same object code — `obj.on_click(pos,
+app)`, the panel callback, `cls.create(app)` — with *that player's* camera and mouse
+(`pygame.mouse.get_pos` is pointed at it while it runs). Whatever object code would show is
+sent back as a `ui` request and the answer comes back with its token:
+- `app.ask` / `app.confirm` / `app.context_menu` → the text box / confirm / menu opens in the
+  player's window; Enter / OK / the item chosen goes back, and the callback runs in the world.
+- `app.start_picking` (linking: "click what X takes from") → the window's pick mode, with the
+  ids the world's `accept` allows; the clicked object (or empty-canvas point) goes back.
+- `app.start_placing(factory)` → the world makes a sample, the window holds a see-through copy
+  (`GhostGroup`); the drop point goes back and the world makes the real one with the factory
+  (Shift+click keeps placing; a one-only type ends it with `place_done`).
+- `app.open_inventory`, the train / wall builders (`RemoteMode`) → start in the window; a
+  finished train / wall comes back as `add`.
+- If object code moved the player's camera (Go To, a train ride) or changed their selection
+  (a placed object is selected), the world tells the window (`camera` / `select`).
+- **Panel clicks** can't send the callback itself, so each clickable spot is drawn with a
+  **path** (`InspectorPanel.hot_at` → `(callback, view, path)`): `("button", i, label)`,
+  `("row", n, label[, part])` — n counts every row, sections' rows included, folded or not
+  (`flat_rows`), part is `pick` / `unlink` / `choose_give` / `set_by_hand` / `on_label` /
+  `down` / `up` / `item k` — or `("menu", pos)`, `("rename",)`. The world rebuilds the panel for
+  that object and finds the same spot (`panel_callback`, via `row_callback`, which the panel
+  draws with too), checking the label so a click is never run on a different row. Folding a
+  section (`view=True`) stays in the window.
+- A **click** asks the world and waits for its answer (`request` → `reply`): did the object
+  take it (then drags / release follow) or should it just select? Same PC: a few ms.
+
+**How it works** (`world_link.py`, protocol in its docstring; JSON lines over
+127.0.0.1:47810 — local only):
+- The world thread (`World.run`) ticks the Scene 60×/s and, 30×/s, sends what changed. Network
+  threads only queue messages; only the world thread touches the scene.
+- **Mirroring is generic** (`Mirror`): an object's state is its instance attributes —
+  everything in `vars(obj)` that can be JSON (numbers, text, lists, str-keyed dicts, vectors
+  `{"__v2"}`, tuples `{"__t"}`, sets `{"__s"}`), skipping what can't (fonts, surfaces, compiled
+  equations) and the view's own flags (`VIEW_ATTRS`: is_hovered / is_clicked / is_selected,
+  scene). On join a player gets every object (`to_dict` + state, in the welcome); after that
+  only changed attributes, and added / removed objects. So no object type has networking code,
+  and new types are mirrored for free. A player's copy (`Scene.copy_of_world`, `path=None`)
+  never saves and is never ticked — it only draws what the world sends, so windows can't drift
+  apart (agents, neurons, counters move only in the world).
+- **Selections go to the world** (`{"op": "select"}` when yours changes, and with every action)
+  into `scene.selections[name]` — so an agent holds still while anyone in the world has it
+  selected, and Delete / Copy act on what you have selected right now.
+- **Devices:** only the world talks to the instrument server. Players see the devices through
+  it: the world sends `instruments.client.snapshot()` (10×/s, when it changed) and the player's
+  `instruments.client.mirror()`s it — never started, so it never connects anywhere.
+- **Names:** a second window with the same name gets "Yaakov 2". Views are kept per name in
+  player.json (`{"name", "views": {name: view}}`), so two windows each reopen where they were.
+- **Laser safety:** the world keeps running when everyone leaves, so the instrument server's
+  "no clients" rule (emission off when the canvas goes) would no longer fire. Instead, when the
+  last player leaves the world calls `on_no_players()` on every object; the SuperK turns
+  emission off (unless its device's `off_when_canvas_closes` option is off). Stopping the world
+  still disconnects it from the instrument server, so that rule fires too.
+- **"Work on my own" lock:** that window holds 127.0.0.1:47811 (a bound port is let go even
+  on a crash); the world won't start while it's held, and the home screen greys out Launch.
+- **Tests** point everything elsewhere with `CANVAS_WORLD_PORT`, `CANVAS_NODES_FILE`,
+  `CANVAS_PLAYER_FILE` (and `CANVAS_INSTRUMENT_PORT`), so they never touch the real world.
+- **Cost:** 500 objects ≈ 15 ms per send (tick + compare), ~8 KB a message — fine at today's
+  sizes. If worlds grow: send less often, or only what's near each player's view.
+- **Known rough edges:** movement is updated 30×/s, so agents step slightly (smoothing
+  between updates could fix it); a Switch's knob slide is mirrored, not animated locally;
+  times stored as `time.monotonic()` (e.g. the SuperK's "starting…" timer) are shared as-is,
+  which is right on one PC but won't be across computers; a collector's scroll position is
+  shared when it's moved with the scrollbar (that runs in the world), not with the wheel
+  (that's the window's own). Launchers' commands run on the PC the world runs on. Each action
+  waits for the next world tick (≤ 16 ms) and its result shows with the next send (≤ 33 ms).
+- **World icon:** the world window uses `world.ico` (or `world.png`) from the project folder
+  if there is one, else the canvas's icon.ico.
+
+---
+
 ## Concepts that keep guiding us
 
 Checked against every new idea:
@@ -591,6 +763,8 @@ different about it. The loop, menu and inspector just call the hooks.
 | `migrate(d)` | update an older save before loading | unchanged |
 | `center`, `in_box`, `copyable`, `COPY_SKIP` | Go To, drag-box select, copy | per family |
 | `on_prop_changed(key)` | react to an inspector edit | nothing |
+| `tick(dt)` | the world moving on its own, every frame (never reads the mouse, camera or selection) | nothing |
+| `hover(mouse_pos, mouse_pressed, camera)` | a player's view: hover / pressed *looks* only | nodes set `is_hovered` |
 
 ---
 

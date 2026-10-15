@@ -18,11 +18,14 @@ import os
 import random
 import re
 import subprocess
+import threading
 import time
 import traceback
 import uuid
 
 import pygame
+
+import world_link  # the world <-> players link (the home screen asks it what is running)
 
 
 # ============================================================================
@@ -31,7 +34,7 @@ import pygame
 # Anchor all file paths here, to this file's own folder — never bare relative
 # paths (they resolve against the process's working dir, not the script).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-NODES_FILE = os.path.join(SCRIPT_DIR, "Nodes.json")
+NODES_FILE = os.environ.get("CANVAS_NODES_FILE") or os.path.join(SCRIPT_DIR, "Nodes.json")   # tests point it elsewhere
 ERRORS_FILE = os.path.join(SCRIPT_DIR, "errors.log")   # the app has no console: errors go here
 
 # Scene
@@ -819,7 +822,23 @@ class CanvasObject:
         """Runs after this object is deleted from the scene."""
         pass
 
-    def update(self, mouse_pos, mouse_pressed, camera, dt):
+    def on_no_players(self):
+        """Runs in the world when the last player leaves (the world keeps
+        running). For safety: e.g. a laser turns its emission off."""
+        pass
+
+    # The world and the view are kept apart: tick() is the world moving on its
+    # own (it may read other objects, never the mouse, camera or selection);
+    # hover() is one player's view looking at it (it may only set view state,
+    # like is_hovered, never anything other objects read or that's saved).
+    def tick(self, dt):
+        """The world: called every frame with the frame time in seconds,
+        whether or not anyone is looking. Animate / simulate here."""
+        pass
+
+    def hover(self, mouse_pos, mouse_pressed, camera):
+        """A player's view: the mouse is at screen mouse_pos (button down if
+        mouse_pressed). Only for drawing hover / pressed looks."""
         pass
 
     def hit(self, pos, camera):
@@ -1227,7 +1246,7 @@ class Node(CanvasObject):
     def screen_bounds(self, camera):
         return self.screen_rect(camera)
 
-    def update(self, mouse_pos, mouse_pressed, camera, dt):
+    def hover(self, mouse_pos, mouse_pressed, camera):
         rect = self.screen_rect(camera)
         self.is_hovered = rect.collidepoint(mouse_pos)
         self.is_clicked = self.is_hovered and mouse_pressed
@@ -1386,7 +1405,7 @@ class Train(CanvasObject):
     @classmethod
     def create(cls, app):
         app.cancel_modes()
-        app.scene.select_only(None)     # nothing selected while drawing a route
+        app.player.select_only(None)     # nothing selected while drawing a route
         app.train_builder.begin()
 
     @classmethod
@@ -1616,7 +1635,7 @@ class Wall(CanvasObject):
     @classmethod
     def create(cls, app):
         app.cancel_modes()
-        app.scene.select_only(None)
+        app.player.select_only(None)
         app.wall_builder.begin()       # drag a box; the loop then asks for its name
 
     @classmethod
@@ -1742,14 +1761,6 @@ class Thing(Node):
     def screen_rect(self, camera):
         return camera.world_rect_to_screen(self.world_center, self.world_width, self.world_height)
 
-    def update(self, mouse_pos, mouse_pressed, camera, dt):
-        super().update(mouse_pos, mouse_pressed, camera, dt)   # hover/click
-        self.tick(dt)
-
-    def tick(self, dt):
-        """Called every frame with the frame time in seconds. Animate here."""
-        pass
-
     def draw(self, surface, camera):
         rect = self.screen_rect(camera)
         if self.is_selected:
@@ -1778,8 +1789,8 @@ AGENT_MARGIN = 24                  # keep this far inside the wall's border
 class Agent(Thing):
     """A point object that idly wanders — walk to a random spot, pause, repeat —
     staying inside whatever Wall contains it (or a small area if it's in none).
-    Just for looks right now; real behaviour can come later. While selected it
-    holds still so you can grab it."""
+    Just for looks right now; real behaviour can come later. While any player
+    has it selected it holds still so they can grab it."""
 
     TYPE = "agent"
     MENU_LABEL = "Add agent"
@@ -1820,7 +1831,7 @@ class Agent(Thing):
                                       random.uniform(miny, max(miny, maxy)))
 
     def tick(self, dt):
-        if self.is_selected:
+        if self.scene is not None and self.scene.selected_by_anyone(self):
             return                                             # hold still when grabbed
         if self._state == "pause":
             self._pause -= dt
@@ -2332,9 +2343,10 @@ def load_objects(path=NODES_FILE):
     return objects
 
 
-def load_view(path=NODES_FILE):
-    """The camera view saved at last close — {"x", "y", "zoom"}, where x/y is the
-    world point at the center of the screen — or None if there isn't one."""
+def load_view(path):
+    """A saved camera view — {"x", "y", "zoom"}, where x/y is the world point
+    at the center of the screen — from a player file (or, from before players,
+    Nodes.json), or None if there isn't one."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             view = json.load(f).get("view")
@@ -2344,6 +2356,8 @@ def load_view(path=NODES_FILE):
 
 
 def save_objects(objects, path=NODES_FILE, view=None):
+    """Write the world. `view` only carries an old Nodes.json's view through
+    load_objects' one-time rewrite, so the player can still pick it up."""
     data = {"objects": [o.to_dict() for o in objects]}
     if view is not None:
         data["view"] = view
@@ -2352,19 +2366,22 @@ def save_objects(objects, path=NODES_FILE, view=None):
 
 
 # ============================================================================
-# SCENE — the live state container (objects, camera, selection, id index)
+# SCENE — the world: the live objects, their id index, ticking and saving.
+# Nothing in here belongs to one player (no camera, no selection list) —
+# that's Player, below — so the world could run with nobody looking at it.
 # ============================================================================
 class Scene:
-    """Holds the live objects + camera and owns mutation/persistence, so the
-    game loop stays wiring-only. `by_id` is an O(1) index for lookups (e.g. a
-    future connector resolving its two endpoints)."""
+    """Holds the live objects and owns mutation/persistence, so the game loop
+    stays wiring-only. `by_id` is an O(1) index for lookups (e.g. a connector
+    resolving its two endpoints). `selections` is what each player has
+    selected, by id — kept here because the world reacts to it (an agent holds
+    still while anyone has it selected)."""
 
-    def __init__(self, objects, camera=None, view=None):
+    def __init__(self, objects, path=NODES_FILE):
         self.objects = objects
-        self.camera = camera or Camera()
-        self.view = view        # last saved camera view (see load_view); kept on every save
-        self.mesh = NeuronMesh()  # the faint all-to-all lines between neurons
+        self.path = path        # where it saves; None = a player's copy of a world that lives elsewhere
         self.by_id = {o.id: o for o in objects}
+        self.selections = {}    # player name -> set of selected ids
         for o in objects:
             o.scene = self      # so connectors (Train) can resolve their nodes
         for o in objects:       # heal any legacy overhang corners in old trains
@@ -2395,54 +2412,38 @@ class Scene:
         return changed
 
     @classmethod
+    def copy_of_world(cls, welcome):
+        """A player's copy of a world running in world_server.py, built from its
+        welcome message. It never saves (the world does) and is never ticked."""
+        objects = []
+        for d in welcome["objects"]:
+            obj = object_from_dict(d)
+            world_link.apply_state(obj, welcome["state"].get(obj.id, {}))
+            objects.append(obj)
+        return cls(objects, path=None)
+
+    @classmethod
     def load(cls):
-        scene = cls(load_objects(), view=load_view())
+        scene = cls(load_objects())
         if scene._weights_filled:
             scene.save()     # persist any W's just created, so they're stable from now on
         return scene
 
     def save(self):
-        save_objects(self.objects, view=self.view)
+        if self.path is not None:
+            save_objects(self.objects, self.path)
 
-    def restore_view(self, screen_size):
-        """Put the camera back where it was at last close (if anything was saved)."""
-        if self.view:
-            self.camera.look_at((self.view["x"], self.view["y"]), self.view["zoom"], screen_size)
-
-    def remember_view(self, screen_size):
-        """Record where the camera is now (screen-center world point + zoom), so
-        the next save writes it and the next launch reopens here."""
-        cx, cy = self.camera.screen_to_world((screen_size[0] / 2, screen_size[1] / 2))
-        self.view = {"x": cx, "y": cy, "zoom": self.camera.zoom}
-
-    @property
-    def selection(self):
-        """Every selected object (a drag-box can select many)."""
-        return [o for o in self.objects if o.selectable and o.is_selected]
-
-    @property
-    def selected(self):
-        """The one selected object, or None if nothing — or several — are
-        selected. Single-object actions (rename, inspector, copy, goto) use this,
-        so they simply don't apply to a multi-selection."""
-        sel = self.selection
-        return sel[0] if len(sel) == 1 else None
-
-    def select_only(self, obj):
-        """Select obj (or deselect everything if obj is None)."""
-        self.select_many([obj] if obj is not None else [])
-
-    def select_many(self, objs):
-        objs = set(map(id, objs))
-        for o in self.objects:
-            if o.selectable:
-                o.is_selected = id(o) in objs
+    def selected_by_anyone(self, obj):
+        """Does any player have obj selected?"""
+        return any(obj.id in ids for ids in self.selections.values())
 
     def objects_in_box(self, x, y, w, h):
         """What a drag-box over world rect (x, y, w, h) selects — each object
         decides via in_box (nodes: center inside; walls: entirely inside)."""
         return [o for o in self.objects if o.in_box(x, y, w, h)]
 
+    # What's under a screen point, seen through a camera: a question a player's
+    # view asks of the world (the camera is passed in, the world keeps none).
     def hit_test(self, pos, camera):
         """The topmost object under a screen point, or None — the same order
         it's drawn in, reversed, so you click what you see on top."""
@@ -2481,32 +2482,168 @@ class Scene:
             if obj in self.objects:
                 self.objects.remove(obj)
                 self.by_id.pop(obj.id, None)
+                for ids in self.selections.values():
+                    ids.discard(obj.id)
                 obj.on_removed()
                 removed = True
         if removed:
             self.sync_weights()
             self.save()
 
-    # Each object's update/draw is guarded: one object's bug (say, at an odd
-    # zoom) is logged to errors.log and marked on screen instead of crashing
-    # the whole app.
-    def update(self, mouse_pos, mouse_pressed, camera, dt):
+    def tick(self, dt):
+        """Move the world on by dt seconds. Each object's tick is guarded: one
+        object's bug is logged to errors.log instead of crashing the app."""
         for o in self.objects:
             try:
-                o.update(mouse_pos, mouse_pressed, camera, dt)
+                o.tick(dt)
                 o.watch_presses(dt)
             except Exception as e:
-                report_error(f"{o.TYPE}.update", e)
+                report_error(f"{o.TYPE}.tick", e)
 
-    def draw(self, surface, camera):
-        self.mesh.draw(surface, camera, self.neurons)
-        for o in self.objects:
+
+# ============================================================================
+# PLAYER — one person's view of the world: their camera, what they've
+# selected, hover, drawing, and where they were looking at last close. The
+# world (Scene) is shared; each player window has its own Player.
+# ============================================================================
+PLAYER_FILE = (os.environ.get("CANVAS_PLAYER_FILE")      # players' own data on this PC, git-ignored
+               or os.path.join(SCRIPT_DIR, "player.json"))
+# {"name": the name last played as, "views": {player name: view}} — a view per
+# name, so two windows on one PC (Yaakov, Yaakov 2) each reopen where they were.
+
+
+def load_players(path=PLAYER_FILE):
+    """player.json as {"name", "views"} (empty if missing; the first shape,
+    {"name", "view"}, is read as that name's view)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    views = data.get("views") if isinstance(data.get("views"), dict) else {}
+    name = data.get("name") or ""
+    if "view" in data:                  # the first shape: one view, saved as "local"
+        views.setdefault(name or "local", data["view"])
+    if name == "local":                 # (that was never a name you chose)
+        name = ""
+    return {"name": name, "views": views}
+
+
+def save_players(data, path=PLAYER_FILE):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"name": data.get("name", ""), "views": data.get("views", {})}, f, indent=2)
+
+
+def _clean_view(view):
+    try:
+        return {k: float(view[k]) for k in ("x", "y", "zoom")}
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+class Player:
+    """A view of a Scene. Selection is kept as ids (and told to the world, see
+    Scene.selections); each object's is_selected / is_hovered flags are this
+    view's drawing hints and are never saved."""
+
+    def __init__(self, scene, name="local", path=PLAYER_FILE):
+        self.scene = scene
+        self.name = name
+        self.path = path
+        self.camera = Camera()
+        self.mesh = NeuronMesh()    # the faint all-to-all lines between neurons (a cached drawing)
+        self._selected = set()      # ids
+        self.view = None
+        if path is None:            # the world's own record of a player: nothing to load or save
+            return
+        players = load_players(path)
+        self.view = (_clean_view(players["views"].get(name))
+                     or _clean_view(players["views"].get("local")))   # the one view from before names
+        if self.view is None and not players["views"]:   # first run with players: take over
+            self.view = load_view(NODES_FILE)             # the view Nodes.json had
+            if self.view is not None:
+                self.save()
+
+    # --- Remembering the view ---------------------------------------------------
+    def save(self):
+        """Write this player's view and name (other names' views are kept)."""
+        if self.path is None:
+            return
+        players = load_players(self.path)
+        players["views"][self.name] = self.view
+        players["name"] = players["name"] or self.name
+        save_players(players, self.path)
+
+    def restore_view(self, screen_size):
+        """Put the camera back where it was at last close (if anything was saved)."""
+        if self.view:
+            self.camera.look_at((self.view["x"], self.view["y"]), self.view["zoom"], screen_size)
+
+    def remember_view(self, screen_size):
+        """Record where the camera is now (screen-center world point + zoom) and
+        save it, so the next launch reopens here."""
+        cx, cy = self.camera.screen_to_world((screen_size[0] / 2, screen_size[1] / 2))
+        self.view = {"x": cx, "y": cy, "zoom": self.camera.zoom}
+        self.save()
+
+    # --- Selection ----------------------------------------------------------------
+    @property
+    def selection(self):
+        """Every selected object (a drag-box can select many)."""
+        return [o for o in self.scene.objects if o.selectable and o.id in self._selected]
+
+    @property
+    def selected(self):
+        """The one selected object, or None if nothing — or several — are
+        selected. Single-object actions (rename, inspector, copy, goto) use this,
+        so they simply don't apply to a multi-selection."""
+        sel = self.selection
+        return sel[0] if len(sel) == 1 else None
+
+    def select_only(self, obj):
+        """Select obj (or deselect everything if obj is None)."""
+        self.select_many([obj] if obj is not None else [])
+
+    def select_many(self, objs):
+        self.select_ids(o.id for o in objs if o.selectable)
+
+    def select_ids(self, ids):
+        """Select by id — also ids of objects that aren't here yet (one the world
+        is about to send); they show as selected once they arrive (refresh)."""
+        self._selected = set(ids)
+        self.refresh()
+        self.scene.selections[self.name] = set(self._selected)
+
+    @property
+    def selected_ids(self):
+        return set(self._selected)
+
+    def refresh(self):
+        """Set each object's is_selected drawing flag from the selection."""
+        for o in self.scene.objects:
+            if o.selectable:
+                o.is_selected = o.id in self._selected
+
+    # --- Looking: hover and drawing ----------------------------------------------------
+    # Each object's hover / draw is guarded: one object's bug (say, at an odd
+    # zoom) is logged to errors.log and marked on screen instead of crashing.
+    def hover(self, mouse_pos, mouse_pressed):
+        for o in self.scene.objects:
+            try:
+                o.hover(mouse_pos, mouse_pressed, self.camera)
+            except Exception as e:
+                report_error(f"{o.TYPE}.hover", e)
+
+    def draw(self, surface):
+        camera, objects = self.camera, self.scene.objects
+        self.mesh.draw(surface, camera, self.scene.neurons)
+        for o in objects:
             try:
                 o.draw_links(surface, camera)
             except Exception as e:
                 report_error(f"{o.TYPE}.draw_links", e)
         view = surface.get_rect()
-        for o in sorted(self.objects, key=lambda o: o.draw_layer):
+        for o in sorted(objects, key=lambda o: o.draw_layer):
             try:
                 if not self._on_screen(o, camera, view):
                     continue                    # off-screen: skip the (costly) drawing
@@ -3101,6 +3238,71 @@ def split_actions(actions):
     return actions[:keep] + actions[-1:], actions[keep:-1]
 
 
+def flat_rows(rows):
+    """Every row, sections' rows included (folded or not), top to bottom —
+    numbered this way, a row can be named the same in two copies of a panel."""
+    for r in rows:
+        yield r
+        if isinstance(r, Section):
+            yield from flat_rows(r.rows)
+
+
+def row_label(row):
+    """A row's title, checked when a panel path is looked up (so a click is never
+    run on a different row than the one clicked)."""
+    if isinstance(row, (Section, ScrollList)):
+        return str(row.title)
+    if isinstance(row, PortRow):
+        return row.take.key
+    if isinstance(row, GiveRow):
+        return row.give.key
+    return str(getattr(row, "label", ""))
+
+
+def row_callback(row, part=None, item=None):
+    """What clicking `part` of a panel row does: a callback(app), or None. The
+    panel draws with these, and the world runs them for a player (panel_callback)."""
+    if isinstance(row, PortRow):
+        obj, take = row.obj, row.take
+        return {"pick": lambda app: obj.pick(app, take.key),
+                "unlink": lambda app: obj.unlink(take.key, app),
+                "choose_give": lambda app: app.choose_give(obj, take.key, obj.take_source(take.key)),
+                "on_label": take.on_label, "set_by_hand": take.set_by_hand}.get(part)
+    if isinstance(row, GiveRow):
+        return lambda app: app.pick_target(row.obj, row.give.key)
+    if isinstance(row, Stepper):
+        return {"down": row.on_down if row.down_enabled else None,
+                "up": row.on_up if row.up_enabled else None}.get(part)
+    if isinstance(row, ScrollList):
+        ok = part == "item" and item is not None and 0 <= item < len(row.items)
+        return row.items[item][2] if ok else None
+    return getattr(row, "on_click", None)
+
+
+def panel_callback(obj, app, path):
+    """The callback a click on the panel spot `path` (InspectorPanel.hot_at) runs,
+    found in obj's panel as built for `app` — or None if that spot is gone.
+    This is how the world runs a click a player made on their copy of a panel."""
+    kind = path[0] if path else None
+    if kind == "menu":
+        pos = tuple(path[1])
+        return lambda app: app.object_menu(obj, pos)
+    if kind == "rename":
+        return obj.rename if obj.can_rename else None
+    if kind == "button":
+        footer, _overflow = split_actions(obj.actions(app))
+        i, label = path[1], path[2]
+        b = footer[i] if 0 <= i < len(footer) else None
+        return b.on_click if b is not None and b.enabled and b.label == label else None
+    if kind == "row":
+        rows = list(flat_rows(obj.inspector(app)))
+        i, label = path[1], path[2]
+        if not 0 <= i < len(rows) or row_label(rows[i]) != label:
+            return None
+        return row_callback(rows[i], *path[3:])
+    return None
+
+
 class InspectorPanel:
     """Right-edge overlay for the selected object. It knows nothing about
     object types: it draws a header (type, the object's name — click to rename
@@ -3114,7 +3316,7 @@ class InspectorPanel:
     the app. The caller consumes the click either way."""
 
     def __init__(self):
-        self._hot = []            # (rect, callback) for each clickable spot from the last draw
+        self._hot = []            # (rect, callback, view-only?) for each clickable spot from the last draw
         self._panel = None        # the panel's rect while it's showing
         self._obj_id = None       # whose panel is showing (another object starts at the top)
         self._scroll = 0          # px the body is scrolled down
@@ -3146,18 +3348,28 @@ class InspectorPanel:
         return True
 
     def handle_click(self, pos):
-        for rect, callback in reversed(self._hot):     # the last drawn is on top
+        """The callback under pos, or None."""
+        hot = self.hot_at(pos)
+        return hot[0] if hot is not None else None
+
+    def hot_at(self, pos):
+        """(callback, view, path) for the spot under pos, or None. view: it only
+        changes this panel (folding a section). path: what the spot is, in a form
+        the world can find again in its own copy of the panel (panel_callback) —
+        how a player window's panel clicks are run in the world."""
+        for rect, callback, view, path in reversed(self._hot):     # the last drawn is on top
             if rect.collidepoint(pos):
-                return callback
+                return callback, view, path
         return None
 
-    def _clickable(self, surface, rect, callback, mouse):
-        """Hover highlight + remember the hit rect, if the spot has a callback."""
+    def _clickable(self, surface, rect, callback, mouse, view=False, path=None):
+        """Hover highlight + remember the hit rect, if the spot has a callback.
+        view=True: it only changes this panel, not the world. path: see hot_at."""
         if callback is None:
             return
         if rect.collidepoint(mouse):
             pygame.draw.rect(surface, INSPECTOR_HOVER, rect, border_radius=4)
-        self._hot.append((rect, callback))
+        self._hot.append((rect, callback, view, path))
 
     @staticmethod
     def _ring(surface, obj, camera):
@@ -3196,8 +3408,8 @@ class InspectorPanel:
         footer, _overflow = split_actions(obj.actions(app))
         bh, gap = 36, 10
         buttons, by = [], panel.bottom - INSPECTOR_PAD - bh
-        for b in reversed(footer):
-            buttons.append((pygame.Rect(x, by, max_w, bh), b))
+        for i, b in reversed(list(enumerate(footer))):
+            buttons.append((pygame.Rect(x, by, max_w, bh), b, i))
             by -= bh + gap
         bottom = (by + bh + gap - 10) if buttons else panel.bottom - 4
 
@@ -3211,13 +3423,15 @@ class InspectorPanel:
         surface.set_clip(body)
         top = body.y + 4 - self._scroll
         cy = top
-        for row in obj.inspector(app):
+        rows = obj.inspector(app)
+        self._index = {id(r): i for i, r in enumerate(flat_rows(rows))}   # a row's number, for paths
+        for row in rows:
             cy = self._draw_row(surface, row, x, cy, max_w, inside, obj)
         surface.set_clip(prev_clip)
         content = cy - top + 8
         self._max_scroll = max(0, content - body.height)
         self._scroll = min(self._scroll, self._max_scroll)
-        self._hot = header_hot + [(r.clip(body), cb) for r, cb in self._hot if r.colliderect(body)]
+        self._hot = header_hot + [(r.clip(body), cb, v, p) for r, cb, v, p in self._hot if r.colliderect(body)]
         if self._list_rect is not None:
             self._list_rect = self._list_rect.clip(body)
         if self._max_scroll:                         # a thin scrollbar on the right edge
@@ -3230,7 +3444,7 @@ class InspectorPanel:
         if buttons:
             pygame.draw.line(surface, INSPECTOR_DIVIDER, (panel.x + 2, bottom), (panel.right, bottom))
         font = get_font(22)
-        for rect, b in buttons:
+        for rect, b, i in buttons:
             if not b.enabled:
                 bcolor, tcolor = (55, 55, 64), (120, 120, 130)
             elif b.style == "go":
@@ -3245,13 +3459,14 @@ class InspectorPanel:
             ts = font.render(clip_text(b.label, font, rect.width - 12), True, tcolor)
             surface.blit(ts, ts.get_rect(center=rect.center))
             if b.enabled:
-                self._hot.append((rect, b.on_click))
+                self._hot.append((rect, b.on_click, False, ("button", i, b.label)))
 
     def _draw_header(self, surface, obj, app, x, y, max_w, mouse):
         """The type, the object's name (click to rename), its status line and the
         ⋯ menu button. Returns the y the body starts at."""
         dots = pygame.Rect(x + max_w - 30, y, 34, 26)
-        self._clickable(surface, dots, lambda app: app.object_menu(obj, dots.bottomleft), mouse)
+        self._clickable(surface, dots, lambda app: app.object_menu(obj, dots.bottomleft), mouse,
+                        path=("menu", list(dots.bottomleft)))
         for dx in (-7, 0, 7):
             pygame.draw.circle(surface, INSPECTOR_TITLE, (dots.centerx + dx, dots.centery), 2)
         room = max_w - dots.width - 8
@@ -3262,7 +3477,8 @@ class InspectorPanel:
             y += 26
             font = get_font(28)
             if obj.can_rename:
-                self._clickable(surface, pygame.Rect(x - 4, y - 2, max_w + 8, 34), obj.rename, mouse)
+                self._clickable(surface, pygame.Rect(x - 4, y - 2, max_w + 8, 34), obj.rename, mouse,
+                                path=("rename",))
             surface.blit(font.render(clip_text(str(name), font, max_w), True, INSPECTOR_TITLE), (x, y))
             y += 36
         else:
@@ -3287,11 +3503,13 @@ class InspectorPanel:
         if isinstance(row, Section):
             return self._draw_section(surface, row, x, y, max_w, mouse, obj)
         if isinstance(row, PortRow):
-            return self._draw_port(surface, row, x, y, max_w, mouse)
+            return self._draw_port(surface, row, x, y, max_w, mouse,
+                                   ("row", self._index.get(id(row), -1), row_label(row)))
+        path = ("row", self._index.get(id(row), -1), row_label(row))
         if isinstance(row, GiveRow):
             g = row.give
             self._clickable(surface, pygame.Rect(x - 4, y - 2, max_w + 8, 24),
-                            lambda app: app.pick_target(row.obj, g.key), mouse)
+                            row_callback(row), mouse, path=path)
             return self._label_value(surface, x, y, max_w, g.label, format_value(row.value, g.unit),
                                      label, body, INSPECTOR_VALUE)
         if isinstance(row, Gap):
@@ -3299,14 +3517,14 @@ class InspectorPanel:
         if isinstance(row, Field):
             lines = wrap_text(str(row.value), body, max_w)
             h = 22 + 24 * len(lines)
-            self._clickable(surface, pygame.Rect(x - 4, y - 2, max_w + 8, h + 2), row.on_click, mouse)
+            self._clickable(surface, pygame.Rect(x - 4, y - 2, max_w + 8, h + 2), row.on_click, mouse, path=path)
             surface.blit(label.render(row.label, True, INSPECTOR_LABEL), (x, y))
             for i, line in enumerate(lines):
                 surface.blit(body.render(line, True, row.color or INSPECTOR_VALUE), (x, y + 22 + 24 * i))
             return y + h + 6
         if isinstance(row, Row):
             indent = 14 if row.sub else 0
-            self._clickable(surface, pygame.Rect(x - 4, y - 2, max_w + 8, 24), row.on_click, mouse)
+            self._clickable(surface, pygame.Rect(x - 4, y - 2, max_w + 8, 24), row.on_click, mouse, path=path)
             return self._label_value(surface, x + indent, y, max_w - indent, row.label, row.value,
                                      get_font(18) if row.sub else label, body, row.color or INSPECTOR_VALUE)
         if isinstance(row, Stepper):
@@ -3326,12 +3544,12 @@ class InspectorPanel:
                 pygame.draw.polygon(surface, INSPECTOR_TITLE if enabled else (120, 120, 130), points)
             surface.blit(text, text.get_rect(midleft=(down.right + 8, cy)))
             if row.down_enabled:
-                self._hot.append((down, row.on_down))
+                self._hot.append((down, row.on_down, False, path + ("down",)))
             if row.up_enabled:
-                self._hot.append((up, row.on_up))
+                self._hot.append((up, row.on_up, False, path + ("up",)))
             return y + 28
         if isinstance(row, ScrollList):
-            return self._draw_list(surface, row, x, y, max_w, mouse)
+            return self._draw_list(surface, row, x, y, max_w, mouse, path)
         raise TypeError(f"not an inspector row: {row!r}")
 
     @staticmethod
@@ -3355,7 +3573,8 @@ class InspectorPanel:
         folded = self._collapsed.get(key, section.collapsed)
         y += 4
         head = pygame.Rect(x - 4, y, max_w + 8, 24)
-        self._clickable(surface, head, lambda app: self._collapsed.__setitem__(key, not folded), mouse)
+        self._clickable(surface, head, lambda app: self._collapsed.__setitem__(key, not folded), mouse,
+                        view=True)
         font = get_font(17)
         ts = font.render(section.title.upper(), True, INSPECTOR_SECTION)
         surface.blit(ts, ts.get_rect(midleft=(x, head.centery)))
@@ -3371,7 +3590,7 @@ class InspectorPanel:
         pygame.draw.line(surface, INSPECTOR_DIVIDER, (x - INSPECTOR_PAD + 2, y), (x + max_w + INSPECTOR_PAD, y))
         return y + 2
 
-    def _draw_port(self, surface, row, x, y, max_w, mouse):
+    def _draw_port(self, surface, row, x, y, max_w, mouse, path):
         """One input: its name, then "link" (and its value set by hand) while
         unlinked, or "source · give  x" (green) and the live value under it."""
         obj, take = row.obj, row.take
@@ -3381,7 +3600,8 @@ class InspectorPanel:
         line = pygame.Rect(x - 4, y - 2, max_w + 8, 24)
         name = body.render(clip_text(take.label, body, max_w * 0.45), True, INSPECTOR_VALUE)
         if take.on_label is not None:
-            self._clickable(surface, pygame.Rect(x - 4, y - 2, name.get_width() + 8, 24), take.on_label, mouse)
+            self._clickable(surface, pygame.Rect(x - 4, y - 2, name.get_width() + 8, 24), take.on_label, mouse,
+                            path=path + ("on_label",))
         surface.blit(name, (x, y))
         right = x + max_w
         verb = small.render(take.verb or VERBS[take.kind], True, INSPECTOR_LABEL)
@@ -3390,7 +3610,7 @@ class InspectorPanel:
             word = small.render("link", True, INSPECTOR_ACCENT)
             pill = pygame.Rect(0, 0, word.get_width() + 18, 22)
             pill.midright = (right, line.centery)
-            self._clickable(surface, pill, lambda app: obj.pick(app, take.key), mouse)
+            self._clickable(surface, pill, row_callback(row, "pick"), mouse, path=path + ("pick",))
             pygame.draw.rect(surface, INSPECTOR_ACCENT, pill, width=1, border_radius=11)
             surface.blit(word, word.get_rect(center=pill.center))
             if take.current is not None:
@@ -3399,7 +3619,8 @@ class InspectorPanel:
                 room = pill.x - 10 - (x + name.get_width() + 10)
                 vs = body.render(clip_text(text, body, max(10, room)), True, INSPECTOR_VALUE)
                 vr = vs.get_rect(midright=(pill.x - 10, line.centery))
-                self._clickable(surface, vr.inflate(10, 4), take.set_by_hand, mouse)
+                self._clickable(surface, vr.inflate(10, 4), take.set_by_hand, mouse,
+                                path=path + ("set_by_hand",))
                 surface.blit(vs, vr)
             y += 26
             if link.get("id"):                       # it was linked to something that's gone
@@ -3410,7 +3631,7 @@ class InspectorPanel:
 
         xr = pygame.Rect(0, 0, 22, 22)                 # ✕: unlink
         xr.midright = (right + 3, line.centery)
-        self._clickable(surface, xr, lambda app: obj.unlink(take.key, app), mouse)
+        self._clickable(surface, xr, row_callback(row, "unlink"), mouse, path=path + ("unlink",))
         c = xr.center
         for dx in (-4, 4):
             pygame.draw.line(surface, INSPECTOR_LABEL, (c[0] - dx, c[1] - 4), (c[0] + dx, c[1] + 4), 2)
@@ -3420,8 +3641,9 @@ class InspectorPanel:
                           True, LINK_COLOR)
         kr = ks.get_rect(midright=(xr.x - 6, line.centery))
         nr = ns.get_rect(midright=(kr.x, line.centery))
-        self._clickable(surface, nr.inflate(6, 4), lambda app: obj.pick(app, take.key), mouse)
-        self._clickable(surface, kr.inflate(6, 4), lambda app: app.choose_give(obj, take.key, src), mouse)
+        self._clickable(surface, nr.inflate(6, 4), row_callback(row, "pick"), mouse, path=path + ("pick",))
+        self._clickable(surface, kr.inflate(6, 4), row_callback(row, "choose_give"), mouse,
+                        path=path + ("choose_give",))
         surface.blit(ns, nr)
         surface.blit(ks, kr)
         if line.collidepoint(mouse):
@@ -3437,7 +3659,7 @@ class InspectorPanel:
         surface.blit(vs, (right - vs.get_width(), y + 1))
         return y + 24
 
-    def _draw_list(self, surface, lst, x, y, max_w, mouse):
+    def _draw_list(self, surface, lst, x, y, max_w, mouse, path):
         """A titled list, up to SCROLL_LIST_ROWS rows tall; the wheel scrolls it."""
         font = get_font(20)
         surface.blit(font.render(lst.title, True, INSPECTOR_LABEL), (x, y))
@@ -3459,7 +3681,7 @@ class InspectorPanel:
         for i, (name, value, on_click) in enumerate(lst.items[self._list_scroll:self._list_scroll + visible]):
             ry = area.y + i * row_h
             self._clickable(surface, pygame.Rect(area.x - 4, ry - 1, area.width + 8, row_h),
-                            on_click, mouse)
+                            on_click, mouse, path=path + ("item", self._list_scroll + i))
             val = font.render(str(value), True, INSPECTOR_VALUE)
             name_w = area.width - val.get_width() - 12
             surface.blit(font.render(clip_text(str(name), font, name_w), True, INSPECTOR_LABEL), (x, ry))
@@ -3497,14 +3719,18 @@ class PlaceMode:
     def __init__(self):
         self.factory = None      # factory(x, y) -> a new object at a world point
         self.obj = None          # the one in hand (not in the scene yet)
+        self.on_place = None     # see begin
         self._layer = None
 
     @property
     def active(self):
         return self.obj is not None
 
-    def begin(self, factory, world):
+    def begin(self, factory, world, on_place=None):
+        """on_place(world point, keep_going): instead of adding the object here,
+        hand the drop to someone else (a player window sends it to the world)."""
         self.factory = factory
+        self.on_place = on_place
         self.obj = factory(*world)
         self.follow(world)
 
@@ -3516,8 +3742,17 @@ class PlaceMode:
         c = self.obj.center
         self.obj.move(world[0] - c[0], world[1] - c[1])
 
-    def place(self, world, scene, keep_going=False):
+    def place(self, world, player, keep_going=False):
         self.follow(world)
+        if self.on_place is not None:
+            on_place, obj = self.on_place, self.obj
+            if keep_going:
+                self.obj = self.factory(*world)
+            else:
+                self.cancel()
+            on_place(world, keep_going)
+            return obj
+        scene = player.scene
         obj = self.obj
         placed = obj.members if isinstance(obj, MachineGroup) else [obj]   # a machine drops all of its objects
         scene.add_many(placed)
@@ -3525,7 +3760,7 @@ class PlaceMode:
             self.obj = self.factory(*world)
         else:
             self.cancel()
-            scene.select_many(placed)
+            player.select_many(placed)
         return obj
 
     def draw(self, surface, camera):
@@ -3850,12 +4085,12 @@ class MarqueeSelect:
         if (pygame.Vector2(screen_pos) - self.start_screen).length() >= MARQUEE_MIN_PX:
             self.dragged = True
 
-    def finish(self, scene):
+    def finish(self, player):
         """End the drag; select what's inside if it was a real drag."""
         if self.active and self.dragged:
             x, y = min(self.start.x, self.current.x), min(self.start.y, self.current.y)
             w, h = abs(self.current.x - self.start.x), abs(self.current.y - self.start.y)
-            scene.select_many(scene.objects_in_box(x, y, w, h))
+            player.select_many(player.scene.objects_in_box(x, y, w, h))
         self.__init__()
 
     def draw(self, surface, camera):
@@ -4083,15 +4318,16 @@ class InventoryPanel:
 # APP — the handle every object hook, inspector callback and action receives
 # ============================================================================
 class App:
-    """What object code gets handed (as `app`): the scene, camera and screen
-    size, plus the ways an object can reach the UI — ask for text, confirm,
+    """What object code gets handed (as `app`): the world (scene), this
+    window's player (camera, selection) and screen size, plus the ways an object can reach the UI — ask for text, confirm,
     place a new object, start a build mode, save. The game loop owns one and
     shows/clears `modal`. Also the context ACTIONS run with (.scene, .camera,
     .screen_size)."""
 
-    def __init__(self, scene, screen_size):
-        self.scene = scene
-        self.camera = scene.camera
+    def __init__(self, player, screen_size):
+        self.player = player                # this window's view: camera, selection
+        self.scene = player.scene           # the world
+        self.camera = player.camera
         self.screen_size = screen_size      # the loop keeps this current
         self.modal = None                   # the open dialog / E menu, or None
         self.train_builder = TrainBuilder()
@@ -4132,7 +4368,7 @@ class App:
         """Pick up a new object to drop with the mouse; factory(x, y) builds one
         at a world point. (The default for CanvasObject.create.)"""
         self.cancel_modes()
-        self.scene.select_only(None)
+        self.player.select_only(None)
         self.placer.begin(factory, self.camera.screen_to_world(pygame.mouse.get_pos()))
 
     def center_world(self):
@@ -4143,7 +4379,7 @@ class App:
     def place(self, obj):
         """Add a new object to the scene (saved) and select it."""
         self.scene.add(obj)
-        self.scene.select_only(obj)
+        self.player.select_only(obj)
 
     def save(self):
         self.scene.save()
@@ -4255,6 +4491,65 @@ class App:
         items.append((label, lambda: self.delete_objects(objs), "danger"))
         return items
 
+    # --- What the loop does to the world --------------------------------------------
+    # One method per kind of change, so the game loop is the same whether this
+    # window owns the world or is in one: JoinedApp (below) sends each of these
+    # to the world instead, which runs them with its own App for this player.
+    def click(self, obj, pos):
+        """A left-click on obj (not Ctrl): True if obj handled it (then it gets
+        drag / release until the button comes up)."""
+        return obj.on_click(pos, self)
+
+    def drag(self, obj, pos):
+        obj.on_drag(pos, self)
+
+    def release(self, obj, pos):
+        obj.on_release(pos, self)
+
+    def panel_click(self, obj, hot):
+        """A click on a panel spot: hot = (callback, view, path) from hot_at."""
+        hot[0](self)
+
+    def selection_menu(self, objs, pos):
+        """The right-click menu for several objects."""
+        self.context_menu(pos, self.selection_menu_items(objs))
+
+    def move_objects(self, objs, dx, dy):
+        """Arrow keys: shift objects by a world delta (each frame they're held)."""
+        for o in objs:
+            o.move(dx, dy)
+
+    def moved(self):
+        """The arrow keys were let go: a settle point, so save."""
+        self.save()
+
+    def add(self, objs):
+        """Add new objects made here (a train or wall just drawn)."""
+        self.scene.add_many(objs)
+
+    def menu_command(self, command):
+        """A menu bar command (Add ▸ type, Objects, Edit Name / Copy / Delete, Go To)
+        for this player's selection."""
+        sel = self.player.selected
+        if command.startswith("add:"):              # Add ▸ <type>: the type decides how
+            OBJECT_TYPES[command[4:]].create(self)
+        elif command == "inventory":
+            self.open_inventory()
+        elif command == "edit_name":
+            if sel is not None and getattr(sel, "text", None) is not None:   # things with a name
+                def rename(text, obj=sel):
+                    if text.strip():
+                        obj.text = text.strip()
+                        self.save()
+                self.ask("Edit text:", rename, value=sel.text)
+        elif command == "copy":
+            if sel is not None:
+                self.copy(sel)                      # nothing for trains (not copyable)
+        elif command == "delete_node":
+            self.delete_objects(self.player.selection)    # works for any object (incl. trains)
+        elif command == "goto":
+            self.go_to(sel)
+
     def align(self, objs, axis):
         """Line up the movable objects' centers on one axis (0: same X, so they
         stand in a column; 1: same Y, a row), at their average. The other axis
@@ -4321,3 +4616,808 @@ class App:
             self.confirm(f"Delete machine '{machine['name']}'?",
                          "The saved machine only — objects already placed stay.", gone)
         self.context_menu(pos, [("Rename…", rename, None), (f"Delete '{machine['name']}'", delete, "danger")])
+
+
+# ============================================================================
+# HOME SCREEN — what a canvas window opens to: join the world (it runs on its
+# own, in world_server.py), launch it, or work on your own (Nodes.json
+# directly, the way the canvas always worked — only while no world is running).
+# Drawn in the app's own look: a drifting dot-grid canvas with faint linked
+# shapes, and the logo — a little node graph — drawn live with flowing wires.
+# ============================================================================
+APP_NAME = "Canvas Lab"
+HOME_TAGLINE = "A living canvas for the lab — build it, wire it, share it."
+HOME_DIM = (140, 140, 155)
+HOME_OK = (90, 220, 120)
+HOME_WARN = (240, 190, 90)
+HOME_TEXT = (238, 238, 244)
+HOME_TITLE_FONT = "Bahnschrift"     # system font (falls back to the default if missing)
+# The logo's four shapes, in four of the player colors (blue, amber, green, pink).
+LOGO_COLORS = [(80, 170, 255), (240, 200, 70), (110, 220, 120), (255, 110, 190)]
+HOME_GRID = 34                      # dot-grid spacing, px
+HOME_DRIFT = (14.0, 6.0)            # how the background canvas drifts, px/s
+
+
+def _lerp_color(a, b, t):
+    return tuple(int(x + (y - x) * t) for x, y in zip(a, b))
+
+
+def draw_logo(surface, center, size, t, *, glow=True):
+    """The Canvas Lab logo, drawn live: a square, a diamond, a square and a ring
+    joined by right-angle links (D → C → B → A), each shape in its own color,
+    with dots flowing along the links like the canvas's wires."""
+    cx, cy = center
+    s = size
+
+    def P(u, v):
+        return pygame.Vector2(cx + (u - 0.5) * s, cy + (v - 0.5) * s)
+
+    stroke = max(2, round(s * 0.065))
+    a, b, c, d = P(0.25, 0.25), P(0.75, 0.25), P(0.75, 0.74), P(0.25, 0.74)
+    path = [d, c, b, a]                                   # the way the value flows
+    key = (round(s), "logo")
+    layer = _LOGO_CACHE.get(key)
+    if layer is None:
+        layer = _render_logo_shapes(s, stroke)
+        _LOGO_CACHE.clear()
+        _LOGO_CACHE[key] = layer
+    shapes, halo = layer
+    # links: a dim line, then flowing dots (drawn under the shapes, which hide the ends)
+    for p, q in zip(path, path[1:]):
+        pygame.draw.line(surface, (70, 74, 92), p, q, max(2, stroke // 2))
+    total = sum((q - p).length() for p, q in zip(path, path[1:]))
+    dots = 7
+    for k in range(dots):
+        f = ((t * 0.18 + k / dots) % 1.0) * total
+        for i, (p, q) in enumerate(zip(path, path[1:])):
+            seg = (q - p).length()
+            if f <= seg:
+                color = _lerp_color(LOGO_COLORS[[3, 2, 1][i]], LOGO_COLORS[[2, 1, 0][i]], f / max(1, seg))
+                pygame.draw.circle(surface, color, p.lerp(q, f / max(1, seg)), max(2, stroke * 0.42))
+                break
+            f -= seg
+    top_left = (cx - s / 2, cy - s / 2)
+    if glow:
+        surface.blit(halo, (top_left[0] - s * 0.25, top_left[1] - s * 0.25), special_flags=pygame.BLEND_RGB_ADD)
+    surface.blit(shapes, top_left)
+
+
+_LOGO_CACHE = {}
+
+
+def _render_logo_shapes(s, stroke):
+    """(shapes, halo): the logo's four shapes on a clear layer, and a blurred,
+    larger copy to add on as a glow."""
+    size = max(8, round(s))
+    shapes = pygame.Surface((size, size), pygame.SRCALPHA)
+
+    def P(u, v):
+        return pygame.Vector2(u * size, v * size)
+    fill = (16, 16, 22)
+    # A: square (blue)
+    half = size * 0.115
+    for center, color in ((P(0.25, 0.25), LOGO_COLORS[0]), (P(0.75, 0.74), LOGO_COLORS[2])):
+        r = pygame.Rect(0, 0, round(half * 2), round(half * 2))
+        r.center = center
+        pygame.draw.rect(shapes, fill, r, border_radius=max(1, stroke // 2))
+        pygame.draw.rect(shapes, color, r, width=stroke, border_radius=max(1, stroke // 2))
+    # B: diamond (amber)
+    bc, rad = P(0.75, 0.25), size * 0.155
+    diamond = [bc + (0, -rad), bc + (rad, 0), bc + (0, rad), bc + (-rad, 0)]
+    pygame.draw.polygon(shapes, fill, diamond)
+    pygame.draw.polygon(shapes, LOGO_COLORS[1], diamond, stroke)
+    # D: ring (pink)
+    dc = P(0.25, 0.74)
+    pygame.draw.circle(shapes, fill, dc, size * 0.115)
+    pygame.draw.circle(shapes, LOGO_COLORS[3], dc, size * 0.115, stroke)
+    # the glow: the shapes, blurred (scaled way down and back up), on a wider layer
+    pad = round(size * 0.25)
+    wide = pygame.Surface((size + 2 * pad, size + 2 * pad), pygame.SRCALPHA)
+    wide.blit(shapes, (pad, pad))
+    small = pygame.transform.smoothscale(wide, (max(1, wide.get_width() // 10), max(1, wide.get_height() // 10)))
+    halo = pygame.transform.smoothscale(small, wide.get_size())
+    halo.fill((150, 150, 150, 255), special_flags=pygame.BLEND_RGBA_MULT)   # softer
+    return shapes, halo
+
+
+class HomeBackdrop:
+    """The home screen's background: a dark gradient, a drifting dot grid,
+    faint shapes linked by flowing wires (the canvas, idling), and a vignette.
+    The parts that only depend on the window size are drawn once per size."""
+
+    SHAPES = 16
+
+    def __init__(self):
+        rng = random.Random(7)
+        self.nodes = [{"u": rng.random(), "v": rng.random(), "kind": rng.choice(("square", "diamond", "ring", "tile")),
+                       "color": rng.choice(LOGO_COLORS), "size": rng.uniform(16, 34),
+                       "speed": rng.uniform(0.6, 1.3)} for _ in range(self.SHAPES)]
+        self.links = [(i, j) for i in range(self.SHAPES) for j in range(i + 1, self.SHAPES)
+                      if rng.random() < 0.13]
+        self._size = None
+
+    def _build(self, size):
+        w, h = size
+        self._size = size
+        top, bottom = (17, 17, 23), (26, 23, 36)
+        self.base = pygame.Surface(size)
+        for y in range(h):
+            pygame.draw.line(self.base, _lerp_color(top, bottom, y / max(1, h - 1)), (0, y), (w, y))
+        g = HOME_GRID
+        self.grid = pygame.Surface((w + g, h + g), pygame.SRCALPHA)
+        for gx in range(0, w + g, g):
+            for gy in range(0, h + g, g):
+                pygame.draw.circle(self.grid, (54, 54, 70, 255), (gx, gy), 1)
+        self.vignette = pygame.Surface(size, pygame.SRCALPHA)
+        try:
+            import numpy as np
+            yy, xx = np.mgrid[0:h, 0:w]
+            r = np.hypot((xx - w / 2) / (w / 2), (yy - h / 2) / (h / 2))
+            alpha = np.clip((r - 0.55) * 230, 0, 190).astype(np.uint8)
+            self.vignette.fill((6, 6, 10, 0))
+            pygame.surfarray.pixels_alpha(self.vignette)[:] = alpha.T
+        except Exception:
+            pass
+
+    def draw(self, surface, t, clear=()):
+        """clear: screen rects (the logo, the panel) the drifting shapes keep out of."""
+        size = surface.get_size()
+        if size != self._size:
+            self._build(size)
+        w, h = size
+        surface.blit(self.base, (0, 0))
+        g = HOME_GRID
+        ox, oy = (t * HOME_DRIFT[0]) % g, (t * HOME_DRIFT[1]) % g
+        surface.blit(self.grid, (ox - g, oy - g))
+        # the idle canvas: shapes drifting with the grid (a little parallax each), wrapping around
+        span_w, span_h = w + 300, h + 300
+        pos = []
+        for n in self.nodes:
+            x = (n["u"] * span_w + t * HOME_DRIFT[0] * n["speed"]) % span_w - 150
+            y = (n["v"] * span_h + t * HOME_DRIFT[1] * n["speed"]) % span_h - 150
+            pos.append(pygame.Vector2(x, y))
+        zones = [pygame.Rect(r).inflate(60, 60) for r in clear]
+        hidden = [any(z.collidepoint(p) for z in zones) for p in pos]
+        for i, j in self.links:
+            p, q = pos[i], pos[j]
+            if abs(p.x - q.x) > 520 or abs(p.y - q.y) > 360:
+                continue                                    # one of them just wrapped: no stretched wire
+            corner = pygame.Vector2(q.x, p.y)
+            if hidden[i] or hidden[j] or any(z.clipline(p, corner) or z.clipline(corner, q) for z in zones):
+                continue                                    # keep wires out from behind the logo / panel
+            for a, b in ((p, corner), (corner, q)):
+                pygame.draw.line(surface, (40, 41, 54), a, b, 2)
+            color = _lerp_color((26, 24, 34), self.nodes[i]["color"], 0.55)
+            total = (corner - p).length() + (q - corner).length()
+            for k in range(max(1, int(total / 70))):
+                f = ((t * 0.12 * self.nodes[i]["speed"] + k / max(1, int(total / 70))) % 1.0) * total
+                seg = (corner - p).length()
+                spot = p.lerp(corner, f / seg) if f <= seg and seg > 0 else corner.lerp(q, (f - seg) / max(1, total - seg))
+                pygame.draw.circle(surface, color, spot, 2)
+        for n, p, hide in zip(self.nodes, pos, hidden):
+            if hide:
+                continue
+            color = _lerp_color((26, 24, 34), n["color"], 0.32)
+            s = n["size"]
+            if n["kind"] == "square":
+                r = pygame.Rect(0, 0, s, s)
+                r.center = p
+                pygame.draw.rect(surface, color, r, width=2, border_radius=3)
+            elif n["kind"] == "tile":
+                r = pygame.Rect(0, 0, s * 2.2, s * 1.2)
+                r.center = p
+                pygame.draw.rect(surface, (24, 24, 32), r, border_radius=6)
+                pygame.draw.rect(surface, color, r, width=2, border_radius=6)
+            elif n["kind"] == "diamond":
+                d = s * 0.7
+                pygame.draw.polygon(surface, color, [p + (0, -d), p + (d, 0), p + (0, d), p + (-d, 0)], 2)
+            else:
+                pygame.draw.circle(surface, color, p, s * 0.55, 2)
+        surface.blit(self.vignette, (0, 0))
+
+
+class HomeScreen:
+    """run() shows it until you choose; it returns ("join", link, welcome),
+    ("solo", name) or ("quit",). It checks every half second whether a world
+    is running (and whether a window is already working on its own)."""
+
+    def __init__(self, message=""):
+        self.name = load_players()["name"] or world_link.default_name()
+        self.message = message      # e.g. "The world stopped."
+        self.status = None          # the running world's status, or None
+        self.solo = False           # a canvas window is working on its own right now
+        self.checked = False        # has the first check come back?
+        self.starting_until = 0.0   # after Launch world: wait for it until then (monotonic)
+        self.modal = None
+        self.backdrop = HomeBackdrop()
+        self._t0 = time.monotonic()
+        self._buttons = []          # (rect, action) from the last draw
+        self._stop = False
+        threading.Thread(target=self._poll, daemon=True, name="home-poll").start()
+
+    def _poll(self):
+        while not self._stop:
+            status = world_link.world_status()
+            self.solo = status is None and world_link.solo_running()
+            self.status, self.checked = status, True
+            time.sleep(0.5)
+
+    # --- Choices -------------------------------------------------------------------
+    def join(self):
+        self._draw_wait("Joining the world…")
+        link = world_link.WorldLink(self.name)
+        try:
+            welcome = link.connect()
+        except (OSError, ValueError) as e:
+            self.message = f"Couldn't join: {e}"
+            return None
+        return ("join", link, welcome)
+
+    def launch(self):
+        world_link.launch_world()
+        self.starting_until = time.monotonic() + 20
+        self.message = ""
+        return None
+
+    def work_alone(self):
+        return ("solo", self.name)
+
+    def rename(self):
+        def submit(text):
+            if text.strip():
+                self.name = text.strip()[:40]
+                players = load_players()
+                players["name"] = self.name
+                save_players(players)
+        self.modal = TextInputModal("Your name (what other players see):", submit, value=self.name)
+
+    def primary(self):
+        """What Enter does: the green button."""
+        if self.status is not None:
+            return self.join()
+        if self.checked and not self.solo and not self.starting_until:
+            return self.launch()
+        return None
+
+    # --- Loop ------------------------------------------------------------------------
+    def run(self):
+        clock = pygame.time.Clock()
+        try:
+            while True:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        return ("quit",)
+                    if event.type == pygame.VIDEORESIZE:
+                        pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
+                        continue
+                    if self.modal is not None:
+                        result = self.modal.handle_event(event, pygame.display.get_surface().get_size())
+                        if result in ("submit", "cancel"):
+                            modal, self.modal = self.modal, None
+                            if result == "submit":
+                                modal.commit()
+                        continue
+                    choice = None
+                    if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                        hit = next((act for rect, act in self._buttons if rect.collidepoint(event.pos)), None)
+                        choice = hit() if hit is not None else None
+                    elif event.type == pygame.KEYDOWN and event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        choice = self.primary()
+                    if choice is not None:
+                        return choice
+                if self.starting_until:
+                    if self.status is not None:             # it's up: go straight in
+                        self.starting_until = 0.0
+                        choice = self.join()
+                        if choice is not None:
+                            return choice
+                    elif time.monotonic() > self.starting_until:
+                        self.starting_until = 0.0
+                        self.message = "The world didn't start — see errors.log."
+                self.draw(pygame.display.get_surface())
+                pygame.display.flip()
+                clock.tick(60)
+        finally:
+            self._stop = True
+
+    # --- Drawing ------------------------------------------------------------------------
+    @property
+    def t(self):
+        return time.monotonic() - self._t0
+
+    def _draw_wait(self, text):
+        surface = pygame.display.get_surface()
+        self.backdrop.draw(surface, self.t)
+        c = pygame.Vector2(surface.get_rect().center)
+        draw_logo(surface, c - (0, 40), 110, self.t)
+        ts = get_font(26).render(text, True, HOME_TEXT)
+        surface.blit(ts, ts.get_rect(center=(c.x, c.y + 50)))
+        pygame.display.flip()
+
+    @staticmethod
+    def _panel(surface, rect, edge=None, alpha=215):
+        """A glassy dark panel; `edge` = a colored strip down its left side."""
+        layer = pygame.Surface(rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(layer, (28, 28, 38, alpha), layer.get_rect(), border_radius=14)
+        pygame.draw.rect(layer, (70, 70, 92, 255), layer.get_rect(), width=1, border_radius=14)
+        surface.blit(layer, rect.topleft)
+        if edge is not None:
+            strip = pygame.Rect(rect.x + 1, rect.y + 12, 4, rect.height - 24)
+            pygame.draw.rect(surface, edge, strip, border_radius=2)
+
+    def _button(self, surface, rect, label, action, *, primary=False, enabled=True, hint=None):
+        hover = enabled and rect.collidepoint(pygame.mouse.get_pos())
+        if primary:
+            if enabled:
+                top, bottom = ((96, 205, 128), (52, 150, 86)) if hover else ((80, 186, 112), (44, 130, 74))
+                if hover:                                   # a soft glow around it
+                    glow = pygame.Surface(rect.inflate(24, 24).size, pygame.SRCALPHA)
+                    pygame.draw.rect(glow, (90, 220, 120, 40), glow.get_rect(), border_radius=18)
+                    surface.blit(glow, rect.inflate(24, 24).topleft)
+            else:
+                top, bottom = (54, 56, 64), (44, 46, 54)
+            fill = pygame.Surface(rect.size, pygame.SRCALPHA)
+            for y in range(rect.height):
+                pygame.draw.line(fill, _lerp_color(top, bottom, y / max(1, rect.height - 1)), (0, y), (rect.width, y))
+            mask = pygame.Surface(rect.size, pygame.SRCALPHA)
+            pygame.draw.rect(mask, (255, 255, 255, 255), mask.get_rect(), border_radius=12)
+            fill.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+            surface.blit(fill, rect.topleft)
+            ink = (14, 30, 20) if enabled else (120, 122, 132)
+            font = get_font(26, HOME_TITLE_FONT, bold=True)
+        else:
+            glass = pygame.Surface(rect.size, pygame.SRCALPHA)
+            pygame.draw.rect(glass, (52, 52, 68, 235) if hover else (28, 28, 38, 225), glass.get_rect(), border_radius=12)
+            surface.blit(glass, rect.topleft)
+            pygame.draw.rect(surface, (100, 100, 124) if enabled else (58, 58, 70), rect, width=2, border_radius=12)
+            ink = HOME_TEXT if enabled else (100, 100, 112)
+            font = get_font(23, HOME_TITLE_FONT)
+        ts = font.render(label, True, ink)
+        surface.blit(ts, ts.get_rect(center=rect.center))
+        if hint and enabled:                                # a little key cap: "Enter"
+            hs = get_font(15, bold=True).render(hint, True, (14, 30, 20))
+            cap = pygame.Rect(0, 0, hs.get_width() + 12, hs.get_height() + 4)
+            cap.midright = (rect.right - 12, rect.centery)
+            pygame.draw.rect(surface, (150, 230, 170), cap, border_radius=5)
+            surface.blit(hs, hs.get_rect(center=cap.center))
+        if enabled and action is not None:
+            self._buttons.append((rect, action))
+
+    @staticmethod
+    def _text(surface, text, pos, size=20, color=HOME_DIM, bold=False, width=420, font_name=None):
+        """Wrapped text at pos; returns the y below it."""
+        font = get_font(size, font_name, bold=bold)
+        x, y = pos
+        for line in wrap_text(text, font, width, max_lines=4):
+            ts = font.render(line, True, color)
+            surface.blit(ts, (x, y))
+            y += ts.get_height() + 2
+        return y
+
+    def _hero(self, surface, x, y, logo_size, title_size, width):
+        """Logo, "Canvas Lab", tagline at (x, y). Returns the y below it."""
+        t = self.t
+        bob = math.sin(t * 1.4) * 2
+        draw_logo(surface, (x + logo_size / 2, y + logo_size / 2 + bob), logo_size, t)
+        tx = x + logo_size + 18
+        big = get_font(title_size, HOME_TITLE_FONT, bold=True)
+        a = big.render("Canvas", True, HOME_TEXT)
+        b = big.render(" Lab", True, HOME_OK)
+        ty = y + logo_size / 2 - a.get_height() / 2 - 8
+        surface.blit(a, (tx, ty))
+        surface.blit(b, (tx + a.get_width(), ty))
+        self._text(surface, HOME_TAGLINE, (tx + 2, ty + a.get_height() + 2), 18, HOME_DIM,
+                   width=max(160, width - logo_size - 20))
+        return y + logo_size
+
+    def _status_card(self, surface, rect):
+        t = self.t
+        x, y = rect.x + 22, rect.y + 16
+        caps = get_font(15, bold=True).render("THE WORLD", True, (120, 120, 140))
+        if self.status is not None:
+            edge, title, color = HOME_OK, "Running", HOME_OK
+            names = [p if isinstance(p, str) else p.get("name", "?") for p in self.status.get("players", [])]
+            detail = ((f"In it: {', '.join(names)}" if names else "Nobody's in it yet")
+                      + f"  ·  {self.status.get('objects', 0)} objects")
+        elif self.starting_until:
+            edge, title, color = HOME_WARN, "Starting…", HOME_WARN
+            detail = "It opens a small window of its own."
+        elif not self.checked:
+            edge, title, color = (110, 110, 125), "Looking for it…", HOME_DIM
+            detail = ""
+        else:
+            edge, title, color = (110, 110, 125), "Not running", (205, 205, 215)
+            detail = "Launch it and it keeps running on its own until you stop it — closing this window won't."
+        self._panel(surface, rect, edge)
+        surface.blit(caps, (x, y))
+        y += caps.get_height() + 6
+        dot = pygame.Vector2(x + 7, y + 14)
+        if self.status is not None:                          # a ring pulsing out of the dot
+            phase = (t * 0.8) % 1.0
+            ring = pygame.Surface((60, 60), pygame.SRCALPHA)
+            pygame.draw.circle(ring, (*HOME_OK, int(150 * (1 - phase))), (30, 30), 6 + 16 * phase, 2)
+            surface.blit(ring, (dot.x - 30, dot.y - 30))
+            pygame.draw.circle(surface, HOME_OK, dot, 6)
+        elif self.starting_until:
+            pygame.draw.circle(surface, HOME_WARN, dot, 6 if int(t * 3) % 2 else 4)
+        else:
+            pygame.draw.circle(surface, color, dot, 6, width=2)
+        y = self._text(surface, title, (x + 22, y), 26, color, bold=True, font_name=HOME_TITLE_FONT)
+        if detail:
+            self._text(surface, detail, (x, y + 4), 18, HOME_DIM, width=rect.width - 44)
+
+    def draw(self, surface):
+        self._buttons = []
+        t = self.t
+        w, h = surface.get_size()
+        wide = w >= 980 and h >= 520
+        col_w = min(440, w - 48)
+        if wide:                                            # logo + title on the left, the panel on the right
+            left_w = min(540, w - col_w - 130)
+            gap = 60
+            hx = (w - (left_w + gap + col_w)) // 2
+            logo, title, hy = 176, 66, h // 2 - 128
+            px, py = hx + left_w + gap, max(30, h // 2 - 200)
+        else:                                               # stacked: a smaller header, then the panel
+            hx = px = (w - col_w) // 2
+            logo, title, hy = 84, 44, max(16, h // 2 - 250)
+            left_w = col_w
+            py = hy + logo + 18
+        self.backdrop.draw(surface, t, clear=[(hx, hy, logo, logo), (px, py, col_w, 380)])
+        self._hero(surface, hx, hy, logo, title, left_w)
+
+        card = pygame.Rect(px, py, col_w, 118)
+        self._status_card(surface, card)
+        y = card.bottom + 16
+        big = pygame.Rect(px, y, col_w, 56)
+        if self.status is not None:
+            self._button(surface, big, "Join world", self.join, primary=True, hint="Enter")
+        elif self.starting_until:
+            self._button(surface, big, "Starting…", None, primary=True, enabled=False)
+        else:
+            self._button(surface, big, "Launch world", self.launch, primary=True,
+                         enabled=self.checked and not self.solo, hint="Enter")
+        y = big.bottom + 12
+        alone_ok = self.checked and self.status is None and not self.solo and not self.starting_until
+        small = pygame.Rect(px, y, col_w, 46)
+        self._button(surface, small, "Work on my own", self.work_alone, enabled=alone_ok)
+        y = small.bottom + 8
+        if self.solo:
+            note = "A canvas window is already working on its own. Close it to launch the world."
+        elif self.status is not None:
+            note = "Working on your own isn't possible while the world is running — join it instead."
+        else:
+            note = "On your own: the canvas as it always was — no world running, nobody can join."
+        y = self._text(surface, note, (px + 4, y), 16, (120, 120, 138), width=col_w - 8) + 14
+
+        # Who you'll be: a chip with your name
+        chip = pygame.Rect(px, y, col_w, 40)
+        self._panel(surface, chip, alpha=170)
+        lts = get_font(18).render("Playing as", True, HOME_DIM)
+        nts = get_font(21, bold=True).render(self.name, True, HOME_TEXT)
+        hover = chip.collidepoint(pygame.mouse.get_pos())
+        cts = get_font(18).render("change", True, (150, 195, 255) if hover else INSPECTOR_ACCENT)
+        surface.blit(lts, (chip.x + 16, chip.centery - lts.get_height() // 2))
+        nx = chip.x + 16 + lts.get_width() + 10
+        surface.blit(nts, (nx, chip.centery - nts.get_height() // 2))
+        surface.blit(cts, (chip.right - cts.get_width() - 16, chip.centery - cts.get_height() // 2))
+        self._buttons.append((chip, self.rename))
+        y = chip.bottom + 12
+
+        if self.message:
+            pygame.draw.circle(surface, HOME_WARN, (px + 8, y + 10), 4)
+            self._text(surface, self.message, (px + 20, y), 18, HOME_WARN, width=col_w - 24)
+        foot = get_font(15).render(f"{APP_NAME}  ·  worlds on this PC", True, (90, 90, 108))
+        surface.blit(foot, (w - foot.get_width() - 16, h - foot.get_height() - 10))
+        if self.modal is not None:
+            self.modal.draw(surface)
+
+
+def draw_world_roster(surface, you, players, top):
+    """The top-left list while in the world: "Connected to world", then everyone
+    in it — a dot in their color and their name, yours marked "you". players:
+    [{"name", "color"}]. Returns its rect."""
+    head, font, small = get_font(18, bold=True), get_font(20), get_font(17)
+    rows = [(p.get("name", "?"), tuple(p.get("color") or (200, 200, 210))) for p in players]
+    rows.sort(key=lambda r: r[0] != you)               # you first
+    width = max([head.size("Connected to world")[0] + 22]
+                + [font.size(n)[0] + 22 + (small.size("  you")[0] if n == you else 0) for n, _c in rows])
+    box = pygame.Rect(10, top, width + 20, 30 + 24 * len(rows))
+    overlay = pygame.Surface(box.size, pygame.SRCALPHA)
+    overlay.fill((16, 16, 20, 200))
+    surface.blit(overlay, box.topleft)
+    x, y = box.x + 10, box.y + 6
+    pygame.draw.circle(surface, HOME_OK, (x + 5, y + 10), 4)
+    surface.blit(head.render("Connected to world", True, HOME_OK), (x + 16, y))
+    y += 26
+    for name, color in rows:
+        pygame.draw.circle(surface, color, (x + 5, y + 11), 6)
+        ts = font.render(name, True, (235, 235, 240))
+        surface.blit(ts, (x + 18, y))
+        if name == you:
+            surface.blit(small.render("  you", True, HOME_DIM), (x + 18 + ts.get_width(), y + 2))
+        y += 24
+    return box
+
+
+# ============================================================================
+# IN THE WORLD — a player window's App. The world runs every change (with an
+# App of its own for this player, world_server.WorldApp), so object code runs
+# in one place only; this window sends what you did, and shows what the world
+# asks it to (a text box, a menu, a pick, something to place).
+# ============================================================================
+class GhostGroup:
+    """What a player window holds while placing something the world will make:
+    copies of the world's sample objects, moved and drawn together. Never added
+    here — the drop goes to the world, which makes the real ones."""
+
+    SINGLETON = False
+
+    def __init__(self, members, name):
+        self.members, self.name = members, name
+
+    @property
+    def center(self):
+        left, top, right, bottom = group_bounds(self.members)
+        return ((left + right) / 2, (top + bottom) / 2)
+
+    def move(self, dx, dy):
+        for o in self.members:
+            if o.movable:
+                o.move(dx, dy)
+
+    def draw(self, surface, camera):
+        for o in self.members:
+            try:
+                o.draw(surface, camera)
+            except Exception:
+                pass
+
+    def place_name(self):
+        return self.name
+
+
+class JoinedApp(App):
+    """App for a window in the world (`link`: its world_link.WorldLink). Looking
+    (camera, selection, hover, panels, wheel scrolling) stays here; every change
+    goes to the world, with this window's view (camera, screen size, mouse) so
+    object code there sees what you saw."""
+
+    def __init__(self, player, screen_size, link):
+        super().__init__(player, screen_size)
+        self.link = link
+        self.inventory.on_pick = self._picked_in_inventory
+
+    def view(self):
+        """This window as object code in the world needs it: camera, screen size,
+        mouse, and what's selected (so a command never acts on a stale selection)."""
+        cam = self.camera
+        return {"camera": [cam.offset.x, cam.offset.y, cam.zoom], "screen": list(self.screen_size),
+                "mouse": list(pygame.mouse.get_pos()), "selection": sorted(self.player.selected_ids)}
+
+    def send(self, message):
+        self.link.send(dict(message, view=self.view()))
+
+    # --- The changes (see App) — all sent to the world -------------------------------
+    def click(self, obj, pos):
+        reply = self.link.request(dict({"op": "click", "id": obj.id, "pos": list(pos)}, view=self.view()))
+        return bool(reply and reply.get("handled"))
+
+    def drag(self, obj, pos):
+        self.send({"op": "drag", "id": obj.id, "pos": list(pos)})
+
+    def release(self, obj, pos):
+        self.send({"op": "release", "id": obj.id, "pos": list(pos)})
+
+    def panel_click(self, obj, hot):
+        callback, view, path = hot
+        if view:
+            callback(self)                  # folding a section: just this window
+        elif path is not None:
+            self.send({"op": "panel", "id": obj.id, "path": list(path)})
+
+    def object_menu(self, obj, pos):
+        self.send({"op": "menu", "ids": [obj.id], "pos": list(pos)})
+
+    def selection_menu(self, objs, pos):
+        self.send({"op": "menu", "ids": [o.id for o in objs], "pos": list(pos)})
+
+    def move_objects(self, objs, dx, dy):
+        self.send({"op": "move", "ids": [o.id for o in objs], "dx": dx, "dy": dy})
+
+    def moved(self):
+        self.send({"op": "moved"})
+
+    def add(self, objs):
+        self.send({"op": "add", "objects": [o.to_dict() for o in objs]})
+
+    def place(self, obj):
+        """A copy dropped with C: made here, added (and selected) in the world."""
+        self.send({"op": "add", "objects": [obj.to_dict()], "select": True})
+        self.player.select_ids([obj.id])
+
+    def choose_take(self, target, src, key, port=None):
+        self.send({"op": "choose_take", "target": target.id, "src": src.id, "key": key, "port": port})
+
+    def menu_command(self, command):
+        if command in ("goto", "inventory"):
+            super().menu_command(command)   # just this window
+        else:
+            self.send({"op": "command", "command": command})
+
+    def save(self):
+        pass                                # the world saves
+
+    def _picked_in_inventory(self, picked):
+        if isinstance(picked, MachineTile):
+            self.send({"op": "create_machine", "machine": picked.machine})
+        else:
+            self.send({"op": "create", "type": picked.TYPE})
+
+    # --- What the world asks this window to show ---------------------------------------
+    def handle_ui(self, msg):
+        """A {"op": "ui"} message: show it; the answer goes back with its token."""
+        kind, token = msg.get("kind"), msg.get("token")
+
+        def answer(**fields):
+            self.send(dict({"op": "answer", "token": token}, **fields))
+
+        if kind == "ask":
+            self.ask(msg["prompt"], lambda text: answer(value=text), value=msg.get("value", ""),
+                     q_pastes=msg.get("q_pastes", True))
+        elif kind == "confirm":
+            self.confirm(msg["message"], msg.get("sub", ""), lambda: answer(), ok_label=msg.get("ok_label", "Delete"))
+        elif kind == "menu":
+            items = []
+            for i, (label, active, style, *rest) in enumerate(msg["items"]):
+                items.append((label, (lambda i=i: answer(index=i)) if active else None, style, *rest))
+            self.context_menu(tuple(msg["pos"]), items)
+        elif kind == "pick":
+            ids = set(msg.get("accept", []))
+            on_empty = (lambda point: answer(point=list(point))) if msg.get("empty") else None
+            origin = tuple(msg["origin"]) if msg.get("origin") else None
+            self.start_picking(msg["prompt"], lambda obj: answer(id=obj.id), accept=lambda o: o.id in ids,
+                               origin=origin, on_empty=on_empty)
+        elif kind == "place":
+            sample = msg["sample"]
+
+            def ghost(x, y):
+                group = GhostGroup([object_from_dict(d) for d in sample["objects"]], sample["name"])
+                c = group.center
+                group.move(x - c[0], y - c[1])
+                return group
+            self.cancel_modes()
+            self.player.select_only(None)
+            self.placer.begin(ghost, self.camera.screen_to_world(pygame.mouse.get_pos()),
+                              on_place=lambda world, keep: answer(point=list(world), keep=keep))
+        elif kind == "place_done":
+            self.placer.cancel()
+        elif kind == "inventory":
+            self.open_inventory()
+        elif kind in ("train", "wall"):
+            self.cancel_modes()
+            self.player.select_only(None)
+            (self.train_builder if kind == "train" else self.wall_builder).begin()
+        elif kind == "camera":
+            cam = self.camera
+            cam.offset.x, cam.offset.y, cam.zoom = msg["camera"]
+            ride = msg.get("ride")
+            if ride:
+                cam.start_ride([tuple(p) for p in ride["points"]], ride["speed"])
+        elif kind == "select":
+            self.player.select_ids(msg.get("ids", []))
+
+
+# ============================================================================
+# OTHER PLAYERS — what this window shows of everyone else in the world: the
+# area each one's window shows (a box), their cursor, and what they have
+# selected, in their color, with name tags.
+# ============================================================================
+PRESENCE_SMOOTH = 14.0      # how fast a drawn cursor / box catches up with the newest position (1/s)
+PRESENCE_SEND_S = 0.05      # this window reports where it is at most this often (s)
+
+
+def name_tag(surface, text, color, pos, *, above=False):
+    """A small rounded tag in a player's color with their name, its top-left at
+    pos (above=True: its bottom-left)."""
+    font = get_font(18, bold=True)
+    ink = (20, 20, 24) if sum(color) > 420 else (250, 250, 252)     # dark text on light colors
+    ts = font.render(text, True, ink)
+    tag = pygame.Rect(0, 0, ts.get_width() + 12, ts.get_height() + 4)
+    if above:
+        tag.bottomleft = pos
+    else:
+        tag.topleft = pos
+    pygame.draw.rect(surface, color, tag, border_radius=5)
+    surface.blit(ts, (tag.x + 6, tag.y + 2))
+    return tag
+
+
+class OtherPlayers:
+    """The others' presence, from the world's "presence" messages. Drawn
+    positions glide toward the newest ones (they arrive ~20 times a second)."""
+
+    def __init__(self, me):
+        self.me = me                # this window's own name (never drawn)
+        self.players = {}           # name -> the newest presence dict from the world
+        self._shown = {}            # name -> {"cursor": Vector2, "view": [x, y, w, h]} as drawn
+
+    def update(self, players):
+        self.players = {p["name"]: p for p in players if p.get("name") != self.me}
+        for name in list(self._shown):
+            if name not in self.players:
+                del self._shown[name]
+
+    def tick(self, dt):
+        k = 1 - math.exp(-PRESENCE_SMOOTH * dt)
+        for name, p in self.players.items():
+            shown = self._shown.setdefault(name, {})
+            cursor, view = p.get("cursor"), p.get("view")
+            if cursor is None:
+                shown["cursor"] = None
+            elif shown.get("cursor") is None:
+                shown["cursor"] = pygame.Vector2(cursor)
+            else:
+                shown["cursor"] += (pygame.Vector2(cursor) - shown["cursor"]) * k
+            if view is not None:
+                old = shown.get("view") or view
+                shown["view"] = [a + (b - a) * k for a, b in zip(old, view)]
+
+    def draw(self, surface, camera, scene):
+        for name, p in self.players.items():
+            color = tuple(p.get("color") or (200, 200, 210))
+            shown = self._shown.get(name, {})
+            self._draw_selection(surface, camera, scene, p.get("selection") or [], color)
+            view = shown.get("view")
+            if view is not None:
+                self._draw_view(surface, camera, view, name, color)
+        for name, p in self.players.items():          # cursors last: on top of every box
+            cursor = self._shown.get(name, {}).get("cursor")
+            if cursor is not None:
+                self._draw_cursor(surface, camera, cursor, name, tuple(p.get("color") or (200, 200, 210)),
+                                  bool(p.get("down")))
+
+    @staticmethod
+    def _draw_selection(surface, camera, scene, ids, color):
+        for oid in ids:
+            obj = scene.by_id.get(oid)
+            rect_of = getattr(obj, "screen_rect", None)
+            if rect_of is None:
+                continue
+            try:
+                rect = rect_of(camera).inflate(18, 18)
+            except Exception:
+                continue
+            if rect.width < 4000 and rect.height < 4000:
+                pygame.draw.rect(surface, color, rect, width=2, border_radius=10)
+
+    @staticmethod
+    def _draw_view(surface, camera, view, name, color):
+        x, y, w, h = view
+        left, top = camera.world_to_screen((x, y))
+        right, bottom = camera.world_to_screen((x + w, y + h))
+        box = pygame.Rect(round(left), round(top), max(1, round(right - left)), max(1, round(bottom - top)))
+        screen = surface.get_rect()
+        if not box.colliderect(screen.inflate(40, 40)):
+            return
+        if box.width > 4 * screen.width or box.height > 4 * screen.height:
+            box = box.clip(screen.inflate(20, 20))   # far bigger than this window: just its part of it
+        pygame.draw.rect(surface, color, box, width=2, border_radius=4)
+        if screen.collidepoint(box.topleft) and box.y > MENU_BAR_HEIGHT + 20:
+            name_tag(surface, f"{name}'s view", color, box.topleft, above=True)
+        # (no tag when their corner is off screen — e.g. their view is bigger than this
+        # window's: the player list says who's here)
+
+    @staticmethod
+    def _draw_cursor(surface, camera, cursor, name, color, down):
+        sx, sy = camera.world_to_screen(cursor)
+        if not surface.get_rect().inflate(30, 30).collidepoint(sx, sy):
+            return
+        tip = pygame.Vector2(sx, sy)
+        arrow = [tip, tip + (0, 19), tip + (5, 14), tip + (9, 22), tip + (12, 21), tip + (8, 13), tip + (14, 13)]
+        if down:                                     # clicking: a ring, and the arrow pressed in
+            pygame.draw.circle(surface, color, tip, 13, 2)
+        pygame.draw.polygon(surface, color, arrow)
+        pygame.draw.polygon(surface, (15, 15, 18), arrow, 1)
+        name_tag(surface, name, color, (sx + 14, sy + 16))
+
