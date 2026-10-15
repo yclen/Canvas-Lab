@@ -173,7 +173,12 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   the paths (the wires' flowing dots already show direction). The panel shows the value and what it
   **Feeds**: readers are found every 0.25 s by `links_to(obj, id)`, which scans an object's
   `source_id` and every `{"id": …}` inside its data props — it covers today's link styles without
-  each type listing its links
+  each type listing its links. **Laying a path:** while linking a relay (or a tag), a click on
+  *empty* canvas places a new relay there fed by it (`extend`) — the clicked one keeps its own
+  source, the new one is selected, and clicking it then empty canvas again adds the next hop. A
+  click on an object that can't be linked, or Esc, still just cancels. This is PickMode's
+  `on_empty(world point)` (via `App.start_picking(..., on_empty=)`), which draws a small ring at
+  the cursor over empty canvas; other picks (a function's chips, …) don't pass it
 - **Data tag** (E menu ▸ Data, `things.py`): a named data point — a `DataRelay` subclass, so it passes
   its value through the same way (no delay, loop guard, any number of readers), but it has a body
   you can read. Named after SCADA/PLC "tags" (a named live value with units). Shaped like a luggage

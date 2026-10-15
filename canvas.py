@@ -2976,21 +2976,25 @@ class PlaceMode:
 class PickMode:
     """Waiting for a click on an object — e.g. choosing what a readout reads.
     accept(obj) says which objects count; a valid click calls on_pick(obj),
-    anything else (or Esc) cancels. Draws a hint, a rubber-band line from
-    `origin` to the cursor, and a ring around a pickable object under it."""
+    anything else (or Esc) cancels — except that, given on_empty, a click on
+    empty canvas calls on_empty(world point) (a relay places another there).
+    Draws a hint, a rubber-band line from `origin` to the cursor, and a ring
+    around a pickable object under it (or a small ring on empty canvas)."""
 
     def __init__(self):
         self.prompt = ""
         self.on_pick = None
         self.accept = None
         self.origin = None       # world point the rubber band starts from, or None
+        self.on_empty = None     # on_empty(world point) for a click on empty canvas, or None
 
     @property
     def active(self):
         return self.on_pick is not None
 
-    def begin(self, prompt, on_pick, accept, origin=None):
+    def begin(self, prompt, on_pick, accept, origin=None, on_empty=None):
         self.prompt, self.on_pick, self.accept, self.origin = prompt, on_pick, accept, origin
+        self.on_empty = on_empty
 
     def cancel(self):
         self.__init__()
@@ -3002,10 +3006,13 @@ class PickMode:
     def click(self, scene, pos, camera):
         """Pick what's under pos (if allowed), then end the mode either way."""
         obj = self.target(scene, pos, camera)
-        on_pick = self.on_pick
+        on_pick, on_empty = self.on_pick, self.on_empty
+        empty = on_empty is not None and scene.hit_test(pos, camera) is None
         self.cancel()
         if obj is not None:
             on_pick(obj)
+        elif empty:
+            on_empty(camera.screen_to_world(pos))
 
     def draw(self, surface, camera, scene, mouse):
         if not self.active:
@@ -3018,6 +3025,8 @@ class PickMode:
         if obj is not None and hasattr(obj, "screen_rect"):
             pygame.draw.rect(surface, (120, 220, 150), obj.screen_rect(camera).inflate(14, 14),
                              width=3, border_radius=10)
+        elif self.on_empty is not None and scene.hit_test(mouse, camera) is None:
+            pygame.draw.circle(surface, (120, 220, 150), mouse, 9, 2)      # a click here places something
         draw_hint(surface, f"{self.prompt}     Esc: cancel")
 
 
@@ -3493,12 +3502,13 @@ class App:
         self.placer.cancel()
         self.picker.cancel()
 
-    def start_picking(self, prompt, on_pick, accept=lambda obj: True, origin=None):
+    def start_picking(self, prompt, on_pick, accept=lambda obj: True, origin=None, on_empty=None):
         """Wait for a click on an object that accept(obj) allows, then call
-        on_pick(obj). Esc or a click elsewhere cancels. `origin` (a world
+        on_pick(obj). Esc or a click elsewhere cancels — or, with on_empty, a
+        click on empty canvas calls on_empty(world point). `origin` (a world
         point) draws a line from there to the cursor while picking."""
         self.cancel_modes()
-        self.picker.begin(prompt, on_pick, accept, origin)
+        self.picker.begin(prompt, on_pick, accept, origin, on_empty)
 
     def open_inventory(self):
         """Show the E menu (dropping whatever mode was active)."""

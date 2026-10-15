@@ -2034,9 +2034,18 @@ class DataRelay(Thing):
             app.save()
         what = self.NAME.lower()
         hint = f" — or click this {what} to unlink" if linked else ""
-        app.start_picking(f"Click what this {what} passes on (a device, readout, relay, …){hint}", link,
+        app.start_picking(f"Click what this {what} passes on (a device, readout, relay, …){hint}"
+                          " — empty canvas: place a relay fed by it", link,
                           accept=lambda obj: (obj is self and linked) or (obj is not self and bool(obj.outputs())),
-                          origin=self.input_point())
+                          origin=self.input_point(), on_empty=lambda world: self.extend(app, world))
+
+    def extend(self, app, world):
+        """A click on empty canvas while linking: a new relay there, fed by this one —
+        so a path can be laid down hop by hop (this one keeps its own source)."""
+        relay = DataRelay(*world)
+        relay.source = {"id": self.id, "key": "value"}
+        app.place(relay)
+        self._recount = 0.0
 
     def next_key(self, app):
         src = self.source_obj()
