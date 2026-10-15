@@ -771,6 +771,19 @@ to `{"objects": [...]}`).
 
 ---
 
+## Bench notes (the optics the software has to respect)
+
+- **The power meter only sees light with the detection flip mirror UP.** The detection
+  mirror (device `flipper` in devices.json, `mirror: detection`; on the canvas *Power meter
+  flip*, paths *Power meter* / *Sphere*) sends the beam to the PM100D when up and on to the
+  sphere when down (`flipper.SETUP`: `DETECTION = up "PM100D", down "sphere"`). Anything that
+  reads the power meter — a canvas setup or a script — must flip it up first, wait for it to
+  settle (~0.75 s, flipper.py's `DEFAULT_SETTLE_S`), and put it back down afterwards if the
+  detector needs the light. With it down the PM100D reads ~0 and nothing errors, so a
+  forgotten flip only shows up as bad data. The position has no readback (*assumed*): sync or
+  find it on the canvas before a script relies on it. `scripts/calibrate_nd_filter.py` does
+  all of this (`--mirror`).
+
 ## What's next (open threads)
 
 - **E menu extras** — a search box (type to filter), a hotbar of recent picks, and

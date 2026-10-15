@@ -12,3 +12,6 @@ data/
 
 # saved machines (E menu > Machines), personal like Nodes.json
 machines.json
+
+# calibration runs (calibrate_nd_filter.py / fit_nd_filter.py: CSVs, plots, fits)
+calibration/nd_filter/
