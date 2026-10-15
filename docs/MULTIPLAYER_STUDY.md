@@ -1,8 +1,8 @@
 # Multiplayer — feasibility study
 
-> **Study written 2026-10-14. Built since:** step 1, the world / player split (DESIGN.md,
+> **Study written 2026-10-14. Built since:** step 1, the world / player split (ARCHITECTURE.md,
 > *The world and the player's view*), and — reordered ahead of the command layer — the world
-> as its own program with player windows on this PC (DESIGN.md, *The world server and
+> as its own program with player windows on this PC (ARCHITECTURE.md, *The world server and
 > players*; table step 4), and players making changes (table step 2 — done as "the world
 > runs the same object code for you, and sends its dialogs to your window", not one command
 > per change, so object types didn't need rewriting). The two-views-in-one-process step was
@@ -236,7 +236,7 @@ Each step is useful on its own and the app keeps working single-player throughou
 Steps 1–3 are worth doing even if multiplayer never ships: they give undo, one save path,
 and a cleaner object model. Step 2 is the one to estimate carefully — it's roughly "visit
 every one of the 34 object types once", about the size of the panel + takes / gives
-refactor that was just finished (PANEL_PLAN.md), maybe a bit bigger.
+refactor that was just finished (docs/archive/PANEL_PLAN.md), maybe a bit bigger.
 
 ---
 

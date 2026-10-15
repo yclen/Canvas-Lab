@@ -1,0 +1,24 @@
+# Canvas Lab — what to pip install (developed on Python 3.13).
+#
+#     pip install -r requirements.txt
+#
+# A player PC (joins a world, or works on its own without hardware) only needs
+# the first section. The lab PC, which runs the instrument server, also needs
+# the second one.
+
+# --- The app ---------------------------------------------------------------
+pygame>=2.6
+pyserial>=3.5          # NOT the unrelated "serial" package (same import name): uninstall that one
+
+# --- Scripts in scripts/ (calibration runs, fits, plots) --------------------
+numpy>=2.0
+matplotlib>=3.8
+
+# --- Lab hardware (instrument server, on the lab PC only) -------------------
+# The drivers in drivers/ load the modules in "../../hardware drivers", which need:
+zaber-motion>=7.0      # Zaber stages (zaber.py)
+PyVISA>=1.14           # PM100D power meter (pm100d.py)
+nidaqmx>=1.0           # NI 6363 DAQ: flip mirrors, PDA45 voltage (ni6363.py)
+# Not on PyPI — install by hand:
+#   nkt_tools   SuperK laser (superk.py); a local copy, `pip install -e <path to nkt_tools>`
+#   TimeTagger  PDA45 counts (timetagger.py); comes with Swabian's Time Tagger software

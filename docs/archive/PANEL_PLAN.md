@@ -1,6 +1,6 @@
 # Inspector panel + Takes / Gives — design plan
 
-> **Built 2026-10-14.** How it works now is in DESIGN.md (*The panel*, *Inputs and
+> **Built 2026-10-14.** How it works now is in docs/ARCHITECTURE.md (*The panel*, *Inputs and
 > outputs*); this file is kept as the record of the plan. Differences from the plan below:
 > Outputs / gives is a plain list (no reader counts — a relay still shows *Feeds*); clicking
 > an output links it into another object's input; folded sections are remembered per type

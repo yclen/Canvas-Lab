@@ -32,13 +32,13 @@ Optional extras:
     TAKES / takes()       its inputs (Take): each can follow another object's
                  output; read one with self.take(port). See Function, Counter.
     state_rows / info_rows / actions / menu_items / panel_status (app)
-                 fill in the standard panel (see "The panel" in DESIGN.md).
+                 fill in the standard panel (see "The panel" in docs/ARCHITECTURE.md).
     Subclass another Thing to share its drawing/props/behavior.
 
 `app` (in buttons and callbacks) has: app.scene (the world), app.player
 (this window's view: camera, selection), app.camera, app.save(),
 app.ask(prompt, on_submit), app.confirm(...), app.place(obj).
-See "Adding an object type" in DESIGN.md.
+See "Adding an object type" in docs/ARCHITECTURE.md.
 """
 
 import csv

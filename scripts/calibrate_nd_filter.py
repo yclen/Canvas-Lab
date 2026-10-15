@@ -15,7 +15,7 @@ server (and the canvas) running; this script starts the server if it isn't.
 Turn the laser's emission on first. Home the ND stage (canvas, or --home)
 before the first run after a power cycle.
 
-The PM100D only sees the beam with the detection flip mirror UP (see DESIGN.md,
+The PM100D only sees the beam with the detection flip mirror UP (see docs/ARCHITECTURE.md,
 "Bench notes"), so the script flips it up before measuring and puts it back
 where it was afterwards. The mirror has no readback: its position must be known
 on the canvas ("It's at …" or Find position) — the script stops if it isn't.
