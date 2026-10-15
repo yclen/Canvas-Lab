@@ -26,7 +26,11 @@ Optional extras:
     icon_sample() / draw_icon(surface)   customize its E-menu icon (default: draws
                  a sample of it with draw_shape, scaled to fit).
     draw_layer   paint order (walls -2, trains -1, things 0, name tags 1).
-    inspector(app) / buttons(app)   override for a fully custom panel (see Neuron).
+    outputs() / gives()   values it offers other objects ({name: number}).
+    TAKES / takes()       its inputs (Take): each can follow another object's
+                 output; read one with self.take(port). See Function, Counter.
+    state_rows / info_rows / actions / menu_items / panel_status (app)
+                 fill in the standard panel (see "The panel" in DESIGN.md).
     Subclass another Thing to share its drawing/props/behavior.
 
 `app` (in buttons and callbacks) has: app.scene, app.camera, app.save(),
@@ -45,9 +49,9 @@ import pygame
 
 import expressions
 import instruments
-from canvas import (OBJECT_TYPES, WARN_COLOR, Btn, Field, Gap, Prop, Row, Thing, alpha_layer,
-                    clip_text, draw_arc, draw_rect, font_px,
-                    get_font, panel_button, run_action)
+from canvas import (OBJECT_TYPES, WARN_COLOR, Btn, Field, Give, Prop, Row, Section, Take, Thing,
+                    alpha_layer, clip_text, draw_arc, draw_rect, font_px, format_value, get_font,
+                    panel_button, run_action, short_name)
 
 
 def shade(color, factor):
@@ -77,7 +81,7 @@ class Lamp(Thing):
     SIZE = (50, 50)
     DOT_COLOR = (255, 220, 120)
     PROPS = [
-        Prop("on", "On", "bool", False),
+        Prop("on", "On", "bool", False, state=True),
         Prop("color", "Light color", "color", (255, 220, 120)),
         Prop("pulse", "Pulses per second", "float", 0.5, min=0),
     ]
@@ -165,8 +169,8 @@ class Input(Thing):
     def outputs(self):
         return {"pressed": 1.0 if self.pressed else 0.0, "presses": float(self.presses)}
 
-    def inspector(self, app):
-        rows = super().inspector(app)
+    def state_rows(self, app):
+        rows = super().state_rows(app)
         if self.SHOW_PRESSES:
             rows.append(Row("Presses (this session)", self.presses))
         return rows
@@ -330,7 +334,7 @@ class Switch(Input):
     NAME = "Switch"
     SIZE = (100, 60)
     DOT_COLOR = (70, 200, 110)
-    PROPS = [Prop("on", "On", "bool", False),
+    PROPS = [Prop("on", "On", "bool", False, state=True),
              Prop("color", "Color", "color", (70, 200, 110))]
     SLIDE_TIME = 0.12               # seconds for the knob to travel across
 
@@ -422,7 +426,7 @@ class Slider(Input):
     SHOW_PRESSES = False
     SIZE = (56, 0)                  # width; the height is the `length` prop
     DOT_COLOR = (90, 170, 240)
-    PROPS = [Prop("value", "Value", "float", 0.5),
+    PROPS = [Prop("value", "Value", "float", 0.5, state=True),
              Prop("min", "Min", "float", 0.0),
              Prop("max", "Max", "float", 1.0),
              Prop("step", "Step (0 = smooth)", "float", 0.0, min=0),
@@ -579,105 +583,40 @@ class Slider(Input):
 
 
 # ============================================================================
-# OUTPUTS — things that show a value read live from another object (E ▸ Outputs)
+# DISPLAYS — things that show a value read live from another object (E ▸ Displays)
 # ============================================================================
-def draw_wire(surface, camera, start, end, color):
-    """A link between two world points: a thin line with dots flowing from
-    start toward end (the direction the value travels)."""
-    a = pygame.Vector2(camera.world_to_screen(start))
-    b = pygame.Vector2(camera.world_to_screen(end))
-    if (b - a).length() < 2:
-        return
-    pygame.draw.line(surface, shade(color, 0.45), a, b, 2)
-    t = pygame.time.get_ticks() / 1000.0
-    dots = max(2, min(12, int((b - a).length() / 60)))
-    for k in range(dots):
-        f = (t * 0.6 + k / dots) % 1.0
-        pygame.draw.circle(surface, color, a.lerp(b, f), 3)
-
-
 class Output(Thing):
-    """Base for the output family: it's linked to a *source* — any object with
-    outputs() (a slider's value, a switch's on, a neuron's firing, …) — and
-    reads one of those values every frame into `self.reading` (None when
-    unlinked). Link it with "Link to source…" (then click the source); a wire
-    with flowing dots shows the link. The link is saved (source id + which
-    value). Subclasses just draw `self.reading`."""
+    """Base for the display family: one input, `in`, that follows a value from
+    another object (a slider's value, a switch's on, a neuron's firing, …) —
+    link it from the panel's Inputs / takes. The value is read every frame into
+    `self.reading` (None while unlinked, or while the source has none), and
+    passed on as `value`, so displays can chain. Subclasses just draw
+    `self.reading`."""
 
-    CATEGORY = "Outputs"
+    CATEGORY = "Displays"
     PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
-                  prompt="Size (1 = normal, 2 = twice as big):"),
-             Prop("source_id", kind="str", default="", hidden=True),
-             Prop("source_key", kind="str", default="value", hidden=True)]
-    WIRE_COLOR = (120, 220, 150)
+                  prompt="Size (1 = normal, 2 = twice as big):")]
+    TAKES = (Take("in", "shows"),)
+
+    @classmethod
+    def migrate(cls, d):
+        """Older saves kept the link as source_id / source_key."""
+        if "source_id" in d or "source_key" in d:
+            d = dict(d)
+            sid, key = d.pop("source_id", ""), d.pop("source_key", "value")
+            if sid:
+                d["links"] = dict(d.get("links") or {}, **{"in": {"id": sid, "key": key}})
+        return d
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.reading = None
 
-    def source(self):
-        return self.scene.by_id.get(self.source_id) if self.scene and self.source_id else None
-
     def tick(self, dt):
-        src = self.source()
-        self.reading = src.outputs().get(self.source_key) if src is not None else None
+        self.reading = self.take("in")
 
     def outputs(self):
-        return {} if self.reading is None else {"value": self.reading}   # so outputs can chain
-
-    # --- Linking ------------------------------------------------------------------
-    def link_to(self, src, app):
-        self.source_id = src.id
-        keys = list(src.outputs())
-        if self.source_key not in keys:
-            self.source_key = keys[0]
-        app.save()
-
-    def pick_source(self, app):
-        app.start_picking("Click the object to read from (slider, switch, neuron, …)",
-                          lambda src: self.link_to(src, app),
-                          accept=lambda obj: obj is not self and bool(obj.outputs()),
-                          origin=self.center)
-
-    def next_key(self, app):
-        """Cycle which of the source's values this reads."""
-        src = self.source()
-        keys = list(src.outputs()) if src is not None else []
-        if keys:
-            i = keys.index(self.source_key) if self.source_key in keys else -1
-            self.source_key = keys[(i + 1) % len(keys)]
-            app.save()
-
-    def unlink(self, app):
-        self.source_id = ""
-        app.save()
-
-    def inspector(self, app):
-        src = self.source()
-        if src is not None:
-            source_row = Row("Source", src.display_name, on_click=self.pick_source)
-            reads_row = Row("Reads", self.source_key, on_click=self.next_key)
-        else:
-            source_row = Row("Source", "— (source deleted)" if self.source_id else "— (not linked)",
-                             on_click=self.pick_source)
-            reads_row = None
-        rows = super().inspector(app) + [Gap(6), source_row]
-        if reads_row is not None:
-            rows.append(reads_row)
-        rows.append(Row("Reading", "—" if self.reading is None else f"{self.reading:g}"))
-        return rows
-
-    def buttons(self, app):
-        out = super().buttons(app) + [Btn("Link to source…", self.pick_source)]
-        if self.source_id:
-            out.append(Btn("Unlink", self.unlink))
-        return out
-
-    # --- Drawing ------------------------------------------------------------------
-    def draw_links(self, surface, camera):
-        src = self.source()
-        if src is not None and src.center is not None:
-            draw_wire(surface, camera, output_point(src), self.center, self.WIRE_COLOR)
+        return {"value": self.reading}       # so displays can chain
 
 
 # ---- Seven-segment digits -----------------------------------------------------
@@ -827,13 +766,6 @@ FN_CHIP_TEXT = 15
 FN_MIN_W, FN_MAX_W = 220, 800
 
 
-def output_point(obj):
-    """World point a wire from obj's output starts at: its output_point() if
-    it has one (a Function's output nub), else its center."""
-    point = getattr(obj, "output_point", None)
-    return point() if point is not None else obj.center
-
-
 class Function(Thing):
     """y = an equation you type (click it). Every name in the equation that
     isn't built in (sin, sqrt, pi, t, … — see expressions.py) becomes a little
@@ -853,9 +785,7 @@ class Function(Thing):
     PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
                   prompt="Size (1 = normal, 2 = twice as big):"),
              Prop("color", "Color", "color", (175, 140, 255)),
-             Prop("expression", kind="str", default="", hidden=True),
-             Prop("links", kind="data", default={}, hidden=True)]     # variable -> {"id", "key"}
-    WIRE_COLOR = (120, 220, 150)
+             Prop("expression", kind="str", default="", hidden=True)]
 
     @classmethod
     def icon_sample(cls):
@@ -879,9 +809,10 @@ class Function(Thing):
             self._eq = expressions.Equation(self.expression)
         return self._eq
 
-    def source(self, name):
-        link = self.links.get(name)
-        return self.scene.by_id.get(link.get("id")) if link and self.scene else None
+    def takes(self):
+        """One input per variable, in the order they first appear. (Links for
+        names no longer in the equation are kept, just not shown.)"""
+        return [Take(name) for name in self.equation().variables]
 
     def tick(self, dt):
         eq = self.equation()
@@ -892,17 +823,16 @@ class Function(Thing):
         values = {"t": time.monotonic() - FUNCTION_T0}
         unlinked = []
         for name in eq.variables:
-            src = self.source(name)
-            if src is None:
+            if self.take_source(name) is None:
                 unlinked.append(name)
                 continue
-            value = src.outputs().get(self.links[name].get("key"))
+            value = self.take(name)
             if value is None:
                 self.problem = f"{name}: its source has no value"
                 return
             values[name] = value
         if unlinked:
-            self.problem = f"link {', '.join(unlinked)} (click {'its' if len(unlinked) == 1 else 'a'} chip)"
+            self.problem = f"link {', '.join(unlinked)}"
             return
         try:
             self.result = eq.evaluate(values)
@@ -922,69 +852,22 @@ class Function(Thing):
             app.save()
         app.ask("Equation  y =", submit, value=self.expression, q_pastes=False)
 
-    def pick_source(self, app, name):
-        def link(src):
-            if src is self:                         # clicked itself: unlink
-                self.links.pop(name, None)
-            else:
-                keys = list(src.outputs())
-                self.links[name] = {"id": src.id, "key": "value" if "value" in keys else keys[0]}
-            app.save()
-        linked = self.source(name) is not None
-        hint = f" — or click this function to unlink {name}" if linked else ""
-        app.start_picking(f"Click what {name} should follow (a slider, switch, …){hint}", link,
-                          accept=lambda obj: (obj is self and linked) or
-                                             (obj is not self and bool(obj.outputs())),
-                          origin=self.chip_point(name))
-
-    def next_key(self, app, name):
-        """Cycle which of the source's values a variable reads."""
-        src = self.source(name)
-        keys = list(src.outputs()) if src is not None else []
-        if keys:
-            key = self.links[name].get("key")
-            i = keys.index(key) if key in keys else -1
-            self.links[name]["key"] = keys[(i + 1) % len(keys)]
-            app.save()
-
-    def unlink_all(self, app):
-        self.links = {}
-        app.save()
-
     def on_click(self, pos, app):
         name = self.chip_at(pos, app.camera)
         if name is not None:
-            self.pick_source(app, name)
+            self.pick(app, name)
         else:
             self.edit_equation(app)
         return True                 # a click edits/links; Ctrl+click selects
 
-    # --- Inspector ------------------------------------------------------------------
-    def inspector(self, app):
-        rows = [Field("Equation", f"y = {self.expression}" if self.expression else "— click to type one",
+    # --- Panel ----------------------------------------------------------------------
+    def panel_status(self, app):
+        return (self.problem, WARN_COLOR) if self.problem else None
+
+    def state_rows(self, app):
+        return [Field("Equation", f"y = {self.expression}" if self.expression else "— click to type one",
                       on_click=self.edit_equation),
                 Row("y", self.result_text(), color=None if self.result is not None else WARN_COLOR)]
-        if self.problem:
-            rows.append(Field("Problem", self.problem, color=WARN_COLOR))
-        for name in self.equation().variables:
-            rows.append(Gap(6))
-            src = self.source(name)
-            if src is None:
-                rows.append(Row(name, "— click to link", on_click=lambda app, n=name: self.pick_source(app, n)))
-                continue
-            value = src.outputs().get(self.links[name].get("key"))
-            rows.append(Row(name, "—" if value is None else f"{value:g}"))
-            rows.append(Row("   follows", src.display_name,
-                            on_click=lambda app, n=name: self.pick_source(app, n)))
-            rows.append(Row("   reads", self.links[name].get("key"),
-                            on_click=lambda app, n=name: self.next_key(app, n)))
-        return rows + [Gap(6)] + self.prop_rows()
-
-    def buttons(self, app):
-        out = super().buttons(app) + [Btn("Edit equation…", self.edit_equation)]
-        if self.links:
-            out.append(Btn("Unlink all", self.unlink_all))
-        return out
 
     # --- Layout (world units at Size 1; shared by drawing, clicks and wires) ----------
     def _measure(self):
@@ -1025,10 +908,10 @@ class Function(Thing):
         c = self.world_center
         return (c.x - self.world_width / 2 + x * self.scale, c.y - self.world_height / 2 + y * self.scale)
 
-    def chip_point(self, name):
+    def input_point(self, port):
         """World point where a variable's wire ends: its chip's left edge."""
         for n, x, y, _w, h in self._chip_boxes():
-            if n == name:
+            if n == port:
                 return self._to_world(x, y + h / 2)
         return self.center
 
@@ -1047,15 +930,10 @@ class Function(Thing):
         chips, _k = self._chip_rects(self.screen_rect(camera))
         return next((name for name, r in chips if r.inflate(6, 6).collidepoint(pos)), None)
 
-    # --- Drawing ----------------------------------------------------------------------
-    def draw_links(self, surface, camera):
-        if self.scene is None:
-            return
-        for name in self.equation().variables:     # links for names no longer in it stay hidden
-            src = self.source(name)
-            if src is not None and src.center is not None:
-                draw_wire(surface, camera, output_point(src), self.chip_point(name), self.WIRE_COLOR)
+    def take_at(self, pos, camera):
+        return self.chip_at(pos, camera)
 
+    # --- Drawing ----------------------------------------------------------------------
     def draw_shape(self, surface, rect, camera):
         s = min(rect.width, rect.height)
         radius = max(2, s // 8)
@@ -1085,7 +963,7 @@ class Function(Thing):
         mouse = pygame.mouse.get_pos() if self.is_hovered else None
         csize = round(FN_CHIP_TEXT * k)
         for name, r in chips:
-            linked = self.source(name) is not None
+            linked = self.take_source(name) is not None
             hot = mouse is not None and r.inflate(6, 6).collidepoint(mouse)
             color = shade(self.color, 1.2) if hot else self.color
             cr = max(2, r.height // 2)
@@ -1151,9 +1029,8 @@ class Counter(Thing):
              Prop("start", "Start", "float", 0.0, prompt="Start (what reset goes back to):"),
              Prop("value", kind="float", default=0.0, hidden=True),
              Prop("low", kind="data", default=None, hidden=True),      # minimum, or None
-             Prop("high", kind="data", default=None, hidden=True),     # maximum, or None
-             Prop("links", kind="data", default={}, hidden=True)]      # input -> {"id", "key"}
-    WIRE_COLOR = (120, 220, 150)
+             Prop("high", kind="data", default=None, hidden=True)]     # maximum, or None
+    TAKES = tuple(Take(name, kind="press") for name in CT_INPUTS)
 
     @classmethod
     def icon_sample(cls):
@@ -1163,7 +1040,6 @@ class Counter(Thing):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._last_high = {}        # input -> high last frame (missing = not read yet: no edge)
         self._flash = 0.0           # seconds the number stays bright after a change
 
     @property
@@ -1197,22 +1073,11 @@ class Counter(Thing):
     def reset(self, app=None):
         self.set_value(self.start, app)
 
-    def source(self, name):
-        link = self.links.get(name)
-        return self.scene.by_id.get(link.get("id")) if link and self.scene else None
+    def on_press(self, port):
+        getattr(self, port)()          # up / down / reset, once per 0 → 1
 
     def tick(self, dt):
         self._flash = max(0.0, self._flash - dt)
-        for name in CT_INPUTS:
-            src = self.source(name)
-            on = src.outputs().get(self.links[name].get("key")) if src is not None else None
-            if on is None:
-                self._last_high.pop(name, None)
-                continue
-            high = on > DC_EDGE
-            if high and self._last_high.get(name) is False:       # a press: 0 → 1
-                getattr(self, name)()
-            self._last_high[name] = high
 
     def outputs(self):
         return {"value": self.value}
@@ -1246,68 +1111,24 @@ class Counter(Thing):
                 app.save()
         app.ask("Name:", submit, value=self.title)
 
-    def pick_source(self, app, name):
-        linked = self.source(name) is not None
-        def link(src):
-            if src is self:                                  # clicked itself: unlink
-                self.links.pop(name, None)
-            else:
-                keys = list(src.outputs())
-                key = next((k for k in ("pressed", "on", "value") if k in keys), keys[0])
-                self.links[name] = {"id": src.id, "key": key}
-            self._last_high.pop(name, None)
-            app.save()
-        hint = " — or click this counter to unlink it" if linked else ""
-        what = {"up": "adds a step", "down": "takes a step away", "reset": "resets it"}[name]
-        app.start_picking(f"Click what {what} (a push button: once per press){hint}", link,
-                          accept=lambda obj: (obj is self and linked) or (obj is not self and bool(obj.outputs())),
-                          origin=self.chip_point(name))
-
-    def next_key(self, app, name):
-        src = self.source(name)
-        keys = list(src.outputs()) if src is not None else []
-        if keys:
-            key = self.links[name].get("key")
-            self.links[name]["key"] = keys[(keys.index(key) + 1) % len(keys) if key in keys else 0]
-            self._last_high.pop(name, None)
-            app.save()
-
-    def unlink_all(self, app):
-        self.links = {}
-        self._last_high = {}
-        app.save()
-
     def on_click(self, pos, app):
         name = self.chip_at(pos, app.camera)
         if name is not None:
-            self.pick_source(app, name)
+            self.pick(app, name)
         else:
             self.type_value(app)
         return True
 
-    def inspector(self, app):
-        rows = [Row("Name", self.title, on_click=self.rename),
-                Row("Value", f"{self.value:.6g}", on_click=self.type_value),
+    def state_rows(self, app):
+        return [Row("Value", f"{self.value:.6g}", on_click=self.type_value),
                 Row("Minimum", "none" if self.low is None else f"{self.low:g}",
                     on_click=lambda app: self.set_limit(app, "low")),
                 Row("Maximum", "none" if self.high is None else f"{self.high:g}",
                     on_click=lambda app: self.set_limit(app, "high"))]
-        for name in CT_INPUTS:
-            rows.append(Gap(6))
-            src = self.source(name)
-            rows.append(Row(name, src.display_name if src else "— click to link",
-                            on_click=lambda app, n=name: self.pick_source(app, n)))
-            if src is not None:
-                rows.append(Row("   reads", self.links[name].get("key"),
-                                on_click=lambda app, n=name: self.next_key(app, n)))
-        return rows + [Gap(6)] + self.prop_rows()
 
-    def buttons(self, app):
-        out = super().buttons(app) + [Btn(f"+ {self.step:g}", self.up, style="go"),
-                                      Btn(f"- {self.step:g}", self.down), Btn("Reset", self.reset)]
-        if self.links:
-            out.append(Btn("Unlink all", self.unlink_all))
-        return out
+    def actions(self, app):
+        return [Btn(f"+ {self.step:g}", self.up, style="go"), Btn(f"- {self.step:g}", self.down),
+                Btn("Reset", self.reset)]
 
     # --- Layout (world units at Size 1 from the top-left; shared by drawing, clicks, wires) --
     @property
@@ -1332,9 +1153,9 @@ class Counter(Thing):
         y = FN_PAD + CT_TITLE
         return x, y, CT_W - FN_PAD - x, self.world_height / self.scale - FN_PAD - y
 
-    def chip_point(self, name):
+    def input_point(self, port):
         for n, x, y, _w, h in self._chip_boxes():
-            if n == name:
+            if n == port:
                 return self._to_world(x, y + h / 2)
         return self.center
 
@@ -1352,15 +1173,10 @@ class Counter(Thing):
         chips, _k = self._chip_rects(self.screen_rect(camera))
         return next((name for name, r in chips if r.inflate(6, 6).collidepoint(pos)), None)
 
-    # --- Drawing ----------------------------------------------------------------------
-    def draw_links(self, surface, camera):
-        if self.scene is None:
-            return
-        for name in CT_INPUTS:
-            src = self.source(name)
-            if src is not None and src.center is not None:
-                draw_wire(surface, camera, output_point(src), self.chip_point(name), self.WIRE_COLOR)
+    def take_at(self, pos, camera):
+        return self.chip_at(pos, camera)
 
+    # --- Drawing ----------------------------------------------------------------------
     def draw_shape(self, surface, rect, camera):
         s = min(rect.width, rect.height)
         radius = max(2, s // 8)
@@ -1392,7 +1208,7 @@ class Counter(Thing):
         mouse = pygame.mouse.get_pos() if self.is_hovered else None
         csize = round(FN_CHIP_TEXT * k)
         for name, r in chips:
-            linked = self.source(name) is not None
+            linked = self.take_source(name) is not None
             hot = mouse is not None and r.inflate(6, 6).collidepoint(mouse)
             color = shade(self.color, 1.2) if hot else self.color
             cr = max(2, r.height // 2)
@@ -1438,7 +1254,6 @@ DC_TEXT = 14
 DC_BUTTON_W = 96
 DC_SCROLL_W = 14                # the scrollbar, right of the sheet
 DC_WHEEL_ROWS = 3               # rows per wheel notch
-DC_EDGE = 0.5                   # collect input above this = high (a rising edge collects)
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
 
@@ -1463,10 +1278,8 @@ class DataCollector(Thing):
              Prop("color", "Color", "color", (240, 200, 90)),
              Prop("shown_rows", "Rows shown", "int", 8, min=1, max=60,
                   prompt="How many rows to show (the latest; all are kept):"),
-             Prop("columns", kind="data", default=[], hidden=True),  # [{"cid", "name", "id", "key"}]
-             Prop("rows", kind="data", default=[], hidden=True),     # [{"time": iso, "values": {cid: v}}]
-             Prop("trigger", kind="data", default={}, hidden=True)]  # collect input: {"id", "key"}
-    WIRE_COLOR = (120, 220, 150)
+             Prop("columns", kind="data", default=[], hidden=True),  # [{"cid", "name"}]
+             Prop("rows", kind="data", default=[], hidden=True)]     # [{"time": iso, "values": {cid: v}}]
     COPY_SKIP = ("rows",)           # a copy (C key, or a placed machine) starts with no data
 
     @classmethod
@@ -1476,6 +1289,25 @@ class DataCollector(Thing):
             name = next(f"Data set {i}" for i in range(1, 1000) if f"Data set {i}" not in used)
             return cls(x, y, name, columns=[{"cid": 1, "name": "A"}, {"cid": 2, "name": "B"}])
         app.start_placing(make)
+
+    @classmethod
+    def migrate(cls, d):
+        """Older saves kept the links on the columns ({"cid", "name", "id", "key"})
+        and the collect input as `trigger`; they're inputs col<cid> / collect now."""
+        if "trigger" not in d and not any("id" in c for c in d.get("columns", [])):
+            return d
+        d = dict(d)
+        links = dict(d.get("links") or {})
+        trigger = d.pop("trigger", None) or {}
+        if trigger.get("id"):
+            links["collect"] = {"id": trigger["id"], "key": trigger.get("key", "value")}
+        columns = []
+        for col in d.get("columns", []):
+            if col.get("id"):
+                links[f"col{col['cid']}"] = {"id": col["id"], "key": col.get("key", "value")}
+            columns.append({k: v for k, v in col.items() if k not in ("id", "key")})
+        d["columns"], d["links"] = columns, links
+        return d
 
     @classmethod
     def icon_sample(cls):
@@ -1488,7 +1320,6 @@ class DataCollector(Thing):
         super().__init__(x, y, text, **kwargs)
         if columns is not None:
             self.columns = columns
-        self._last_high = None      # the collect input last frame (None = not read yet: no edge)
         self._flash = 0.0           # seconds the Collect button stays lit after a collect
         self._top = None            # first row shown (0-based); None = follow the newest rows
         self._grab = None           # while dragging the scrollbar thumb: the click's offset in it
@@ -1504,17 +1335,19 @@ class DataCollector(Thing):
                 app.save()
         app.ask("Data set name:", submit, value=self.title)
 
-    # --- Sources and collecting -----------------------------------------------------
-    def _source(self, link):
-        return self.scene.by_id.get(link.get("id")) if link and link.get("id") and self.scene else None
+    # --- Inputs and collecting ------------------------------------------------------
+    def takes(self):
+        """The collect input (a press: 0 → 1 adds a row), then one per column."""
+        return [Take("collect", kind="press")] + [
+            Take(f"col{c['cid']}", c["name"], verb="records",
+                 on_label=lambda app, cid=c["cid"]: self.column_menu(app, cid))
+            for c in self.columns]
 
     def column_value(self, col):
-        src = self._source(col)
-        return src.outputs().get(col.get("key")) if src is not None else None
+        return self.take(f"col{col['cid']}")
 
-    def trigger_value(self):
-        src = self._source(self.trigger)
-        return src.outputs().get(self.trigger.get("key")) if src is not None else None
+    def on_press(self, port):
+        self.collect()
 
     def collect(self, app=None):
         """Add a row: every column's value right now (None where it has none), and the time."""
@@ -1528,11 +1361,6 @@ class DataCollector(Thing):
 
     def tick(self, dt):
         self._flash = max(0.0, self._flash - dt)
-        value = self.trigger_value()
-        high = None if value is None else value > DC_EDGE
-        if high and self._last_high is False:        # a rising edge (not just "high when loaded")
-            self.collect()
-        self._last_high = high if high is not None else self._last_high
 
     def outputs(self):
         return {"rows": float(len(self.rows))}
@@ -1547,7 +1375,7 @@ class DataCollector(Thing):
             name = text.strip() or chr(ord("A") + (cid - 1) % 26)
             self.columns = self.columns + [{"cid": cid, "name": name}]
             app.save()
-            self.pick_source(app, cid)
+            self.pick(app, f"col{cid}")
         app.ask("New column name:", named)
 
     def rename_column(self, app, cid):
@@ -1562,49 +1390,18 @@ class DataCollector(Thing):
         col = self._column(cid)
         def remove():
             self.columns = [c for c in self.columns if c["cid"] != cid]
+            self.unlink(f"col{cid}")
             app.save()                 # its values stay in the saved rows, just not shown / exported
         app.confirm(f"Remove column '{col['name']}'?", "Its recorded values are no longer shown.",
                     remove, ok_label="Remove")
 
-    def _pick(self, app, prompt, current, set_link, origin):
-        def link(src):
-            if src is self:                          # clicked itself: unlink
-                set_link({})
-            else:
-                keys = list(src.outputs())
-                set_link({"id": src.id, "key": "value" if "value" in keys else keys[0]})
-            app.save()
-        linked = self._source(current) is not None
-        hint = " — or click this collector to unlink" if linked else ""
-        app.start_picking(prompt + hint, link,
-                          accept=lambda obj: (obj is self and linked) or (obj is not self and bool(obj.outputs())),
-                          origin=origin)
-
-    def pick_source(self, app, cid):
+    def column_menu(self, app, cid):
+        """Clicking a column's name in the panel: rename or remove it."""
         col = self._column(cid)
-        def set_link(link):
-            col.pop("id", None)
-            col.pop("key", None)
-            col.update(link)
-        self._pick(app, f"Click what column '{col['name']}' records (a readout, device, …)", col,
-                   set_link, self.column_point(cid))
-
-    def pick_trigger(self, app):
-        def set_link(link):
-            self.trigger = link
-            self._last_high = None
-        self._pick(app, "Click what triggers Collect (a push button, switch, …) — 0 → 1 collects",
-                   self.trigger, set_link, self.trigger_point())
-
-    def _next_key(self, app, link):
-        src = self._source(link)
-        keys = list(src.outputs()) if src is not None else []
-        if keys:
-            i = keys.index(link.get("key")) if link.get("key") in keys else -1
-            link["key"] = keys[(i + 1) % len(keys)]
-            if link is self.trigger:
-                self._last_high = None
-            app.save()
+        app.context_menu(pygame.mouse.get_pos(),
+                         [(f"Column '{col['name']}'", None, "title"),
+                          ("Rename…", lambda: self.rename_column(app, cid), None),
+                          ("Remove column…", lambda: self.remove_column(app, cid), "danger")])
 
     def clear_rows(self, app):
         def clear():
@@ -1666,34 +1463,20 @@ class DataCollector(Thing):
         return True
 
     # --- Panel ------------------------------------------------------------------------
-    def inspector(self, app):
-        rows = [Row("Data set", self.title, on_click=self.rename),
-                Row("Rows", str(len(self.rows)))]
-        src = self._source(self.trigger)
-        rows.append(Row("Collect input", src.display_name if src else "— click to link (optional)",
-                        on_click=self.pick_trigger))
-        if src is not None:
-            rows.append(Row("   reads", self.trigger.get("key"), on_click=lambda app: self._next_key(app, self.trigger)))
-        for col in self.columns:
-            cid = col["cid"]
-            rows.append(Gap(6))
-            rows.append(Row("Column", col["name"], on_click=lambda app, c=cid: self.rename_column(app, c)))
-            src = self._source(col)
-            rows.append(Row("   records", src.display_name if src else "— click to link",
-                            on_click=lambda app, c=cid: self.pick_source(app, c)))
-            if src is not None:
-                value = self.column_value(col)
-                rows.append(Row("   reads", f"{col.get('key')}  ({'—' if value is None else f'{value:.6g}'})",
-                                on_click=lambda app, c=col: self._next_key(app, c)))
-            rows.append(Row("   remove", "✕", on_click=lambda app, c=cid: self.remove_column(app, c)))
-        return rows + [Gap(6)] + self.prop_rows()
+    def state_rows(self, app):
+        return [Row("Rows", str(len(self.rows)))]
 
-    def buttons(self, app):
-        out = super().buttons(app) + [Btn("Collect", self.collect, style="go"),
-                                      Btn("Add column…", self.add_column)]
+    def input_rows(self, app):
+        return [Row("+ add column", "", on_click=self.add_column, color=None)]
+
+    def actions(self, app):
+        out = [Btn("Collect", self.collect, style="go")]
         if self.rows:
-            out += [Btn("Export CSV", self.export_csv), Btn("Clear rows…", self.clear_rows, style="stop")]
+            out.append(Btn("Export CSV", self.export_csv))
         return out
+
+    def menu_items(self, app):
+        return [("Clear rows…", lambda: self.clear_rows(app), "danger")] if self.rows else []
 
     # --- Layout (world units at Size 1 from the top-left; shared by drawing, clicks, wires) --
     def _layout_w(self):
@@ -1730,14 +1513,20 @@ class DataCollector(Thing):
         boxes["sheet"] = (table_x, head_y, x + DC_ADD_W - table_x, DC_CELL_H + body_h)
         return boxes
 
-    def column_point(self, cid):
-        """World point a column's wire ends at: the top of its header."""
-        x, y, w, _h = self._boxes().get(cid, (0, 0, 0, 0))
+    def input_point(self, port):
+        """World point an input's wire ends at: the collect chip's left edge, or
+        the top of a column's header."""
+        if port == "collect":
+            x, y, _w, h = self._boxes()["chip"]
+            return self._to_world(x, y + h / 2)
+        x, y, w, _h = self._boxes().get(int(port[3:]), (0, 0, 0, 0))
         return self._to_world(x + w / 2, y)
 
-    def trigger_point(self):
-        x, y, _w, h = self._boxes()["chip"]
-        return self._to_world(x, y + h / 2)
+    def take_at(self, pos, camera):
+        boxes, _k = self._screen_boxes(self.screen_rect(camera))
+        if boxes["chip"].inflate(4, 4).collidepoint(pos):
+            return "collect"
+        return next((f"col{c['cid']}" for c in self.columns if boxes[c["cid"]].collidepoint(pos)), None)
 
     def _screen_boxes(self, rect):
         k = rect.width / (self.world_width / self.scale)
@@ -1759,11 +1548,11 @@ class DataCollector(Thing):
         if hit == "button":
             self.collect(app)
         elif hit == "chip":
-            self.pick_trigger(app)
+            self.pick(app, "collect")
         elif hit == "add":
             self.add_column(app)
         elif hit is not None:
-            self.pick_source(app, hit)
+            self.pick(app, f"col{hit}")
         return hit is not None
 
     def on_drag(self, pos, app):
@@ -1775,17 +1564,6 @@ class DataCollector(Thing):
         self._grab = None
 
     # --- Drawing ----------------------------------------------------------------------
-    def draw_links(self, surface, camera):
-        if self.scene is None:
-            return
-        for col in self.columns:
-            src = self._source(col)
-            if src is not None and src.center is not None:
-                draw_wire(surface, camera, output_point(src), self.column_point(col["cid"]), self.WIRE_COLOR)
-        src = self._source(self.trigger)
-        if src is not None and src.center is not None:
-            draw_wire(surface, camera, output_point(src), self.trigger_point(), self.color)
-
     def draw_shape(self, surface, rect, camera):
         s = min(rect.width, rect.height)
         radius = max(2, s // 14)
@@ -1803,7 +1581,7 @@ class DataCollector(Thing):
 
         # Title bar: the collect input chip, the name and row count, the Collect button.
         chip = boxes["chip"]
-        linked = self._source(self.trigger) is not None
+        linked = self.take_source("collect") is not None
         hot = mouse is not None and chip.inflate(4, 4).collidepoint(mouse)
         color = shade(self.color, 1.2) if hot else self.color
         cr = max(2, chip.height // 2)
@@ -1858,7 +1636,7 @@ class DataCollector(Thing):
                     draw_rect(surface, (198, 204, 220), cell)
                 dot_r = max(2, round(4 * k))
                 dot = (cell.right - dot_r * 2 - 1, cell.centery)
-                if self._source(col) is not None:
+                if self.take_source(f"col{col['cid']}") is not None:
                     pygame.draw.circle(surface, (60, 170, 90), dot, dot_r)
                 else:
                     pygame.draw.circle(surface, (150, 152, 160), dot, dot_r, max(1, dot_r // 2))
@@ -1936,19 +1714,11 @@ _RELAYS_RESOLVING = set()          # relay ids mid-lookup (a loop guard for outp
 
 
 def links_to(obj, target_id):
-    """True if obj reads from target_id: an Output's source, or any {"id": …} link
-    in its data props (a function's variables, a device's params, a collector's columns)."""
-    def has(value):
-        if isinstance(value, dict):
-            return value.get("id") == target_id or any(has(v) for v in value.values())
-        if isinstance(value, list):
-            return any(has(v) for v in value)
+    """True if one of obj's inputs follows target_id."""
+    if not obj.links:
         return False
-    for p in obj.props():
-        value = getattr(obj, p.key, None)
-        if (p.key == "source_id" and value == target_id) or (p.kind == "data" and has(value)):
-            return True
-    return False
+    ports = {t.key for t in obj.takes()}
+    return any(link.get("id") == target_id for port, link in obj.links.items() if port in ports)
 
 
 class DataRelay(Thing):
@@ -1968,9 +1738,23 @@ class DataRelay(Thing):
     SIZE = (34, 34)
     DOT_COLOR = RELAY_CORE
     PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
-                  prompt="Size (1 = normal, 2 = twice as big):"),
-             Prop("source", kind="data", default={}, hidden=True)]     # {"id", "key"}
-    WIRE_COLOR = RELAY_CORE
+                  prompt="Size (1 = normal, 2 = twice as big):")]
+    TAKES = (Take("in", "passes on"),)
+
+    @classmethod
+    def migrate(cls, d):
+        """Older saves kept the input as `source` (and a tag's streaming input
+        as `stream`); they're the inputs in / stream now."""
+        if "source" not in d and "stream" not in d:
+            return d
+        d = dict(d)
+        links = dict(d.get("links") or {})
+        for old, port in (("source", "in"), ("stream", "stream")):
+            link = d.pop(old, None) or {}
+            if link.get("id"):
+                links[port] = {"id": link["id"], "key": link.get("key", "value")}
+        d["links"] = links
+        return d
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1982,8 +1766,7 @@ class DataRelay(Thing):
 
     # --- The value ------------------------------------------------------------------
     def source_obj(self):
-        sid = self.source.get("id")
-        return self.scene.by_id.get(sid) if sid and self.scene else None
+        return self.take_source("in")
 
     def value(self):
         """The source's value now, read straight through any chain of relays (so no
@@ -1993,7 +1776,7 @@ class DataRelay(Thing):
             return None
         _RELAYS_RESOLVING.add(self.id)
         try:
-            return src.outputs().get(self.source.get("key"))
+            return src.outputs().get(self.links["in"].get("key"))
         finally:
             _RELAYS_RESOLVING.discard(self.id)
 
@@ -2022,76 +1805,47 @@ class DataRelay(Thing):
             self._loop = self._in_loop()
 
     # --- Linking ------------------------------------------------------------------------
-    def pick_source(self, app):
-        linked = self.source_obj() is not None
-        def link(src):
-            if src is self:                          # clicked itself: unlink
-                self.source = {}
-            else:
-                keys = list(src.outputs())
-                self.source = {"id": src.id, "key": "value" if "value" in keys else keys[0]}
-            self._recount = 0.0
-            app.save()
-        what = self.NAME.lower()
-        hint = f" — or click this {what} to unlink" if linked else ""
-        app.start_picking(f"Click what this {what} passes on (a device, readout, relay, …){hint}"
-                          " — empty canvas: place a relay fed by it", link,
-                          accept=lambda obj: (obj is self and linked) or (obj is not self and bool(obj.outputs())),
-                          origin=self.input_point(), on_empty=lambda world: self.extend(app, world))
+    def pick(self, app, port):
+        if port != "in":
+            super().pick(app, port)
+            return
+        app.pick_link(self, port, on_empty=lambda world: self.extend(app, world),
+                      note=" — empty canvas: place a relay fed by it")
+
+    def on_links_changed(self):
+        self._recount = 0.0
 
     def extend(self, app, world):
         """A click on empty canvas while linking: a new relay there, fed by this one —
         so a path can be laid down hop by hop (this one keeps its own source)."""
         relay = DataRelay(*world)
-        relay.source = {"id": self.id, "key": "value"}
+        relay.links = {"in": {"id": self.id, "key": "value"}}
         app.place(relay)
         self._recount = 0.0
 
-    def next_key(self, app):
-        src = self.source_obj()
-        keys = list(src.outputs()) if src is not None else []
-        if keys:
-            key = self.source.get("key")
-            self.source["key"] = keys[(keys.index(key) + 1) % len(keys) if key in keys else 0]
-            app.save()
-
-    def unlink(self, app):
-        self.source = {}
-        app.save()
-
     def on_click(self, pos, app):
-        self.pick_source(app)
+        self.pick(app, "in")
         return True
 
-    def inspector(self, app):
-        src = self.source_obj()
-        value = self.value()
-        rows = [Row("Passes on", src.display_name if src else "— click to link", on_click=self.pick_source)]
-        if src is not None:
-            rows.append(Row("   reads", self.source.get("key"), on_click=self.next_key))
-        rows.append(Row("Value", "—" if value is None else f"{value:.6g}",
-                        color=RELAY_LOOP if self._loop else None if value is not None else WARN_COLOR))
+    def panel_status(self, app):
         if self._loop:
-            rows.append(Field("Problem", "this chain of relays loops back on itself", color=WARN_COLOR))
-        names = ", ".join(o.display_name for o in self._readers[:4]) + (" …" if len(self._readers) > 4 else "")
-        rows.append(Row("Feeds", f"{len(self._readers)}" + (f"  ({names})" if names else "")))
-        return rows + [Gap(6)] + self.prop_rows()
+            return "this chain of relays loops back on itself", RELAY_LOOP
+        return None
 
-    def buttons(self, app):
-        out = super().buttons(app)
-        if self.source_obj() is not None:
-            out.append(Btn("Unlink", self.unlink))
-        return out
+    def state_rows(self, app):
+        value = self.value()
+        names = ", ".join(short_name(o) for o in self._readers[:4]) + (" …" if len(self._readers) > 4 else "")
+        return [Row("Value", format_value(value),
+                    color=RELAY_LOOP if self._loop else None if value is not None else WARN_COLOR),
+                Row("Feeds", f"{len(self._readers)}" + (f"  ({names})" if names else ""))]
 
     # --- Drawing ----------------------------------------------------------------------
-    def input_point(self):
+    def input_point(self, port):
         """World point the incoming wire ends at."""
         return self.center
 
-    def draw_links(self, surface, camera):
-        src = self.source_obj()
-        if src is not None and src.center is not None:
-            draw_wire(surface, camera, output_point(src), self.input_point(), self.WIRE_COLOR)
+    def take_at(self, pos, camera):
+        return "in"
 
     def _state_color(self, value):
         if self.source_obj() is None:
@@ -2170,8 +1924,9 @@ class DataTag(DataRelay):
     DOT_COLOR = (110, 200, 255)
     PROPS = [Prop("unit", "Unit", "str", "", prompt="Unit to show after the number (e.g. counts/s, nm, mW):"),
              Prop("color", "Color", "color", (110, 200, 255)),
-             Prop("stream", kind="data", default={}, hidden=True),    # what turns streaming on: {"id", "key"}
              Prop("held", kind="data", default=None, hidden=True)]    # the last value taken (shown while off)
+    TAKES = (Take("in", "value"),
+             Take("stream", "streaming", kind="onoff", current=lambda: "always"))
 
     @classmethod
     def create(cls, app):
@@ -2197,22 +1952,19 @@ class DataTag(DataRelay):
 
     # --- Streaming ------------------------------------------------------------------------
     def stream_source(self):
-        sid = self.stream.get("id")
-        return self.scene.by_id.get(sid) if sid and self.scene else None
+        return self.take_source("stream")
 
     def streaming(self):
         """True while the tag passes its source's value live: always when nothing is
-        linked to its streaming icon, else while that source is on (> 0.5)."""
-        src = self.stream_source()
+        linked to its streaming input, else while that is on (not 0)."""
         guard = self.id + "#stream"
-        if src is None or guard in _RELAYS_RESOLVING:
+        if self.stream_source() is None or guard in _RELAYS_RESOLVING:
             return True
         _RELAYS_RESOLVING.add(guard)
         try:
-            on = src.outputs().get(self.stream.get("key"))
+            return bool(self.take_on("stream"))
         finally:
             _RELAYS_RESOLVING.discard(guard)
-        return on is not None and on > DC_EDGE
 
     def value(self):
         """Live while streaming (and remembered); otherwise the value it last took."""
@@ -2229,35 +1981,6 @@ class DataTag(DataRelay):
             self.scene.save()                         # a reading was just taken: keep it
         self._was_streaming = streaming
 
-    def pick_stream(self, app):
-        linked = self.stream_source() is not None
-        def link(src):
-            if src is self:                          # clicked itself: always stream again
-                self.stream = {}
-            else:
-                keys = list(src.outputs())
-                key = next((k for k in ("pressed", "on", "value") if k in keys), keys[0])
-                self.stream = {"id": src.id, "key": key}
-            self._recount = 0.0
-            app.save()
-        hint = " — or click this tag to always stream" if linked else ""
-        app.start_picking("Click what turns streaming on (a push button: one reading per press; "
-                          f"a switch: live while on){hint}", link,
-                          accept=lambda obj: (obj is self and linked) or (obj is not self and bool(obj.outputs())),
-                          origin=self.stream_point())
-
-    def next_stream_key(self, app):
-        src = self.stream_source()
-        keys = list(src.outputs()) if src is not None else []
-        if keys:
-            key = self.stream.get("key")
-            self.stream["key"] = keys[(keys.index(key) + 1) % len(keys) if key in keys else 0]
-            app.save()
-
-    def always_stream(self, app):
-        self.stream = {}
-        app.save()
-
     def rename(self, app):
         def submit(text):
             if text.strip():
@@ -2270,8 +1993,13 @@ class DataTag(DataRelay):
         c = self.world_center
         return (c.x - self.world_width / 2 + x * self.scale, c.y - self.world_height / 2 + y * self.scale)
 
-    def input_point(self):
+    def input_point(self, port):
+        if port == "stream":
+            return self.stream_point()
         return self._to_world(TAG_HOLE[0], TAG_HOLE[1])
+
+    def take_at(self, pos, camera):
+        return "stream" if self._stream_rect(self.screen_rect(camera)).collidepoint(pos) else "in"
 
     def output_point(self):
         return self._to_world(TAG_W, TAG_H / 2)
@@ -2293,35 +2021,18 @@ class DataTag(DataRelay):
     def on_click(self, pos, app):
         rect = self.screen_rect(app.camera)
         if self._stream_rect(rect).collidepoint(pos):
-            self.pick_stream(app)
+            self.pick(app, "stream")
         elif self._name_rect(rect).collidepoint(pos):
             self.rename(app)
         else:
-            self.pick_source(app)
+            self.pick(app, "in")
         return True
 
-    def inspector(self, app):
-        rows = [Row("Name", self.title, on_click=self.rename)]
-        src = self.stream_source()
-        if src is None:
-            rows.append(Row("Streaming", "live — click to link a button", on_click=self.pick_stream))
-        else:
-            rows.append(Row("Streaming", f"{src.display_name} · {'on' if self.streaming() else 'off, holding'}",
-                            on_click=self.pick_stream))
-            rows.append(Row("   reads", self.stream.get("key"), on_click=self.next_stream_key))
-        return rows + super().inspector(app)
-
-    def buttons(self, app):
-        out = super().buttons(app)
+    def state_rows(self, app):
+        rows = super().state_rows(app)
         if self.stream_source() is not None:
-            out.append(Btn("Always stream", self.always_stream))
-        return out
-
-    def draw_links(self, surface, camera):
-        super().draw_links(surface, camera)
-        src = self.stream_source()
-        if src is not None and src.center is not None:
-            draw_wire(surface, camera, output_point(src), self.stream_point(), TAG_STREAM_WIRE)
+            rows.append(Row("Streaming", "on" if self.streaming() else "off, holding the last value"))
+        return rows
 
     # --- Drawing ----------------------------------------------------------------------
     def draw_shape(self, surface, rect, camera):
@@ -2508,10 +2219,8 @@ class Label(Thing):
                 app.save()
         app.ask("Label text:", submit, value=self.text)
 
-    def inspector(self, app):
-        pos = f"{self.world_center.x:.0f}, {self.world_center.y:.0f}"
-        return [Row("Text", self.text or "—", on_click=self.edit_text),
-                Row("ID", self.id), Row("Position", pos)] + self.prop_rows()
+    def rename(self, app):
+        self.edit_text(app)          # its name in the panel is its text
 
     # --- Text ---------------------------------------------------------------------
     def shown_text(self):
@@ -2792,10 +2501,12 @@ DEVICE_RETRY_SECONDS = 3.0      # how often a driver-specific object re-asks the
 class Device(Thing):
     """One device on the instrument server, on the canvas. Shows its name, a
     status light, and a small screen with its param values (what it's set to)
-    and readings (what it reports). Each param can be linked to a source —
-    e.g. a slider — and then follows it live; readings are outputs, so a
-    readout can show them. Its params and links are saved; the device itself
-    keeps running (and holds its last values) when the canvas closes."""
+    and readings (what it reports). Its params are its inputs: set one by hand,
+    or link it to follow something (e.g. a slider). Its number readings — and
+    its params' settings — are its outputs. Its links and the names of its
+    params / readings are saved (so it can be wired up while it's offline);
+    the device itself keeps running (and holds its last values) when the
+    canvas closes."""
 
     TYPE = "device"
     MENU_LABEL = None             # not in the menus: placed from the Instrument server's device list
@@ -2809,8 +2520,7 @@ class Device(Thing):
                   prompt="Size (1 = normal, 2 = twice as big):"),
              Prop("device", kind="str", default="", hidden=True),     # name on the server
              Prop("connect", kind="bool", default=False, hidden=True),  # Connect pressed (saved)
-             Prop("links", kind="data", default={}, hidden=True)]     # param -> {"id", "key"}
-    WIRE_COLOR = (120, 220, 150)
+             Prop("catalog", kind="data", default={}, hidden=True)]   # last seen params / readings (see _catalog)
 
     @classmethod
     def create(cls, app):
@@ -2880,30 +2590,76 @@ class Device(Thing):
     def on_removed(self):
         instruments.client.want(self.id, False)
 
-    def outputs(self):
-        """Readings first (what it reports — a readout links to the first one by
-        default), then params (what it's set to)."""
+    # --- Inputs (params) and outputs (readings) ---------------------------------------
+    def _catalog(self):
+        """{"params": {name: unit}, "readings": {name: unit}, "text": [names]} —
+        from the server while it's there (number readings only: text readings
+        are shown, not linked), else the last one seen (saved), so it can be
+        wired up while offline."""
         info = self.info()
         if info is None:
-            return {}
-        out = {k: v for k, v in info["values"].items()
-               if isinstance(v, (int, float)) and not isinstance(v, bool)}   # numbers only (text is shown, not linked)
-        for p, spec in info["params"].items():
-            if spec.get("value") is not None:
-                out.setdefault(p, spec["value"])
+            return {"params": self.catalog.get("params", {}), "readings": self.catalog.get("readings", {}),
+                    "text": self.catalog.get("text", [])}
+        text = set(self.catalog.get("text", []))
+        text |= {k for k, v in info["values"].items() if isinstance(v, str)}
+        return {"params": {p: spec.get("unit", "") for p, spec in info["params"].items()},
+                "readings": {r: spec.get("unit", "") for r, spec in info["readings"].items() if r not in text},
+                "text": sorted(text)}
+
+    @staticmethod
+    def _param_give(param, readings):
+        """A param's output name: the param's own, or "<param> (set)" when a
+        reading has that name (e.g. a filter wheel's position)."""
+        return f"{param} (set)" if param in readings else param
+
+    def param_value(self, param):
+        info = self.info()
+        spec = info["params"].get(param) if info is not None else None
+        return spec.get("value") if spec is not None else None
+
+    def outputs(self):
+        """Readings first (what it reports), then params (what they're set to)."""
+        cat = self._catalog()
+        info = self.info()
+        values = info["values"] if info is not None else {}
+        out = {}
+        for r in cat["readings"]:
+            v = values.get(r)
+            out[r] = v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+        for p in cat["params"]:
+            out[self._param_give(p, cat["readings"])] = self.param_value(p)
         return out
+
+    def gives(self):
+        cat = self._catalog()
+        return ([Give(r, unit=u) for r, u in cat["readings"].items()] +
+                [Give(self._param_give(p, cat["readings"]), unit=u) for p, u in cat["params"].items()])
+
+    def takes(self):
+        """One input per param (set it by hand while it's live, or link it), plus
+        any linked one the device no longer has, so it can be unlinked."""
+        params = self._catalog()["params"]
+        live = self.connect and self.info() is not None
+        out = [Take(p, unit=u, current=lambda p=p: self.param_value(p),
+                    set_by_hand=(lambda app, p=p: self.set_by_hand(app, p)) if live else None)
+               for p, u in params.items()]
+        return out + [Take(port) for port in self.links if port not in params]
 
     def tick(self, dt):
         """Keep the connection wanted (while Connect is on), set up the device
-        if needed, and push each linked param's source value to the server
-        (the client skips repeats and caps the rate)."""
+        if needed, remember its params / readings, and push each linked param's
+        source value to the server (the client skips repeats and caps the rate)."""
         instruments.client.want(self.id, self.connect)
         if not self.connect or not self.device or self.scene is None:
             return
         self._provision()
-        for param, link in self.links.items():
-            src = self.scene.by_id.get(link.get("id"))
-            value = src.outputs().get(link.get("key")) if src is not None else None
+        if self.info() is not None:
+            cat = self._catalog()
+            if cat != self.catalog:
+                self.catalog = cat
+                self.scene.save()
+        for param in self.links:
+            value = self.take(param)
             if value is not None:
                 instruments.client.set(self.device, param, value)
 
@@ -2915,7 +2671,10 @@ class Device(Thing):
             self.device = names[(i + 1) % len(names)]
             app.save()
 
-    def set_by_hand(self, app, param, spec):
+    def set_by_hand(self, app, param):
+        info = self.info()
+        spec = (info["params"].get(param) if info is not None else None) or {}
+
         def submit(text):
             try:
                 instruments.client.set(self.device, param, float(text))
@@ -2939,48 +2698,36 @@ class Device(Thing):
         app.ask(f"Port, or auto ({hint}):", submit,
                 value=str(info.get("options", {}).get("port", "auto")))
 
-    def pick_source(self, app, param):
-        def link(src):
-            keys = list(src.outputs())
-            self.links[param] = {"id": src.id, "key": "value" if "value" in keys else keys[0]}
-            app.save()
-        app.start_picking(f"Click what {param} should follow (a slider, …)", link,
-                          accept=lambda obj: obj is not self and bool(obj.outputs()),
-                          origin=self.center)
+    def panel_name(self):
+        return super().panel_name() or self.device or None
 
-    def unlink_all(self, app):
-        self.links = {}
-        app.save()
-
-    def inspector(self, app):
+    def panel_status(self, app):
         status = self.status()
-        rows = [Row("Device", self.device or "— (none)",
-                    on_click=None if self.DRIVER else self.next_device),
-                Row("Status", DEVICE_STATUS_TEXT.get(status, status),
-                    color=DEVICE_STATUS_COLORS.get(status))]
+        return DEVICE_STATUS_TEXT.get(status, status), DEVICE_STATUS_COLORS.get(status, (110, 110, 120))
+
+    def state_rows(self, app):
+        rows = []
+        if not self.DRIVER:
+            rows.append(Row("Server device", self.device or "— (none)", on_click=self.next_device))
+        info = self.info() if self.connect else None
+        if info is not None:
+            if info.get("message"):
+                rows.append(Field("Message", info["message"], color=WARN_COLOR))
+            for name, value in info["values"].items():          # text readings (status, interlock, …)
+                if isinstance(value, str):
+                    rows.append(Row(name, value))
+        return rows
+
+    def info_rows(self, app):
+        rows = super().info_rows(app)
+        if self.DRIVER:
+            rows.append(Row("Server device", self.device or "—"))
         info = self.info() if self.connect else None
         if info is not None:
             rows.append(Row("Driver", info["driver"]))
             if not self.DRIVER and "port" in info.get("options", {}):
                 rows.append(Row("Port", info["options"]["port"], on_click=self.change_port))
-            if info.get("message"):
-                rows.append(Field("Message", info["message"], color=WARN_COLOR))
-            for param, spec in info["params"].items():
-                rows.append(Gap(6))
-                value = spec.get("value")
-                rows.append(Row(f"{param} (set)", "—" if value is None else f"{value:g} {spec.get('unit', '')}",
-                                on_click=lambda app, p=param, s=spec: self.set_by_hand(app, p, s)))
-                link = self.links.get(param)
-                src = self.scene.by_id.get(link["id"]) if link and self.scene else None
-                rows.append(Row("   follows", f"{src.display_name} · {link['key']}" if src else
-                                "— click to link", on_click=lambda app, p=param: self.pick_source(app, p)))
-            if info["readings"]:
-                rows.append(Gap(6))
-            for name, spec in info["readings"].items():
-                value = info["values"].get(name)
-                rows.append(Row(name, "—" if value is None else
-                                str(value) if isinstance(value, str) else f"{value:g} {spec.get('unit', '')}"))
-        return rows + [Gap(6)] + self.prop_rows()
+        return rows
 
     def remove_from_server(self, app):
         def remove():
@@ -2991,29 +2738,25 @@ class Device(Thing):
     def run_action(self, app, name):
         instruments.client.send({"op": "action", "device": self.device, "name": name})
 
-    def buttons(self, app):
+    def actions(self, app):
+        """Driver actions (Home, Stop, …) while it's running, then Connect / Disconnect."""
         out = []
         info = self.info() if self.connect else None
         if info is not None and info.get("status") == "ok":
-            for name in info.get("actions", []):          # driver actions: Home, Stop, …
+            for name in info.get("actions", []):
                 out.append(Btn(name.capitalize(), lambda app, n=name: self.run_action(app, n)))
-        if self.links:
-            out.append(Btn("Unlink all", self.unlink_all))
+        return out + [self.connect_button()]
+
+    def connect_button(self):
+        return (Btn("Disconnect", self.disconnect) if self.connect
+                else Btn("Connect", self.connect_now, style="go"))
+
+    def menu_items(self, app):
         if not self.DRIVER and self.connect and instruments.client.connected and self.info() is not None:
-            out.append(Btn("Remove from server", self.remove_from_server))
-        out.append(Btn("Disconnect", self.disconnect) if self.connect
-                   else Btn("Connect", self.connect_now, style="go"))
-        return out
+            return [("Remove from server…", lambda: self.remove_from_server(app), "danger")]
+        return []
 
     # --- Drawing ----------------------------------------------------------------------
-    def draw_links(self, surface, camera):
-        if self.scene is None:
-            return
-        for link in self.links.values():
-            src = self.scene.by_id.get(link.get("id"))
-            if src is not None and src.center is not None:
-                draw_wire(surface, camera, output_point(src), self.center, self.WIRE_COLOR)
-
     def draw_shape(self, surface, rect, camera):
         s = min(rect.width, rect.height)
         radius = max(2, s // 8)
@@ -3104,8 +2847,8 @@ class ArduinoServo(Device):
     def device_options(self):
         return {"port": self.port or "auto", "baud": self.baud}
 
-    def inspector(self, app):
-        rows = super().inspector(app)
+    def info_rows(self, app):
+        rows = super().info_rows(app)
         arduinos = [p["device"] for p in instruments.client.ports if p.get("arduino")]
         if instruments.client.connected:
             rows.append(Row("Arduino found on", ", ".join(arduinos) or "— none plugged in"))
@@ -3262,8 +3005,8 @@ class ZaberStage(Device):
         return (values.get("position"), spec.get("value"), spec.get("min"), spec.get("max"),
                 bool(values.get("moving")), bool(values.get("homed")))
 
-    def inspector(self, app):
-        rows = super().inspector(app)
+    def state_rows(self, app):
+        rows = super().state_rows(app)
         position, target, low, high, moving, homed = self._numbers()
         if low is not None and high is not None:
             rows.append(Row("Travel", f"{low:g} – {high:g} mm"))
@@ -3478,15 +3221,18 @@ class FilterBand(Device):
         self._drag_nm = nm
         instruments.client.set(self.device, "center", nm)
 
-    def inspector(self, app):
-        rows = super().inspector(app)
+    def state_rows(self, app):
+        rows = super().state_rows(app)
         band = self._band()
         if self.live():
             rows.append(Row("Reach", f"{band['lo']:g} – {band['hi']:g} nm"))
-        rows.append(Field("Calibration", "calibration/excitation_filters.json — recalibrate with "
-                                         "scripts/calibrate_excitation_filters.py (Stop server first; "
-                                         "reconnect to load it)"))
         return rows
+
+    def info_rows(self, app):
+        return super().info_rows(app) + [
+            Field("Calibration", "calibration/excitation_filters.json — recalibrate with "
+                                 "scripts/calibrate_excitation_filters.py (Stop server first; "
+                                 "reconnect to load it)")]
 
     # --- Drawing -----------------------------------------------------------------------
     def _draw_spectrum(self, surface, strip, band):
@@ -3997,7 +3743,7 @@ class SuperK(Device):
             self.run_action(app, "emission_off")  # no beam left running without its controls
         super().disconnect(app)
 
-    def buttons(self, app):
+    def actions(self, app):
         out = []
         emitting, interlock_ok, _i, _s, _p = self.laser_state()
         if self.live():
@@ -4007,11 +3753,7 @@ class SuperK(Device):
                 out.append(Btn("Turn emission ON", self.toggle_emission, style="go"))
             if interlock_ok == 0:
                 out.append(Btn("Reset interlock", lambda app: self.run_action(app, "reset_interlock")))
-        if self.links:
-            out.append(Btn("Unlink all", self.unlink_all))
-        out.append(Btn("Disconnect", self.disconnect) if self.connect
-                   else Btn("Connect", self.connect_now, style="go"))
-        return out
+        return out + [self.connect_button()]
 
     # --- Layout (shared by drawing and clicking) -----------------------------------------
     def _layout(self, rect):
@@ -4287,7 +4029,7 @@ class FlipMirror(Device):
                 return True
         return False
 
-    def buttons(self, app):
+    def actions(self, app):
         out = []
         is_up, up, down, _f = self.mirror_state()
         if self.live():
@@ -4296,14 +4038,10 @@ class FlipMirror(Device):
             out.append(Btn(f"It's at {up}", lambda app: self.run_action(app, "sync_up")))
             out.append(Btn(f"It's at {down}", lambda app: self.run_action(app, "sync_down")))
             out.append(Btn("Find position (moves it)", self.find_position))
-        if self.links:
-            out.append(Btn("Unlink all", self.unlink_all))
-        out.append(Btn("Disconnect", self.disconnect) if self.connect
-                   else Btn("Connect", self.connect_now, style="go"))
-        return out
+        return out + [self.connect_button()]
 
-    def inspector(self, app):
-        rows = [Row("Name", self.title, on_click=self.rename)] + super().inspector(app)
+    def state_rows(self, app):
+        rows = super().state_rows(app)
         if self.live():
             is_up = self.mirror_state()[0]
             rows.append(Field("Note", "position unknown: say where it is, or Find position" if is_up is None
@@ -4529,9 +4267,8 @@ class FilterWheel(Device):
             app.save()
         app.ask(f"Name of slot {slot} (blank = open / unnamed):", submit, value=self.slot_name(slot))
 
-    def inspector(self, app):
-        rows = [Row("Name", self.title, on_click=self.rename)] + super().inspector(app)
-        rows.append(Gap(6))
+    def state_rows(self, app):
+        rows = super().state_rows(app)
         here = self.position()
         for slot in range(1, self.slot_count() + 1):
             name = self.slot_name(slot)
@@ -4539,14 +4276,14 @@ class FilterWheel(Device):
                             on_click=lambda app, s=slot: self.rename_slot(app, s)))
         return rows
 
-    def buttons(self, app):
+    def actions(self, app):
         out = []
         if self.live() and "position" not in self.links:
             here = self.position()
             if here is not None:
                 n = self.slot_count()
                 out.append(Btn("Next slot", lambda app: self.go_to(app, here % n + 1)))
-        return out + super().buttons(app)
+        return out + super().actions(app)
 
     # --- Drawing / clicking --------------------------------------------------------------
     def _layout(self, rect):
@@ -4788,41 +4525,46 @@ class InstrumentServer(Thing):
             app.ask(f"Port for {name} (e.g. COM3 — leave empty if none):", ported)
         app.ask(f"Name for the new {driver} device:", named, value=default)
 
-    # --- Inspector ------------------------------------------------------------------
-    def inspector(self, app):
+    # --- Panel ----------------------------------------------------------------------
+    def panel_status(self, app):
         state = self.state()
-        client = instruments.client
         text = {"off": "off — press Connect", "connecting": "connecting…", "connected": "connected"}
-        rows = [Row("Status", text[state], color=self.STATE_COLORS[state]),
-                Row("Address", f"{instruments.HOST}:{instruments.PORT} (this PC only)")]
-        if client.last_error:
-            rows.append(Field("Server said", client.last_error, color=WARN_COLOR))
-        if state == "connected":
-            rows += [Gap(8), Row("Devices", "click: place / go to")]
-            names = client.device_names()
-            for name in names:
-                info = client.device(name) or {}
-                status = info.get("status", "?")
-                rows.append(Row(f"   {name}", f"{info.get('driver', '?')} · {status}",
-                                color=DEVICE_STATUS_COLORS.get(status),
-                                on_click=lambda app, n=name, d=info.get("driver"): self.show_device(app, n, d)))
-            if not names:
-                rows.append(Row("   —", "none yet"))
-            rows += [Gap(8), Row("Drivers", "click: add a device")]
-            for drv in client.drivers:
-                rows.append(Row(f"   {drv['module']}", drv["error"] or drv["title"],
-                                color=WARN_COLOR if drv["error"] else None,
-                                on_click=None if drv["error"] else
-                                lambda app, m=drv["module"]: self.add_device(app, m)))
-        return rows + [Gap(6)] + self.prop_rows()
+        return text[state], self.STATE_COLORS[state]
 
-    def buttons(self, app):
+    def state_rows(self, app):
+        client = instruments.client
+        return [Field("Server said", client.last_error, color=WARN_COLOR)] if client.last_error else []
+
+    def more_sections(self, app):
+        client = instruments.client
+        if self.state() != "connected":
+            return []
+        devices = []
+        for name in client.device_names():
+            info = client.device(name) or {}
+            status = info.get("status", "?")
+            devices.append(Row(name, f"{info.get('driver', '?')} · {status}",
+                               color=DEVICE_STATUS_COLORS.get(status),
+                               on_click=lambda app, n=name, d=info.get("driver"): self.show_device(app, n, d)))
+        drivers = [Row(drv["module"], drv["error"] or drv["title"],
+                       color=WARN_COLOR if drv["error"] else None,
+                       on_click=None if drv["error"] else lambda app, m=drv["module"]: self.add_device(app, m))
+                   for drv in client.drivers]
+        return [Section("Devices (click to place)", devices or [Row("—", "none yet")]),
+                Section("Add a device", drivers or [Row("—", "no drivers found")])]
+
+    def info_rows(self, app):
+        return super().info_rows(app) + [Row("Address", f"{instruments.HOST}:{instruments.PORT} (this PC only)")]
+
+    def actions(self, app):
         if not instruments.client.enabled:
             return [Btn("Connect", self.connect_now, style="go")]
-        out = [Btn("Disconnect all", self.disconnect)]
+        return [Btn("Disconnect all", self.disconnect)]
+
+    def menu_items(self, app):
         if instruments.client.connected:
-            out.append(Btn("Stop server", self.stop_server))
-        return out
+            return [("Stop server…", lambda: self.stop_server(app), "danger")]
+        return []
 
     # --- Drawing ----------------------------------------------------------------------
     def draw_shape(self, surface, rect, camera):

@@ -384,10 +384,11 @@ class CameraRide:
 # The pieces an object type uses to describe itself, so the game loop and the
 # inspector never need to know what type it is:
 #   Prop            a saved, inspector-editable field (listed in a class's PROPS)
-#   Field / Row / Stepper / Gap / ScrollList
-#                   what the inspector shows (returned by obj.inspector(app))
+#   Section / Field / Row / Stepper / Gap / ScrollList / PortRow / GiveRow
+#                   what the inspector shows (built by obj.inspector(app))
+#   Take / Give     an object's inputs and outputs, and the links between them
 #   Btn, @panel_button
-#                   the buttons at the bottom of the inspector (obj.buttons(app))
+#                   the buttons at the bottom of the inspector (obj.actions(app))
 # Every callback (on_click=…, a Btn, a @panel_button method) is called with the
 # App (see the APP section at the bottom): scene, camera, ask(), save(), …
 
@@ -420,12 +421,15 @@ class Prop:
     (needs choices=[...]), or "data" (any JSON — a dict/list; use with
     hidden=True, it can't be typed in). min/max clamp numbers. editable=False shows it
     read-only; hidden=True saves it without showing it at all (e.g. a link's
-    target id). unit is appended when displayed ("700 units/sec")."""
+    target id). unit is appended when displayed ("700 units/sec"). state=True
+    lists it under the panel's State section (a switch's On, a slider's Value)
+    instead of Settings."""
 
     KINDS = ("float", "int", "str", "bool", "color", "choice", "data")
 
     def __init__(self, key, label=None, kind="float", default=0.0, *, min=None,
-                 max=None, choices=None, editable=True, unit="", prompt=None, hidden=False):
+                 max=None, choices=None, editable=True, unit="", prompt=None, hidden=False,
+                 state=False):
         if kind not in self.KINDS:
             raise ValueError(f"Prop {key!r}: unknown kind {kind!r}")
         if kind == "choice" and not choices:
@@ -440,6 +444,7 @@ class Prop:
         self.unit = unit
         self.prompt = prompt or f"{self.label}:"
         self.hidden = hidden            # saved, but not shown in the inspector
+        self.state = state              # shown under State (what it is now), not Settings
 
     def parse(self, text):
         """Text typed into the edit box -> a value. Raises ValueError."""
@@ -530,10 +535,12 @@ class Field:
 
 
 class Row:
-    """One compact line: label on the left, value on the right."""
+    """One compact line: label on the left, value on the right. sub=True draws
+    it indented, as a detail of the row above."""
 
-    def __init__(self, label, value, *, on_click=None, color=None):
+    def __init__(self, label, value, *, on_click=None, color=None, sub=False):
         self.label, self.value, self.on_click, self.color = label, value, on_click, color
+        self.sub = sub
 
 
 class Stepper:
@@ -553,12 +560,37 @@ class Gap:
 
 
 class ScrollList:
-    """A titled, wheel-scrollable list that fills the panel down to the
-    buttons, so put it last. items: [(name, value, on_click or None), ...].
-    `key` identifies whose list it is; showing a different key resets the scroll."""
+    """A titled, wheel-scrollable list (up to SCROLL_LIST_ROWS rows tall).
+    items: [(name, value, on_click or None), ...]. `key` identifies whose list
+    it is; showing a different key resets the scroll."""
 
     def __init__(self, title, items, *, empty="—", key=None):
         self.title, self.items, self.empty, self.key = title, items, empty, key
+
+
+class Section:
+    """A titled group of rows in the panel. Clicking the title folds it (the
+    panel remembers that per object type). collapsed = folded by default."""
+
+    def __init__(self, title, rows, *, collapsed=False):
+        self.title, self.rows, self.collapsed = title, rows, collapsed
+
+
+class PortRow:
+    """One input (a Take) of obj. The panel draws it from the take: its name,
+    then either "link" (and the value set by hand, if any) or the source ·
+    give it follows with an x to unlink, and the live value under that."""
+
+    def __init__(self, obj, take):
+        self.obj, self.take = obj, take
+
+
+class GiveRow:
+    """One output (a Give) of obj: its name and live value. Clicking it links
+    it to an input of another object."""
+
+    def __init__(self, obj, give, value):
+        self.obj, self.give, self.value = obj, give, value
 
 
 class Btn:
@@ -578,6 +610,90 @@ def panel_button(label):
         fn.panel_button = label
         return fn
     return mark
+
+
+# ---- Inputs and outputs: how values flow between objects ---------------------
+# An object *gives* named values (outputs(), declared by gives()) and *takes*
+# them on named inputs (takes()). A link — saved in obj.links as
+# {port: {"id": source id, "key": which give}} — makes one input follow one
+# output. An output can feed any number of inputs; an input has one source.
+# On/off is just 0 or 1 (anything that isn't 0 counts as on).
+class Take:
+    """One input of an object: something it can follow from another object.
+
+    kind: "number" (follows the value), "onoff" (on while the source isn't 0),
+    or "press" (acts once each time the source goes 0 → 1: the object's
+    on_press(port) runs). verb is what the panel says it does ("follows",
+    "records"; default by kind). current() is what it uses while unlinked (a
+    device param's setting — a number, or text like "always"),
+    set_by_hand(app) lets you type one, and on_label(app) runs when its name is
+    clicked (e.g. a collector column's menu)."""
+
+    KINDS = ("number", "onoff", "press")
+
+    def __init__(self, key, label=None, kind="number", *, unit="", verb=None,
+                 current=None, set_by_hand=None, on_label=None):
+        if kind not in self.KINDS:
+            raise ValueError(f"Take {key!r}: unknown kind {kind!r}")
+        self.key = key
+        self.label = label or key
+        self.kind = kind
+        self.unit = unit
+        self.verb = verb
+        self.current = current
+        self.set_by_hand = set_by_hand
+        self.on_label = on_label
+
+
+class Give:
+    """One output of an object: a named live value (a number, or None while it
+    has none). The value itself comes from obj.outputs()[key]."""
+
+    def __init__(self, key, label=None, unit=""):
+        self.key = key
+        self.label = label or key
+        self.unit = unit
+
+
+LINK_COLOR = (120, 220, 150)        # number wires (flowing dots)
+LINK_ONOFF_COLOR = (240, 200, 90)   # on/off and press wires
+PRESS_FLASH = 0.35                  # seconds a press wire stays lit after it fires
+
+
+def format_value(value, unit=""):
+    """A live value for the panel: 6 significant digits + unit, or "—"."""
+    if value is None:
+        return "—"
+    return f"{value:.6g}" + (f" {unit}" if unit else "")
+
+
+def output_point(obj):
+    """World point a wire from obj's outputs starts at: its output_point() if
+    it has one (a Function's output nub), else its center."""
+    point = getattr(obj, "output_point", None)
+    return point() if point is not None else obj.center
+
+
+def draw_wire(surface, camera, start, end, color, *, flow=True, width=2):
+    """A link between two world points: a thin line, with dots flowing from
+    start toward end (the direction the value travels) when flow is on."""
+    a = pygame.Vector2(camera.world_to_screen(start))
+    b = pygame.Vector2(camera.world_to_screen(end))
+    if (b - a).length() < 2:
+        return
+    pygame.draw.line(surface, tuple(int(c * 0.45) for c in color), a, b, width)
+    if not flow:
+        return
+    t = pygame.time.get_ticks() / 1000.0
+    dots = max(2, min(12, int((b - a).length() / 60)))
+    for k in range(dots):
+        f = (t * 0.6 + k / dots) % 1.0
+        pygame.draw.circle(surface, color, a.lerp(b, f), 3)
+
+
+def short_name(obj):
+    """What a link row calls an object: its own name if it has one, else its type."""
+    return obj.panel_name() or obj.type_name()
 
 
 # ============================================================================
@@ -607,7 +723,9 @@ class CanvasObject:
     MENU_LABEL = None  # Add-menu entry ("Add lamp"); None = not offered in the menu / E menu
     NAME = None        # name under its icon in the E menu (default: MENU_LABEL minus "Add ")
     CATEGORY = None    # E-menu tab it also appears under (every type is in "All")
-    PROPS = []         # saved, inspector-editable fields (see Prop); inherited + extended
+    PROPS = [Prop("links", kind="data", default={}, hidden=True)]   # input -> {"id", "key"}
+                       # saved, inspector-editable fields (see Prop); inherited + extended
+    TAKES = ()         # its inputs (see Take); override takes() when they change
     COPY_SKIP = ()     # saved keys a copy should NOT carry over (e.g. a neuron's weights)
     draw_layer = 0     # paint order (higher = on top)
     selectable = False
@@ -628,6 +746,8 @@ class CanvasObject:
         self.id = id or new_id()
         for p in self.props():
             setattr(self, p.key, copy.deepcopy(p.default))   # own copy: never share a dict/list default
+        self._press_last = {}       # press input -> on last frame (missing = not read yet: no press)
+        self._press_flash = {}      # press input -> seconds its wire stays lit
 
     @classmethod
     def props(cls):
@@ -735,33 +855,223 @@ class CanvasObject:
         return None
 
     def draw_links(self, surface, camera):
-        """Draw this object's connections (wires) — called for every object
-        before any object is drawn, so wires sit underneath."""
-        pass
+        """Draw the wires into this object's inputs — called for every object
+        before any object is drawn, so wires sit underneath. Each wire runs
+        from the source's output_point() to this object's input_point(port);
+        number wires flow green, on/off wires are amber (lit while on), press
+        wires flash when they fire."""
+        if self.scene is None or not self.links:
+            return
+        for take in self.takes():
+            src = self.take_source(take.key)
+            if src is None or src.center is None:
+                continue
+            start, end = output_point(src), self.input_point(take.key)
+            if take.kind == "number":
+                draw_wire(surface, camera, start, end, LINK_COLOR)
+            elif take.kind == "onoff":
+                on = self.take_on(take.key)
+                draw_wire(surface, camera, start, end, LINK_ONOFF_COLOR, flow=bool(on))
+            else:
+                lit = self._press_flash.get(take.key, 0) > 0
+                draw_wire(surface, camera, start, end, LINK_ONOFF_COLOR, flow=lit, width=3 if lit else 2)
 
+    def input_point(self, port):
+        """World point where the wire into input `port` ends. Default: the center."""
+        return self.center
+
+    def take_at(self, pos, camera):
+        """The input whose chip is under screen pos (a wire dropped there links
+        to it), or None. Default: none."""
+        return None
+
+    def give_at(self, pos, camera):
+        """The output whose nub is under screen pos (dragging from it lays a
+        wire), or None. Default: the first output, if it has an output_point()
+        nub and pos is on it."""
+        point = getattr(self, "output_point", None)
+        gives = self.gives() if point is not None else []
+        if not gives:
+            return None
+        nub = pygame.Vector2(camera.world_to_screen(point()))
+        reach = max(8, 8 * getattr(self, "scale", 1.0) * camera.zoom)
+        return gives[0].key if nub.distance_to(pos) <= reach else None
+
+    # --- Outputs (gives) ------------------------------------------------------------
     def outputs(self):
-        """Live values other objects can read from this one (e.g. a Readout
-        linked to it): {name: number}. Default: none."""
+        """Live values other objects can read from this one: {name: number or
+        None}. Every output it has is listed, with None while it has no value."""
         return {}
 
-    # --- Inspector -------------------------------------------------------------
-    def inspector(self, app):
-        """Rows for the inspector panel, top to bottom. Default: the name (if
-        this type has one) and every Prop."""
-        rows = []
-        if getattr(self, "text", None) is not None:
-            rows.append(Row("Name", self.display_name))
-        return rows + self.prop_rows()
+    def gives(self):
+        """Its outputs, declared (name, unit) — so the panel and the link picker
+        can list them even while a value is None. Default: one per outputs() key."""
+        return [Give(key) for key in self.outputs()]
 
-    def prop_rows(self):
-        """One clickable Row per Prop — for use in a custom inspector()."""
+    # --- Inputs (takes) and links ------------------------------------------------------
+    def takes(self):
+        """Its inputs (Take), top to bottom. Default: TAKES."""
+        return list(self.TAKES)
+
+    def find_take(self, port):
+        return next((t for t in self.takes() if t.key == port), None)
+
+    def take_source(self, port):
+        """The object input `port` follows, or None (unlinked, or it was deleted)."""
+        link = self.links.get(port)
+        if not link or not link.get("id") or self.scene is None:
+            return None
+        return self.scene.by_id.get(link["id"])
+
+    def take(self, port):
+        """The value input `port` follows right now, or None (unlinked, source
+        deleted, or the source has no value)."""
+        src = self.take_source(port)
+        return src.outputs().get(self.links[port].get("key")) if src is not None else None
+
+    def take_on(self, port):
+        """An on/off input: True / False, or None while it has no value."""
+        value = self.take(port)
+        return None if value is None else value != 0
+
+    def link(self, port, src, key, app=None):
+        """Make input `port` follow src's output `key`."""
+        self.links = dict(self.links, **{port: {"id": src.id, "key": key}})
+        self._press_last.pop(port, None)
+        self.on_links_changed()
+        self._save(app)
+
+    def unlink(self, port, app=None):
+        if port in self.links:
+            self.links = {k: v for k, v in self.links.items() if k != port}
+            self._press_last.pop(port, None)
+            self.on_links_changed()
+            self._save(app)
+
+    def unlink_all(self, app=None):
+        self.links = {}
+        self._press_last = {}
+        self.on_links_changed()
+        self._save(app)
+
+    def on_links_changed(self):
+        """Runs after an input is linked or unlinked."""
+        pass
+
+    def pick(self, app, port):
+        """Start linking input `port`: click a source, then (if it has several)
+        choose which output. Override to pass extras to app.pick_link."""
+        app.pick_link(self, port)
+
+    def on_press(self, port):
+        """A "press" input just went 0 → 1."""
+        pass
+
+    def watch_presses(self, dt):
+        """Called every frame by the scene: fires on_press for press inputs. A
+        source that's already on when first read doesn't count — only 0 → 1."""
+        for port in list(self._press_flash):
+            self._press_flash[port] -= dt
+            if self._press_flash[port] <= 0:
+                del self._press_flash[port]
+        if type(self).on_press is CanvasObject.on_press or not self.links:
+            return
+        for take in self.takes():
+            if take.kind != "press":
+                continue
+            on = self.take_on(take.key)
+            if on is None:
+                self._press_last.pop(take.key, None)
+                continue
+            if on and self._press_last.get(take.key) is False:
+                self._press_flash[take.key] = PRESS_FLASH
+                self.on_press(take.key)
+            self._press_last[take.key] = on
+
+    def _save(self, app):
+        if app is not None:
+            app.save()
+        elif self.scene is not None:
+            self.scene.save()
+
+    # --- Inspector -------------------------------------------------------------
+    # The panel is the same for every type, in this order: a header (type, name,
+    # status), then State, Inputs / takes, Outputs / gives, Settings, Info, and
+    # the footer buttons. A type fills in the pieces below; the inputs, outputs
+    # and settings come from takes(), gives() and PROPS on their own.
+    def panel_name(self):
+        """The name in the panel's header, or None for an unnamed object."""
+        name = getattr(self, "title", None) or getattr(self, "text", None)
+        return name or None
+
+    @property
+    def can_rename(self):
+        return getattr(self, "text", None) is not None
+
+    def rename(self, app):
+        def submit(text):
+            self.text = text.strip()
+            app.save()
+        app.ask("Name:", submit, value=getattr(self, "text", "") or "")
+
+    def panel_status(self, app):
+        """(text, color) for the header's status line, or None."""
+        return None
+
+    def state_rows(self, app):
+        """The State section: what it is / shows right now, and the main thing
+        you edit. (Props marked state=True are added after these.)"""
+        return []
+
+    def input_rows(self, app):
+        """Extra rows at the end of Inputs / takes (e.g. "+ add column")."""
+        return []
+
+    def more_sections(self, app):
+        """Extra Sections, shown before Settings (e.g. a neuron's W's)."""
+        return []
+
+    def info_rows(self, app):
+        """The Info section (folded by default): ID, position, and type extras."""
+        rows = [Row("ID", self.id)]
+        c = self.center
+        if c is not None:
+            rows.append(Row("Position", f"{c[0]:.0f}, {c[1]:.0f}"))
+        return rows
+
+    def inspector(self, app):
+        """The panel's sections, top to bottom (the header and footer are drawn
+        around them). Types fill in state_rows / info_rows / … rather than
+        overriding this."""
+        out = []
+        state = self.state_rows(app) + self.prop_rows(state=True)
+        if state:
+            out.append(Section("State", state))
+        inputs = [PortRow(self, t) for t in self.takes()] + self.input_rows(app)
+        if inputs:
+            out.append(Section("Inputs / takes", inputs))
+        gives = self.gives()
+        if gives:
+            values = self.outputs()
+            out.append(Section("Outputs / gives", [GiveRow(self, g, values.get(g.key)) for g in gives]))
+        out += self.more_sections(app)
+        settings = self.prop_rows()
+        if settings:
+            out.append(Section("Settings", settings))
+        out.append(Section("Info", self.info_rows(app), collapsed=True))
+        return out
+
+    def prop_rows(self, state=False):
+        """One clickable Row per visible Prop (the Settings section; state=True:
+        the ones listed under State)."""
         return [Row(p.label, p.format(getattr(self, p.key)),
                     on_click=(lambda app, p=p: p.edit(self, app)) if p.editable else None)
-                for p in self.props() if not p.hidden]
+                for p in self.props() if not p.hidden and p.state == state]
 
-    def buttons(self, app):
-        """Buttons at the bottom of the inspector, top to bottom. Default: every
-        method marked @panel_button, in the order they're defined."""
+    def actions(self, app):
+        """The footer buttons: doing the object's job. Main action first (green),
+        connection last; past 4 the rest go in the ⋯ menu. Default: every method
+        marked @panel_button, in the order they're defined."""
         found = {}
         for klass in reversed(type(self).__mro__):
             for name, fn in vars(klass).items():
@@ -769,12 +1079,26 @@ class CanvasObject:
                     found[name] = fn.panel_button
         return [Btn(label, getattr(self, name)) for name, label in found.items()]
 
+    def menu_items(self, app):
+        """This type's own entries for the ⋯ / right-click menu: [(label,
+        callback(), style)]. Destructive ones use style "danger"."""
+        return []
+
     # --- Saving ------------------------------------------------------------------
     def to_dict(self):
-        """Base: type, id and every Prop. Subclasses add their own keys."""
+        """Base: type, id and every Prop (links only when there are some).
+        Subclasses add their own keys."""
         d = {"type": self.TYPE, "id": self.id}
         for p in self.props():
+            if p.key == "links" and not self.links:
+                continue
             d[p.key] = p.to_json(getattr(self, p.key))
+        return d
+
+    @classmethod
+    def migrate(cls, d):
+        """Bring older saved data up to date before loading (e.g. links stored
+        the old way). Returns the dict to load. Default: unchanged."""
         return d
 
     @classmethod
@@ -869,23 +1193,20 @@ class Node(CanvasObject):
         c = self.world_center
         return x <= c.x <= x + w and y <= c.y <= y + h
 
-    def inspector(self, app):
-        pos = f"{self.world_center.x:.0f}, {self.world_center.y:.0f}"
+    def state_rows(self, app):
         if not self.LAUNCHER:
-            return [Row("Name", self.display_name), Row("ID", self.id),
-                    Row("Position", pos)] + self.prop_rows()
-        return [Row("Name", self.text or "—"), Row("ID", self.id), Row("Position", pos),
-                Gap(6),
-                Field("Description", self.description or "—"),
-                Field("Command", self.params.get("command") or "— (none set)"),
-                ] + self.prop_rows()
+            return []
+        rows = [Field("Command", self.params.get("command") or "— click to set one",
+                      on_click=self.edit_command)]
+        if self.description:
+            rows.append(Field("Description", self.description))
+        return rows
 
-    def buttons(self, app):
-        out = super().buttons(app)
+    def actions(self, app):
+        out = super().actions(app)
         if self.LAUNCHER:
-            out += [Btn("Set command…", self.edit_command),
-                    Btn("Activate", lambda app: run_action(self, app), style="go",
-                        enabled=bool(self.action))]
+            out.insert(0, Btn("Activate", lambda app: run_action(self, app), style="go",
+                              enabled=bool(self.action)))
         return out
 
     def edit_command(self, app):
@@ -1088,16 +1409,12 @@ class Train(CanvasObject):
         if speed:
             self.speed = float(speed)
 
-    def inspector(self, app):
+    def state_rows(self, app):
         def node_name(nid):
             n = self.scene.by_id.get(nid) if self.scene else None
             return n.display_name if n is not None else (nid or "—")
-        return [Field("From", node_name(self.from_id)), Field("To", node_name(self.to_id)),
-                Field("Speed", self.prop("speed").format(self.speed)),
-                Field("Corners", str(len(self.waypoints)))]
-
-    def buttons(self, app):
-        return [Btn("Adjust speed…", lambda app: self.prop("speed").edit(self, app))]
+        return [Row("From", node_name(self.from_id)), Row("To", node_name(self.to_id)),
+                Row("Corners", str(len(self.waypoints)))]
 
     def _endpoints(self):
         s = self.scene
@@ -1728,16 +2045,15 @@ class Neuron(Agent):
         pygame.draw.ellipse(surface, NEURON_SPOT, spot)
 
     # --- Inspector -------------------------------------------------------------
-    def inspector(self, app):
-        # Compact one-line rows, so the W list at the bottom gets the most room.
-        rows = [Row("Name", self.display_name), Row("ID", self.id),
-                Row("Position", f"{self.world_center.x:.0f}, {self.world_center.y:.0f}"),
-                Gap(6),
-                Field("Firing equation (fires per second)", self.equation or "— (never fires)",
-                      on_click=self.edit_equation)]
+    def panel_status(self, app):
         if self.fire_error:
-            rows.append(Field("Error", self.fire_error))
-        else:
+            return f"firing equation: {self.fire_error}", WARN_COLOR
+        return None
+
+    def state_rows(self, app):
+        rows = [Field("Firing equation (fires per second)", self.equation or "— click to set one",
+                      on_click=self.edit_equation)]
+        if not self.fire_error:
             state = ("  (waiting)" if self.waiting else
                      "  (stopped)" if self.clock_stopped else "")
             rows.append(Row("Clock", f"t = {self.t:.1f} s{state}"))
@@ -1759,20 +2075,17 @@ class Neuron(Agent):
                         color=WARN_COLOR if count > NEURON_SOFT_LIMIT else None))
         # Σ (other's W to this) × (other is firing). O(n), selected neuron only.
         rows.append(Row("Input W (from firing others)", f"{self.input_w():.2f}"))
-        rows.append(Gap(8))
+        return rows
+
+    def more_sections(self, app):
         items = []
         for other_id, w in self.weights.items():
             other = self.scene.by_id.get(other_id) if self.scene else None
             name = other.text if other is not None and other.text else other_id
             items.append((name, f"{w:.2f}",
                           lambda app, oid=other_id, name=name: self.edit_weight(app, oid, name)))
-        rows.append(ScrollList("Output W's (to each other neuron)", items,
-                               empty="— (no other neurons)", key=self))
-        return rows
-
-    def buttons(self, app):
-        return [Btn("Clock trigger equation…", self.edit_trigger),
-                Btn("Set firing equation…", self.edit_equation)]
+        return [Section("Weights", [ScrollList("Output W's (to each other neuron)", items,
+                                               empty="— (no other neurons)", key=self)])]
 
     def edit_equation(self, app):
         def submit(text):
@@ -1989,6 +2302,7 @@ def object_from_dict(d):
     cls = OBJECT_TYPES.get(d.get("type", "button"))
     if cls is None:
         return UnknownObject(d)
+    d = cls.migrate(d)
     obj = cls.from_dict(d)
     obj.load_props(d)
     return obj
@@ -2137,6 +2451,15 @@ class Scene:
                 return o
         return None
 
+    def give_at(self, pos, camera):
+        """(object, output) whose output nub is under a screen point, or None —
+        checked before hit_test, since a nub sits on (or past) its object's edge."""
+        for o in reversed(sorted(self.objects, key=lambda o: o.draw_layer)):
+            key = o.give_at(pos, camera)
+            if key is not None:
+                return o, key
+        return None
+
     def add(self, obj):
         self.add_many([obj])
 
@@ -2171,6 +2494,7 @@ class Scene:
         for o in self.objects:
             try:
                 o.update(mouse_pos, mouse_pressed, camera, dt)
+                o.watch_presses(dt)
             except Exception as e:
                 report_error(f"{o.TYPE}.update", e)
 
@@ -2662,14 +2986,16 @@ CONTEXT_DANGER = (255, 120, 110)     # a destructive context-menu item's text
 
 class ContextMenu:
     """A small right-click menu at the cursor (usually opened via
-    app.context_menu). items: [(label, callback, style)], style "danger" (red
-    text) or None. A click on an item picks it — the loop calls commit(), which
-    runs its callback (it may open another modal, e.g. a confirm). A click
-    anywhere else, or Esc, closes it."""
+    app.context_menu). items: [(label, callback, style)] or (label, callback,
+    style, detail) — detail is grey text on the right (a live value). style
+    "danger" (red text), "title" (a grey heading, not clickable) or None. A
+    click on an item picks it — the loop calls commit(), which runs its
+    callback (it may open another modal, e.g. a confirm). A click anywhere
+    else, or Esc, closes it."""
 
     def __init__(self, pos, items):
         self.pos = pos
-        self.items = items
+        self.items = [tuple(item) + (None,) * (4 - len(item)) for item in items]
         self.chosen = None
 
     def commit(self):
@@ -2680,15 +3006,19 @@ class ContextMenu:
         """[(rect, item)] — opens down-right of the cursor, kept on screen."""
         font = get_font(MENU_FONT_SIZE)
         h = MENU_BAR_HEIGHT
-        width = max([140] + [font.size(label)[0] + 28 for label, _cb, _st in self.items])
-        x = min(self.pos[0], screen_size[0] - width - 2)
-        y = min(self.pos[1], screen_size[1] - h * len(self.items) - 2)
+        width = max([140] + [font.size(label)[0] + 28 + (font.size(detail)[0] + 24 if detail else 0)
+                             for label, _cb, _st, detail in self.items])
+        width = min(width, screen_size[0] - 4)
+        x = max(2, min(self.pos[0], screen_size[0] - width - 2))
+        y = max(2, min(self.pos[1], screen_size[1] - h * len(self.items) - 2))
         return [(pygame.Rect(x, y + i * h, width, h), item) for i, item in enumerate(self.items)]
 
     def handle_event(self, event, screen_size):
         if event.type == pygame.MOUSEBUTTONDOWN and event.button in (1, 3):
             for rect, item in self.layout(screen_size):
                 if rect.collidepoint(event.pos) and event.button == 1:
+                    if item[2] == "title":
+                        return None                 # a heading: not an item
                     self.chosen = item
                     return "submit"
             return "cancel"
@@ -2704,20 +3034,37 @@ class ContextMenu:
         frame = rows[0][0].unionall([r for r, _i in rows])
         pygame.draw.rect(surface, (14, 14, 18), frame.move(2, 3), border_radius=4)   # shadow
         mouse = pygame.mouse.get_pos()
-        for rect, (label, _cb, style) in rows:
-            pygame.draw.rect(surface, MENU_HOVER if rect.collidepoint(mouse) else MENU_BG, rect)
-            ts = font.render(label, True, CONTEXT_DANGER if style == "danger" else MENU_TEXT)
+        for rect, (label, _cb, style, detail) in rows:
+            hot = rect.collidepoint(mouse) and style != "title"
+            pygame.draw.rect(surface, MENU_HOVER if hot else MENU_BG, rect)
+            color = (CONTEXT_DANGER if style == "danger" else
+                     (140, 140, 155) if style == "title" else MENU_TEXT)
+            room = rect.width - 28
+            if detail:
+                ds = font.render(clip_text(detail, font, room // 2), True, (140, 140, 155))
+                surface.blit(ds, ds.get_rect(midright=(rect.right - 14, rect.centery)))
+                room -= ds.get_width() + 16
+            ts = font.render(clip_text(label, font, room), True, color)
             surface.blit(ts, ts.get_rect(midleft=(rect.x + 14, rect.centery)))
         pygame.draw.rect(surface, MENU_BORDER, frame, width=1, border_radius=4)
 
 
 # ---- Inspector panel (right-side overlay; shows the selected object) --------
-INSPECTOR_WIDTH = 280
+INSPECTOR_WIDTH = 300
 INSPECTOR_BG = (34, 34, 42)
 INSPECTOR_BORDER = (70, 70, 84)
 INSPECTOR_TITLE = (235, 235, 240)
 INSPECTOR_LABEL = (150, 150, 165)
 INSPECTOR_VALUE = (228, 228, 234)
+INSPECTOR_SECTION = (128, 128, 146)    # section titles
+INSPECTOR_DIVIDER = (54, 54, 66)
+INSPECTOR_HOVER = (58, 58, 72)
+INSPECTOR_ACCENT = (120, 175, 255)     # "link", "+ add column": things that start something
+INSPECTOR_PAD = 16
+PANEL_SCROLL_STEP = 40                 # px the body scrolls per wheel notch
+PANEL_MAX_BUTTONS = 4                  # footer buttons; the rest go in the ⋯ menu
+SCROLL_LIST_ROWS = 10                  # a ScrollList's height, in rows
+VERBS = {"number": "follows", "onoff": "on while it's on", "press": "acts each time it turns on"}
 
 
 def clip_text(text, font, max_width):
@@ -2729,11 +3076,38 @@ def clip_text(text, font, max_width):
     return text + "…"
 
 
+def wrap_text(text, font, max_width, max_lines=4):
+    """Split text into lines that fit max_width (the last one clipped)."""
+    lines, line = [], ""
+    for word in str(text).split(" "):
+        trial = f"{line} {word}" if line else word
+        if font.size(trial)[0] <= max_width or not line:
+            line = trial
+        else:
+            lines.append(line)
+            line = word
+    lines.append(line)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines - 1] + [" ".join(lines[max_lines - 1:])]
+    return [clip_text(s, font, max_width) for s in lines]
+
+
+def split_actions(actions):
+    """(footer buttons, overflow for the ⋯ menu): at most PANEL_MAX_BUTTONS in
+    the footer — the first ones (main actions) and the last (connection)."""
+    if len(actions) <= PANEL_MAX_BUTTONS:
+        return actions, []
+    keep = PANEL_MAX_BUTTONS - 1
+    return actions[:keep] + actions[-1:], actions[keep:-1]
+
+
 class InspectorPanel:
-    """Right-edge overlay for the selected object. It knows nothing about object
-    types: it draws whatever obj.inspector(app) returns (Field / Row / Stepper /
-    Gap / ScrollList), then obj.buttons(app) stacked at the bottom. It never
-    shifts the canvas — it just sits on top of the right side.
+    """Right-edge overlay for the selected object. It knows nothing about
+    object types: it draws a header (type, the object's name — click to rename
+    — its status line and the ⋯ menu), then the Sections obj.inspector(app)
+    returns (State, Inputs / takes, Outputs / gives, Settings, Info), scrolling
+    as a whole when they don't fit, then obj.actions(app) as buttons at the
+    bottom. Clicking a section's title folds it, remembered per object type.
 
     Every clickable spot it draws is remembered with its callback; handle_click
     returns the callback under the mouse (or None) for the loop to call with
@@ -2741,10 +3115,16 @@ class InspectorPanel:
 
     def __init__(self):
         self._hot = []            # (rect, callback) for each clickable spot from the last draw
-        self._list_rect = None    # the ScrollList's area (set by draw), for wheel routing
-        self._list_key = None     # whose list is showing; a different one resets the scroll
-        self._scroll = 0          # rows scrolled past at the top of the list
+        self._panel = None        # the panel's rect while it's showing
+        self._obj_id = None       # whose panel is showing (another object starts at the top)
+        self._scroll = 0          # px the body is scrolled down
         self._max_scroll = 0
+        self._list_rect = None    # a ScrollList's area (set by draw), for wheel routing
+        self._list_key = None     # whose list is showing; a different one resets its scroll
+        self._list_scroll = 0     # rows scrolled past at the top of the list
+        self._list_max = 0
+        self._collapsed = {}      # (object type, section title) -> folded
+        self._hover_src = None    # the source of the input row under the mouse (ringed on the canvas)
 
     def rect(self, screen_size):
         w, h = screen_size
@@ -2754,16 +3134,19 @@ class InspectorPanel:
     def contains(self, pos, screen_size):
         return self.rect(screen_size).collidepoint(pos)
 
-    def scroll_list(self, pos, wheel_y):
-        """Mouse-wheel over the list scrolls it. Returns True if it did (so
-        the loop doesn't also zoom the canvas)."""
-        if self._list_rect is None or not self._list_rect.collidepoint(pos):
+    def scroll(self, pos, wheel_y):
+        """The mouse wheel over the panel scrolls a list under it, else the whole
+        body. Returns True if the panel took it (so the canvas doesn't zoom)."""
+        if self._panel is None or not self._panel.collidepoint(pos):
             return False
-        self._scroll = max(0, min(self._max_scroll, self._scroll - wheel_y * 3))
+        if self._list_rect is not None and self._list_rect.collidepoint(pos):
+            self._list_scroll = max(0, min(self._list_max, self._list_scroll - wheel_y * 3))
+        else:
+            self._scroll = max(0, min(self._max_scroll, self._scroll - wheel_y * PANEL_SCROLL_STEP))
         return True
 
     def handle_click(self, pos):
-        for rect, callback in self._hot:
+        for rect, callback in reversed(self._hot):     # the last drawn is on top
             if rect.collidepoint(pos):
                 return callback
         return None
@@ -2773,43 +3156,80 @@ class InspectorPanel:
         if callback is None:
             return
         if rect.collidepoint(mouse):
-            pygame.draw.rect(surface, (58, 58, 72), rect, border_radius=4)
+            pygame.draw.rect(surface, INSPECTOR_HOVER, rect, border_radius=4)
         self._hot.append((rect, callback))
+
+    @staticmethod
+    def _ring(surface, obj, camera):
+        """Mark an object on the canvas (the source of the input row under the mouse)."""
+        screen_rect = getattr(obj, "screen_rect", None)
+        if screen_rect is None:
+            return
+        try:
+            rect = screen_rect(camera)
+        except Exception:
+            return
+        if rect.width < 4000 and rect.height < 4000:
+            pygame.draw.rect(surface, LINK_COLOR, rect.inflate(16, 16), width=3, border_radius=10)
 
     def draw(self, surface, obj, app):
         self._hot = []
         self._list_rect = None
+        self._panel = None
         if obj is None:
+            self._hover_src = None
             return
+        if obj.id != self._obj_id:
+            self._obj_id, self._scroll, self._hover_src = obj.id, 0, None
+        if self._hover_src is not None and self._hover_src.scene is not None:
+            self._ring(surface, self._hover_src, app.camera)
+        self._hover_src = None
+
         panel = self.rect(surface.get_size())
+        self._panel = panel
         pygame.draw.rect(surface, INSPECTOR_BG, panel)
         pygame.draw.line(surface, INSPECTOR_BORDER, panel.topleft, panel.bottomleft, 2)
+        mouse = pygame.mouse.get_pos()
+        x, max_w = panel.x + INSPECTOR_PAD, panel.width - 2 * INSPECTOR_PAD
 
-        pad = 16
-        x, y = panel.x + pad, panel.y + pad
-        max_w = panel.width - 2 * pad
-        surface.blit(get_font(30).render(obj.type_name(), True, INSPECTOR_TITLE), (x, y))
-        y += 44
-
-        # Buttons are listed top to bottom and stacked up from the panel's bottom.
+        # Footer buttons, listed top to bottom and stacked up from the panel's bottom.
+        footer, _overflow = split_actions(obj.actions(app))
         bh, gap = 36, 10
-        buttons, by = [], panel.bottom - pad - bh
-        for b in reversed(obj.buttons(app)):
+        buttons, by = [], panel.bottom - INSPECTOR_PAD - bh
+        for b in reversed(footer):
             buttons.append((pygame.Rect(x, by, max_w, bh), b))
             by -= bh + gap
-        bottom = (by + bh + gap - 12) if buttons else panel.bottom - pad
+        bottom = (by + bh + gap - 10) if buttons else panel.bottom - 4
 
-        mouse = pygame.mouse.get_pos()
+        y = self._draw_header(surface, obj, app, x, panel.y + 12, max_w, mouse)
+
+        # The body: every section, scrolled as a whole, between the header and the footer.
+        body = pygame.Rect(panel.x + 2, y, panel.width - 2, max(0, bottom - y))
+        inside = mouse if body.collidepoint(mouse) else (-1, -1)    # rows hidden under the footer aren't hovered
+        header_hot, self._hot = self._hot, []
         prev_clip = surface.get_clip()
-        surface.set_clip(pygame.Rect(panel.x, y - 4, panel.width, max(0, bottom - y + 8)))
+        surface.set_clip(body)
+        top = body.y + 4 - self._scroll
+        cy = top
         for row in obj.inspector(app):
-            if y >= bottom:
-                break                       # out of room above the buttons
-            y = self._draw_row(surface, row, x, y, max_w, bottom, mouse)
+            cy = self._draw_row(surface, row, x, cy, max_w, inside, obj)
         surface.set_clip(prev_clip)
-        self._hot = [(r, cb) for r, cb in self._hot if r.top < bottom]   # hidden rows aren't clickable
+        content = cy - top + 8
+        self._max_scroll = max(0, content - body.height)
+        self._scroll = min(self._scroll, self._max_scroll)
+        self._hot = header_hot + [(r.clip(body), cb) for r, cb in self._hot if r.colliderect(body)]
+        if self._list_rect is not None:
+            self._list_rect = self._list_rect.clip(body)
+        if self._max_scroll:                         # a thin scrollbar on the right edge
+            track = pygame.Rect(panel.right - 6, body.y + 2, 3, max(1, body.height - 4))
+            thumb_h = max(16, track.height * body.height // max(1, content))
+            thumb_y = track.y + (track.height - thumb_h) * self._scroll // self._max_scroll
+            pygame.draw.rect(surface, (50, 50, 60), track)
+            pygame.draw.rect(surface, (130, 130, 145), (track.x, thumb_y, 3, thumb_h))
 
-        body = get_font(22)
+        if buttons:
+            pygame.draw.line(surface, INSPECTOR_DIVIDER, (panel.x + 2, bottom), (panel.right, bottom))
+        font = get_font(22)
         for rect, b in buttons:
             if not b.enabled:
                 bcolor, tcolor = (55, 55, 64), (120, 120, 130)
@@ -2819,31 +3239,76 @@ class InspectorPanel:
                 bcolor, tcolor = (170, 48, 48), (250, 240, 240)
             else:
                 bcolor, tcolor = (70, 70, 88), INSPECTOR_TITLE
+            if b.enabled and rect.collidepoint(mouse):
+                bcolor = tuple(min(255, c + 14) for c in bcolor)
             pygame.draw.rect(surface, bcolor, rect, border_radius=6)
-            ts = body.render(b.label, True, tcolor)
+            ts = font.render(clip_text(b.label, font, rect.width - 12), True, tcolor)
             surface.blit(ts, ts.get_rect(center=rect.center))
             if b.enabled:
                 self._hot.append((rect, b.on_click))
 
-    def _draw_row(self, surface, row, x, y, max_w, bottom, mouse):
-        """Draw one inspector row at y; returns the y for the next one."""
+    def _draw_header(self, surface, obj, app, x, y, max_w, mouse):
+        """The type, the object's name (click to rename), its status line and the
+        ⋯ menu button. Returns the y the body starts at."""
+        dots = pygame.Rect(x + max_w - 30, y, 34, 26)
+        self._clickable(surface, dots, lambda app: app.object_menu(obj, dots.bottomleft), mouse)
+        for dx in (-7, 0, 7):
+            pygame.draw.circle(surface, INSPECTOR_TITLE, (dots.centerx + dx, dots.centery), 2)
+        room = max_w - dots.width - 8
+        name = obj.panel_name()
+        if name:
+            font = get_font(18)
+            surface.blit(font.render(clip_text(obj.type_name(), font, room), True, INSPECTOR_LABEL), (x, y + 4))
+            y += 26
+            font = get_font(28)
+            if obj.can_rename:
+                self._clickable(surface, pygame.Rect(x - 4, y - 2, max_w + 8, 34), obj.rename, mouse)
+            surface.blit(font.render(clip_text(str(name), font, max_w), True, INSPECTOR_TITLE), (x, y))
+            y += 36
+        else:
+            font = get_font(30)
+            surface.blit(font.render(clip_text(obj.type_name(), font, room), True, INSPECTOR_TITLE), (x, y))
+            y += 40
+        status = obj.panel_status(app)
+        if status:
+            text, color = status
+            font = get_font(19)
+            pygame.draw.circle(surface, color, (x + 5, y + 10), 5)
+            surface.blit(font.render(clip_text(text, font, max_w - 16), True, color), (x + 16, y))
+            y += 26
+        y += 4
+        pygame.draw.line(surface, INSPECTOR_DIVIDER, (x - INSPECTOR_PAD + 2, y),
+                         (x + max_w + INSPECTOR_PAD, y))
+        return y + 1
+
+    def _draw_row(self, surface, row, x, y, max_w, mouse, obj):
+        """Draw one panel row at y; returns the y for the next one."""
         body, label = get_font(22), get_font(20)
+        if isinstance(row, Section):
+            return self._draw_section(surface, row, x, y, max_w, mouse, obj)
+        if isinstance(row, PortRow):
+            return self._draw_port(surface, row, x, y, max_w, mouse)
+        if isinstance(row, GiveRow):
+            g = row.give
+            self._clickable(surface, pygame.Rect(x - 4, y - 2, max_w + 8, 24),
+                            lambda app: app.pick_target(row.obj, g.key), mouse)
+            return self._label_value(surface, x, y, max_w, g.label, format_value(row.value, g.unit),
+                                     label, body, INSPECTOR_VALUE)
         if isinstance(row, Gap):
             return y + row.px
         if isinstance(row, Field):
-            self._clickable(surface, pygame.Rect(x - 4, y - 2, max_w + 8, 50), row.on_click, mouse)
+            lines = wrap_text(str(row.value), body, max_w)
+            h = 22 + 24 * len(lines)
+            self._clickable(surface, pygame.Rect(x - 4, y - 2, max_w + 8, h + 2), row.on_click, mouse)
             surface.blit(label.render(row.label, True, INSPECTOR_LABEL), (x, y))
-            vs = body.render(clip_text(str(row.value), body, max_w), True, row.color or INSPECTOR_VALUE)
-            surface.blit(vs, (x, y + 22))
-            return y + 54
+            for i, line in enumerate(lines):
+                surface.blit(body.render(line, True, row.color or INSPECTOR_VALUE), (x, y + 22 + 24 * i))
+            return y + h + 6
         if isinstance(row, Row):
+            indent = 14 if row.sub else 0
             self._clickable(surface, pygame.Rect(x - 4, y - 2, max_w + 8, 24), row.on_click, mouse)
-            ls = label.render(row.label, True, INSPECTOR_LABEL)
-            surface.blit(ls, (x, y + 2))
-            room = max_w - ls.get_width() - 12
-            vs = body.render(clip_text(str(row.value), body, room), True, row.color or INSPECTOR_VALUE)
-            surface.blit(vs, (x + max_w - vs.get_width(), y))
-            return y + 26
+            return self._label_value(surface, x + indent, y, max_w - indent, row.label, row.value,
+                                     get_font(18) if row.sub else label, body, row.color or INSPECTOR_VALUE)
         if isinstance(row, Stepper):
             surface.blit(label.render(row.label, True, INSPECTOR_LABEL), (x, y + 2))
             text = body.render(row.value, True, INSPECTOR_VALUE)
@@ -2866,30 +3331,132 @@ class InspectorPanel:
                 self._hot.append((up, row.on_up))
             return y + 28
         if isinstance(row, ScrollList):
-            self._draw_list(surface, row, x, y, max_w, bottom, mouse)
-            return bottom
+            return self._draw_list(surface, row, x, y, max_w, mouse)
         raise TypeError(f"not an inspector row: {row!r}")
 
-    def _draw_list(self, surface, lst, x, y, max_w, bottom, mouse):
-        """A titled list filling the space down to the buttons; wheel scrolls it."""
+    @staticmethod
+    def _label_value(surface, x, y, max_w, label_text, value_text, label_font, value_font, color):
+        """A label on the left and a value on the right of one line, sharing the
+        width (the value gets at least half when both are long)."""
+        label_text, value_text = str(label_text), str(value_text)
+        lw, vw = label_font.size(label_text)[0], value_font.size(value_text)[0]
+        if lw + vw + 12 > max_w:
+            vw = max(max_w - lw - 12, max_w // 2)
+            lw = max_w - vw - 12
+        surface.blit(label_font.render(clip_text(label_text, label_font, lw), True, INSPECTOR_LABEL),
+                     (x, y + 2))
+        vs = value_font.render(clip_text(value_text, value_font, vw), True, color)
+        surface.blit(vs, (x + max_w - vs.get_width(), y))
+        return y + 26
+
+    def _draw_section(self, surface, section, x, y, max_w, mouse, obj):
+        """A section title (click: fold / unfold) and, unless folded, its rows."""
+        key = (obj.TYPE, section.title)
+        folded = self._collapsed.get(key, section.collapsed)
+        y += 4
+        head = pygame.Rect(x - 4, y, max_w + 8, 24)
+        self._clickable(surface, head, lambda app: self._collapsed.__setitem__(key, not folded), mouse)
+        font = get_font(17)
+        ts = font.render(section.title.upper(), True, INSPECTOR_SECTION)
+        surface.blit(ts, ts.get_rect(midleft=(x, head.centery)))
+        cx, cy = head.right - 12, head.centery
+        points = ([(cx - 2, cy - 5), (cx - 2, cy + 5), (cx + 4, cy)] if folded else
+                  [(cx - 5, cy - 2), (cx + 5, cy - 2), (cx, cy + 4)])
+        pygame.draw.polygon(surface, INSPECTOR_SECTION, points)
+        y = head.bottom + 4
+        if not folded:
+            for row in section.rows:
+                y = self._draw_row(surface, row, x, y, max_w, mouse, obj)
+        y += 4
+        pygame.draw.line(surface, INSPECTOR_DIVIDER, (x - INSPECTOR_PAD + 2, y), (x + max_w + INSPECTOR_PAD, y))
+        return y + 2
+
+    def _draw_port(self, surface, row, x, y, max_w, mouse):
+        """One input: its name, then "link" (and its value set by hand) while
+        unlinked, or "source · give  x" (green) and the live value under it."""
+        obj, take = row.obj, row.take
+        body, small = get_font(22), get_font(18)
+        link = obj.links.get(take.key) or {}
+        src = obj.take_source(take.key)
+        line = pygame.Rect(x - 4, y - 2, max_w + 8, 24)
+        name = body.render(clip_text(take.label, body, max_w * 0.45), True, INSPECTOR_VALUE)
+        if take.on_label is not None:
+            self._clickable(surface, pygame.Rect(x - 4, y - 2, name.get_width() + 8, 24), take.on_label, mouse)
+        surface.blit(name, (x, y))
+        right = x + max_w
+        verb = small.render(take.verb or VERBS[take.kind], True, INSPECTOR_LABEL)
+
+        if src is None:
+            word = small.render("link", True, INSPECTOR_ACCENT)
+            pill = pygame.Rect(0, 0, word.get_width() + 18, 22)
+            pill.midright = (right, line.centery)
+            self._clickable(surface, pill, lambda app: obj.pick(app, take.key), mouse)
+            pygame.draw.rect(surface, INSPECTOR_ACCENT, pill, width=1, border_radius=11)
+            surface.blit(word, word.get_rect(center=pill.center))
+            if take.current is not None:
+                current = take.current()
+                text = current if isinstance(current, str) else format_value(current, take.unit)
+                room = pill.x - 10 - (x + name.get_width() + 10)
+                vs = body.render(clip_text(text, body, max(10, room)), True, INSPECTOR_VALUE)
+                vr = vs.get_rect(midright=(pill.x - 10, line.centery))
+                self._clickable(surface, vr.inflate(10, 4), take.set_by_hand, mouse)
+                surface.blit(vs, vr)
+            y += 26
+            if link.get("id"):                       # it was linked to something that's gone
+                ws = small.render("its source was deleted", True, WARN_COLOR)
+                surface.blit(ws, (x + 14, y))
+                y += 22
+            return y
+
+        xr = pygame.Rect(0, 0, 22, 22)                 # ✕: unlink
+        xr.midright = (right + 3, line.centery)
+        self._clickable(surface, xr, lambda app: obj.unlink(take.key, app), mouse)
+        c = xr.center
+        for dx in (-4, 4):
+            pygame.draw.line(surface, INSPECTOR_LABEL, (c[0] - dx, c[1] - 4), (c[0] + dx, c[1] + 4), 2)
+        room = xr.x - 6 - (x + name.get_width() + 12)
+        ks = small.render(clip_text(f" · {link.get('key')}", small, max(10, room // 2)), True, LINK_COLOR)
+        ns = small.render(clip_text(short_name(src), small, max(10, room - ks.get_width())),
+                          True, LINK_COLOR)
+        kr = ks.get_rect(midright=(xr.x - 6, line.centery))
+        nr = ns.get_rect(midright=(kr.x, line.centery))
+        self._clickable(surface, nr.inflate(6, 4), lambda app: obj.pick(app, take.key), mouse)
+        self._clickable(surface, kr.inflate(6, 4), lambda app: app.choose_give(obj, take.key, src), mouse)
+        surface.blit(ns, nr)
+        surface.blit(ks, kr)
+        if line.collidepoint(mouse):
+            self._hover_src = src
+        y += 24
+        value = obj.take(take.key)
+        if take.kind == "number":
+            text = format_value(value, take.unit)
+        else:
+            text = "—" if value is None else "on" if value != 0 else "off"
+        surface.blit(verb, (x + 14, y + 1))
+        vs = small.render(clip_text(text, small, max_w - 14 - verb.get_width() - 10), True, INSPECTOR_VALUE)
+        surface.blit(vs, (right - vs.get_width(), y + 1))
+        return y + 24
+
+    def _draw_list(self, surface, lst, x, y, max_w, mouse):
+        """A titled list, up to SCROLL_LIST_ROWS rows tall; the wheel scrolls it."""
         font = get_font(20)
         surface.blit(font.render(lst.title, True, INSPECTOR_LABEL), (x, y))
         y += 24
         if not lst.items:
             surface.blit(font.render(lst.empty, True, INSPECTOR_VALUE), (x, y))
-            return
+            return y + 26
         row_h = 22
-        area = pygame.Rect(x, y, max_w, max(0, bottom - y))
-        self._list_rect = area
+        visible = min(len(lst.items), SCROLL_LIST_ROWS)
+        area = pygame.Rect(x, y, max_w, visible * row_h)
+        self._list_rect = area.copy()
         if lst.key is not self._list_key:
-            self._list_key, self._scroll = lst.key, 0
-        visible = max(1, area.height // row_h)
-        self._max_scroll = max(0, len(lst.items) - visible)
-        self._scroll = min(self._scroll, self._max_scroll)
+            self._list_key, self._list_scroll = lst.key, 0
+        self._list_max = max(0, len(lst.items) - visible)
+        self._list_scroll = min(self._list_scroll, self._list_max)
 
         prev_clip = surface.get_clip()
-        surface.set_clip(area)
-        for i, (name, value, on_click) in enumerate(lst.items[self._scroll:self._scroll + visible]):
+        surface.set_clip(area.clip(prev_clip))
+        for i, (name, value, on_click) in enumerate(lst.items[self._list_scroll:self._list_scroll + visible]):
             ry = area.y + i * row_h
             self._clickable(surface, pygame.Rect(area.x - 4, ry - 1, area.width + 8, row_h),
                             on_click, mouse)
@@ -2899,12 +3466,13 @@ class InspectorPanel:
             surface.blit(val, (area.right - val.get_width(), ry))
         surface.set_clip(prev_clip)
 
-        if self._max_scroll:                       # thin scrollbar on the right edge
-            track = pygame.Rect(area.right + 6, area.y, 3, visible * row_h)
+        if self._list_max:                         # thin scrollbar beside it
+            track = pygame.Rect(area.right + 6, area.y, 3, area.height)
             thumb_h = max(12, track.height * visible // len(lst.items))
-            thumb_y = track.y + (track.height - thumb_h) * self._scroll // self._max_scroll
+            thumb_y = track.y + (track.height - thumb_h) * self._list_scroll // self._list_max
             pygame.draw.rect(surface, (55, 55, 64), track)
             pygame.draw.rect(surface, (130, 130, 145), (track.x, thumb_y, 3, thumb_h))
+        return area.bottom + 6
 
 
 # ---- Build / place modes ----------------------------------------------------
@@ -3028,6 +3596,49 @@ class PickMode:
         elif self.on_empty is not None and scene.hit_test(mouse, camera) is None:
             pygame.draw.circle(surface, (120, 220, 150), mouse, 9, 2)      # a click here places something
         draw_hint(surface, f"{self.prompt}     Esc: cancel")
+
+
+class LinkDrag:
+    """Dragging a wire out of an object's output nub (see give_at). Let go on
+    an input chip (take_at) to link that input, or anywhere else on an object
+    with inputs to choose one from a menu. Esc cancels."""
+
+    def __init__(self):
+        self.src = None
+        self.key = None
+
+    @property
+    def active(self):
+        return self.src is not None
+
+    def begin(self, src, key):
+        self.src, self.key = src, key
+
+    def cancel(self):
+        self.__init__()
+
+    def target(self, scene, pos, camera):
+        obj = scene.hit_test(pos, camera)
+        return obj if obj is not None and obj is not self.src and obj.takes() else None
+
+    def finish(self, app, pos):
+        src, key = self.src, self.key
+        target = self.target(app.scene, pos, app.camera)
+        self.cancel()
+        if target is not None:
+            app.choose_take(target, src, key, port=target.take_at(pos, app.camera))
+
+    def draw(self, surface, camera, scene, mouse):
+        if not self.active:
+            return
+        start = camera.world_to_screen(output_point(self.src))
+        pygame.draw.line(surface, LINK_COLOR, start, mouse, 2)
+        pygame.draw.circle(surface, LINK_COLOR, mouse, 4)
+        target = self.target(scene, mouse, camera)
+        if target is not None and hasattr(target, "screen_rect"):
+            pygame.draw.rect(surface, LINK_COLOR, target.screen_rect(camera).inflate(14, 14),
+                             width=3, border_radius=10)
+        draw_hint(surface, f"Drop '{self.key}' on an input     Esc: cancel")
 
 
 class TrainBuilder:
@@ -3487,6 +4098,7 @@ class App:
         self.wall_builder = WallBuilder()
         self.placer = PlaceMode()
         self.picker = PickMode()
+        self.link_drag = LinkDrag()
         self.inventory = InventoryPanel(on_pick=lambda cls: cls.create(self),
                                         on_context=lambda machine, pos: self.machine_menu(machine, pos))
 
@@ -3494,13 +4106,14 @@ class App:
     def building(self):
         """True while a mode (train / wall / placing) is claiming the mouse."""
         return (self.train_builder.active or self.wall_builder.active
-                or self.placer.active or self.picker.active)
+                or self.placer.active or self.picker.active or self.link_drag.active)
 
     def cancel_modes(self):
         self.train_builder.cancel()
         self.wall_builder.cancel()
         self.placer.cancel()
         self.picker.cancel()
+        self.link_drag.cancel()
 
     def start_picking(self, prompt, on_pick, accept=lambda obj: True, origin=None, on_empty=None):
         """Wait for a click on an object that accept(obj) allows, then call
@@ -3547,6 +4160,114 @@ class App:
     def context_menu(self, pos, items):
         """Open a right-click menu at screen pos; items: [(label, callback, style)]."""
         self.modal = ContextMenu(pos, items)
+
+    # --- Linking: an input (take) of one object follows an output (give) of another --
+    def pick_link(self, obj, port, *, on_empty=None, note=""):
+        """Link obj's input `port`: click a source, then choose which of its outputs
+        (a menu, if it has several). Clicking obj itself unlinks it. on_empty /
+        note: what a click on empty canvas does, and the hint saying so."""
+        take = obj.find_take(port)
+        label = take.label if take is not None else port
+        linked = obj.take_source(port) is not None
+        hint = f" — or click this {obj.type_name().lower()} to unlink" if linked else ""
+
+        def picked(src):
+            if src is obj:
+                obj.unlink(port, self)
+            else:
+                self.choose_give(obj, port, src)
+        self.start_picking(f"Click what '{label}' takes from{hint}{note}", picked,
+                           accept=lambda o: (o is obj and linked) or (o is not obj and bool(o.gives())),
+                           origin=obj.input_point(port), on_empty=on_empty)
+
+    def choose_give(self, obj, port, src):
+        """Link obj's input `port` to one of src's outputs: right away if it has
+        one, else from a menu listing each with its live value (the likeliest first)."""
+        gives = src.gives()
+        if not gives:
+            return
+        if len(gives) == 1:
+            obj.link(port, src, gives[0].key, self)
+            return
+        take = obj.find_take(port)
+        prefer = ("value",) if take is None or take.kind == "number" else ("pressed", "on", "value")
+        gives = sorted(gives, key=lambda g: prefer.index(g.key) if g.key in prefer else len(prefer))
+        values = src.outputs()
+        label = take.label if take is not None else port
+        items = [(f"'{label}' takes from {short_name(src)}:", None, "title")]
+        items += [(g.label, lambda g=g: obj.link(port, src, g.key, self), None,
+                   format_value(values.get(g.key), g.unit)) for g in gives]
+        self.context_menu(pygame.mouse.get_pos(), items)
+
+    def pick_target(self, src, key):
+        """The other way round: link src's output `key` into an input of an
+        object you click (a menu, if it has several inputs)."""
+        def picked(target):
+            self.choose_take(target, src, key)
+        self.start_picking(f"Click what should take '{key}' from this {src.type_name().lower()}", picked,
+                           accept=lambda o: o is not src and bool(o.takes()), origin=output_point(src))
+
+    def choose_take(self, target, src, key, port=None):
+        """Link src's output `key` into target's input `port`, or into one picked
+        from a menu of target's inputs (right away if it has just one)."""
+        takes = target.takes()
+        if port is not None or len(takes) == 1:
+            target.link(port or takes[0].key, src, key, self)
+            return
+        if not takes:
+            return
+        items = [(f"Which input of {short_name(target)} takes '{key}'?", None, "title")]
+        for t in takes:
+            cur = target.take_source(t.key)
+            items.append((t.label, lambda t=t: target.link(t.key, src, key, self), None,
+                          f"from {short_name(cur)}" if cur is not None else "unlinked"))
+        self.context_menu(pygame.mouse.get_pos(), items)
+
+    # --- The object menu (⋯ in the panel, or a right-click) -----------------------------
+    def object_menu(self, obj, pos):
+        """The menu for one object: footer buttons that didn't fit, its type's own
+        items, then Rename / Copy / Go to / Unlink all / Create machine / Delete."""
+        _footer, overflow = split_actions(obj.actions(self))
+        items = [(b.label, lambda b=b: b.on_click(self), "danger" if b.style == "stop" else None)
+                 for b in overflow if b.enabled]
+        items += obj.menu_items(self)
+        items += self.selection_menu_items([obj])
+        self.context_menu(pos, items)
+
+    def selection_menu_items(self, objs):
+        """Menu items for the selection (one object or several)."""
+        items = []
+        if len(objs) == 1:
+            obj = objs[0]
+            if obj.can_rename:
+                items.append(("Rename…", lambda: obj.rename(self), None))
+            if obj.copyable:
+                items.append(("Copy", lambda: self.copy(obj), None))
+            if obj.center is not None:
+                items.append(("Go to", lambda: self.go_to(obj), None))
+            if obj.links:
+                items.append(("Unlink all inputs", lambda: obj.unlink_all(self), None))
+        items.append(("Create machine…", lambda: self.create_machine(objs), None))
+        label = f"Delete '{objs[0].display_name}'" if len(objs) == 1 else f"Delete {len(objs)} objects"
+        items.append((label, lambda: self.delete_objects(objs), "danger"))
+        return items
+
+    def delete_objects(self, objs):
+        """Delete objects after one confirm."""
+        if not objs:
+            return
+        title = f"Delete '{objs[0].display_name}'?" if len(objs) == 1 else f"Delete {len(objs)} objects?"
+        self.confirm(title, "Are you sure you want to delete?", lambda: self.scene.delete_many(objs))
+
+    def copy(self, obj, at=None):
+        """Drop a copy of obj (at a world point, or nudged beside it) and select it."""
+        new = copy_object(obj, at=at)
+        if new is not None:
+            self.place(new)
+
+    def go_to(self, obj):
+        if obj is not None and obj.center is not None:
+            self.camera.look_at(obj.center, GOTO_ZOOM, self.screen_size)
 
     def create_machine(self, objs):
         """Name the objects as a machine and save it (E menu ▸ Machines)."""

@@ -88,24 +88,18 @@ def handle_menu_command(command):
                     scene.save()
             app.ask("Edit text:", rename, value=sel.text)
     elif command == "copy":
-        new = canvas.copy_object(sel)           # None for trains / nothing selected
-        if new is not None:
-            app.place(new)
+        if sel is not None:
+            app.copy(sel)                       # nothing for trains (not copyable)
     elif command == "delete_node":
-        objs = scene.selection                  # works for any object (incl. trains)
-        if objs:
-            title = (f"Delete '{objs[0].display_name}'?" if len(objs) == 1
-                     else f"Delete {len(objs)} objects?")
-            app.confirm(title, "Are you sure you want to delete?",
-                        lambda: scene.delete_many(objs))
+        app.delete_objects(scene.selection)     # works for any object (incl. trains)
     elif command == "goto":
-        if sel is not None and sel.center is not None:
-            camera.look_at(sel.center, canvas.GOTO_ZOOM, screen.get_size())
+        app.go_to(sel)
 
 
 def open_context_menu(pos):
     """Right-click menu: for the selection (right-clicking an unselected
-    object selects just it first). Nothing selected, nothing opens."""
+    object selects just it first) — one object gets the same menu as its
+    panel's ⋯ button. Nothing selected, nothing opens."""
     if pos[1] <= canvas.MENU_BAR_HEIGHT or (scene.selected is not None
                                             and inspector.contains(pos, screen.get_size())):
         return
@@ -113,12 +107,10 @@ def open_context_menu(pos):
     if clicked is not None and clicked.selectable and not clicked.is_selected:
         scene.select_only(clicked)
     objs = scene.selection
-    if not objs:
-        return
-    label = (f"Delete '{objs[0].display_name}'" if len(objs) == 1
-             else f"Delete {len(objs)} objects")
-    app.context_menu(pos, [("Create machine…", lambda: app.create_machine(objs), None),
-                           (label, lambda: handle_menu_command("delete_node"), "danger")])
+    if len(objs) == 1:
+        app.object_menu(objs[0], pos)
+    elif objs:
+        app.context_menu(pos, app.selection_menu_items(objs))
 
 
 # ---- Main loop -------------------------------------------------------------
@@ -183,6 +175,15 @@ while running:
                     picker.cancel()               # a click on the panel isn't a pick
                 else:
                     picker.click(scene, event.pos, camera)
+                continue
+
+        # A wire being dragged out of an output nub: let go on an input to link it.
+        if app.link_drag.active:
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                app.link_drag.cancel()
+                continue
+            if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                app.link_drag.finish(app, event.pos)
                 continue
 
         # Place mode: left-click drops the held object (Shift = keep placing),
@@ -259,8 +260,8 @@ while running:
             camera.cancel_ride()
 
         if event.type == pygame.MOUSEWHEEL:
-            if inspector.scroll_list(mouse_pos, event.y):
-                pass          # wheel over the inspector's list scrolls it instead of zooming
+            if inspector.scroll(mouse_pos, event.y):
+                pass          # wheel over the inspector scrolls it instead of zooming
             elif ((under := scene.hit_test(mouse_pos, camera)) is not None
                     and under.on_wheel(mouse_pos, event.y, app)):
                 pass          # an object that scrolls (a data collector's rows) took it
@@ -303,7 +304,10 @@ while running:
                     clicked = scene.hit_test(event.pos, camera)
                     # Ctrl+click just selects — e.g. an input you'd otherwise press.
                     interact = not pygame.key.get_mods() & pygame.KMOD_CTRL
-                    if clicked is not None and interact and clicked.on_click(event.pos, app):
+                    nub = scene.give_at(event.pos, camera) if interact else None
+                    if nub is not None:
+                        app.link_drag.begin(*nub)            # dragging a wire out of an output nub
+                    elif clicked is not None and interact and clicked.on_click(event.pos, app):
                         held = clicked    # it handled the click (e.g. a press): it gets drag/release
                     else:
                         scene.select_only(clicked)   # deselects all if clicked is None
@@ -349,6 +353,7 @@ while running:
     marquee.draw(screen, camera)
     placer.draw(screen, camera)
     picker.draw(screen, camera, scene, mouse_pos)
+    app.link_drag.draw(screen, camera, scene, mouse_pos)
     menubar.draw(screen)
     inspector.draw(screen, scene.selected, app)
     if app.modal is not None:
