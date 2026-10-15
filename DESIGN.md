@@ -129,6 +129,17 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   uses an object's `output_point()` if it has one, else its center (Output and Device wires
   use it too). Chains and loops are fine — each Function computes once a frame in `tick` and
   `outputs()` returns the stored value, so a loop just runs a frame behind
+- **Counter** (E menu ▸ Math, `things.py`): a saved value that buttons step. Three input chips on
+  the left — **up** / **down** add / take away the Step, **reset** returns to Start — each linked
+  like a Function's chips (picking prefers a source's `pressed`, then `on`, then `value`). A press is
+  a rising edge (≤ 0.5 → > 0.5), so holding a button counts once and a switch counts each off → on;
+  a source already high when the canvas loads doesn't count. Optional Minimum / Maximum (hidden
+  `low` / `high`, blank = none): the value stops there, so presses past a limit do nothing (no
+  "stored-up" presses, unlike `presses` → Function), and a new limit pulls the value inside it.
+  Values are rounded to 12 places (0.1 × 3 = 0.3). Click the number to type one; the panel has
+  + / - / Reset buttons. The value is saved (a `value` Prop, saved on each change) and is the
+  output `value`. Drawn Function-style: chips, a screen with the number (brightens on a change,
+  dims at a limit), an output nub, and the step / limits beside the name
 - **Data collector** (E menu ▸ Data, `things.py`): a spreadsheet that records values. Columns
   (built-in `#` and `time`, then named ones) each follow a source — click a header, then the
   source (a green dot once linked); **+** adds a column (name, then pick its source); rename /

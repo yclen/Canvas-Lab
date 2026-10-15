@@ -1124,6 +1124,306 @@ class Function(Thing):
                 surface.blit(ts, ts.get_rect(midleft=(screen.x + pad, screen.centery)))
 
 
+# ---- Counter: a value that buttons step up and down ----------------------------------
+CT_W = 240                      # Counter layout, in world units at Size 1
+CT_TITLE = 30                   # the name row
+CT_CHIP_W = 62
+CT_INPUTS = ("up", "down", "reset")
+
+
+class Counter(Thing):
+    """A saved value that steps: each press of whatever's linked to its `up` /
+    `down` chip (a push button — a 0 → 1 change counts once) adds / takes away
+    the Step, and `reset` puts it back to Start. Optional Minimum / Maximum: it
+    stops there (presses past a limit do nothing, so nothing gets "stored up").
+    Its `value` is an output for devices, functions, tags, … Click a chip, then
+    the button; click the number to type a value. Ctrl+click selects it."""
+
+    TYPE = "counter"
+    MENU_LABEL = "Add counter"
+    NAME = "Counter"
+    CATEGORY = "Math"
+    DOT_COLOR = (255, 170, 80)
+    PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
+                  prompt="Size (1 = normal, 2 = twice as big):"),
+             Prop("color", "Color", "color", (255, 170, 80)),
+             Prop("step", "Step", "float", 1.0, prompt="Step (added by up, taken away by down):"),
+             Prop("start", "Start", "float", 0.0, prompt="Start (what reset goes back to):"),
+             Prop("value", kind="float", default=0.0, hidden=True),
+             Prop("low", kind="data", default=None, hidden=True),      # minimum, or None
+             Prop("high", kind="data", default=None, hidden=True),     # maximum, or None
+             Prop("links", kind="data", default={}, hidden=True)]      # input -> {"id", "key"}
+    WIRE_COLOR = (120, 220, 150)
+
+    @classmethod
+    def icon_sample(cls):
+        sample = cls(0, 0)
+        sample.value = 42
+        return sample
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._last_high = {}        # input -> high last frame (missing = not read yet: no edge)
+        self._flash = 0.0           # seconds the number stays bright after a change
+
+    @property
+    def title(self):
+        return self.text or "Counter"
+
+    # --- Stepping ---------------------------------------------------------------------
+    def clamp(self, value):
+        if self.low is not None:
+            value = max(self.low, value)
+        if self.high is not None:
+            value = min(self.high, value)
+        return value
+
+    def set_value(self, value, app=None):
+        value = self.clamp(round(float(value), 12))      # round away float drift (0.1 + 0.2)
+        if value != self.value:
+            self.value = value
+            self._flash = 0.25
+            if app is not None:
+                app.save()
+            elif self.scene is not None:
+                self.scene.save()
+
+    def up(self, app=None):
+        self.set_value(self.value + self.step, app)
+
+    def down(self, app=None):
+        self.set_value(self.value - self.step, app)
+
+    def reset(self, app=None):
+        self.set_value(self.start, app)
+
+    def source(self, name):
+        link = self.links.get(name)
+        return self.scene.by_id.get(link.get("id")) if link and self.scene else None
+
+    def tick(self, dt):
+        self._flash = max(0.0, self._flash - dt)
+        for name in CT_INPUTS:
+            src = self.source(name)
+            on = src.outputs().get(self.links[name].get("key")) if src is not None else None
+            if on is None:
+                self._last_high.pop(name, None)
+                continue
+            high = on > DC_EDGE
+            if high and self._last_high.get(name) is False:       # a press: 0 → 1
+                getattr(self, name)()
+            self._last_high[name] = high
+
+    def outputs(self):
+        return {"value": self.value}
+
+    # --- Editing and linking ------------------------------------------------------------
+    def type_value(self, app):
+        def submit(text):
+            try:
+                self.set_value(float(text), app)
+            except ValueError:
+                pass
+        app.ask("Value:", submit, value=f"{self.value:g}")
+
+    def set_limit(self, app, which):
+        def submit(text):
+            text = text.strip()
+            try:
+                setattr(self, which, None if not text or text.lower() == "none" else float(text))
+            except ValueError:
+                return
+            self.set_value(self.value, app)                  # pull the value inside a new limit
+            app.save()
+        label = "Minimum" if which == "low" else "Maximum"
+        current = getattr(self, which)
+        app.ask(f"{label} (blank = none):", submit, value="" if current is None else f"{current:g}")
+
+    def rename(self, app):
+        def submit(text):
+            if text.strip():
+                self.text = text.strip()
+                app.save()
+        app.ask("Name:", submit, value=self.title)
+
+    def pick_source(self, app, name):
+        linked = self.source(name) is not None
+        def link(src):
+            if src is self:                                  # clicked itself: unlink
+                self.links.pop(name, None)
+            else:
+                keys = list(src.outputs())
+                key = next((k for k in ("pressed", "on", "value") if k in keys), keys[0])
+                self.links[name] = {"id": src.id, "key": key}
+            self._last_high.pop(name, None)
+            app.save()
+        hint = " — or click this counter to unlink it" if linked else ""
+        what = {"up": "adds a step", "down": "takes a step away", "reset": "resets it"}[name]
+        app.start_picking(f"Click what {what} (a push button: once per press){hint}", link,
+                          accept=lambda obj: (obj is self and linked) or (obj is not self and bool(obj.outputs())),
+                          origin=self.chip_point(name))
+
+    def next_key(self, app, name):
+        src = self.source(name)
+        keys = list(src.outputs()) if src is not None else []
+        if keys:
+            key = self.links[name].get("key")
+            self.links[name]["key"] = keys[(keys.index(key) + 1) % len(keys) if key in keys else 0]
+            self._last_high.pop(name, None)
+            app.save()
+
+    def unlink_all(self, app):
+        self.links = {}
+        self._last_high = {}
+        app.save()
+
+    def on_click(self, pos, app):
+        name = self.chip_at(pos, app.camera)
+        if name is not None:
+            self.pick_source(app, name)
+        else:
+            self.type_value(app)
+        return True
+
+    def inspector(self, app):
+        rows = [Row("Name", self.title, on_click=self.rename),
+                Row("Value", f"{self.value:.6g}", on_click=self.type_value),
+                Row("Minimum", "none" if self.low is None else f"{self.low:g}",
+                    on_click=lambda app: self.set_limit(app, "low")),
+                Row("Maximum", "none" if self.high is None else f"{self.high:g}",
+                    on_click=lambda app: self.set_limit(app, "high"))]
+        for name in CT_INPUTS:
+            rows.append(Gap(6))
+            src = self.source(name)
+            rows.append(Row(name, src.display_name if src else "— click to link",
+                            on_click=lambda app, n=name: self.pick_source(app, n)))
+            if src is not None:
+                rows.append(Row("   reads", self.links[name].get("key"),
+                                on_click=lambda app, n=name: self.next_key(app, n)))
+        return rows + [Gap(6)] + self.prop_rows()
+
+    def buttons(self, app):
+        out = super().buttons(app) + [Btn(f"+ {self.step:g}", self.up, style="go"),
+                                      Btn(f"- {self.step:g}", self.down), Btn("Reset", self.reset)]
+        if self.links:
+            out.append(Btn("Unlink all", self.unlink_all))
+        return out
+
+    # --- Layout (world units at Size 1 from the top-left; shared by drawing, clicks, wires) --
+    @property
+    def world_width(self):
+        return CT_W * self.scale
+
+    @property
+    def world_height(self):
+        return (FN_PAD + CT_TITLE + 3 * FN_CHIP_H + 2 * FN_CHIP_GAP + FN_PAD) * self.scale
+
+    def _to_world(self, x, y):
+        c = self.world_center
+        return (c.x - self.world_width / 2 + x * self.scale, c.y - self.world_height / 2 + y * self.scale)
+
+    def _chip_boxes(self):
+        top = FN_PAD + CT_TITLE
+        return [(name, FN_PAD, top + i * (FN_CHIP_H + FN_CHIP_GAP), CT_CHIP_W, FN_CHIP_H)
+                for i, name in enumerate(CT_INPUTS)]
+
+    def _screen_box(self):
+        x = FN_PAD + CT_CHIP_W + 10
+        y = FN_PAD + CT_TITLE
+        return x, y, CT_W - FN_PAD - x, self.world_height / self.scale - FN_PAD - y
+
+    def chip_point(self, name):
+        for n, x, y, _w, h in self._chip_boxes():
+            if n == name:
+                return self._to_world(x, y + h / 2)
+        return self.center
+
+    def output_point(self):
+        x, y, w, h = self._screen_box()
+        return self._to_world(x + w + FN_PAD, y + h / 2)
+
+    def _chip_rects(self, rect):
+        k = rect.width / CT_W
+        return [(name, pygame.Rect(rect.x + round(x * k), rect.y + round(y * k),
+                                   max(1, round(w * k)), max(1, round(h * k))))
+                for name, x, y, w, h in self._chip_boxes()], k
+
+    def chip_at(self, pos, camera):
+        chips, _k = self._chip_rects(self.screen_rect(camera))
+        return next((name for name, r in chips if r.inflate(6, 6).collidepoint(pos)), None)
+
+    # --- Drawing ----------------------------------------------------------------------
+    def draw_links(self, surface, camera):
+        if self.scene is None:
+            return
+        for name in CT_INPUTS:
+            src = self.source(name)
+            if src is not None and src.center is not None:
+                draw_wire(surface, camera, output_point(src), self.chip_point(name), self.WIRE_COLOR)
+
+    def draw_shape(self, surface, rect, camera):
+        s = min(rect.width, rect.height)
+        radius = max(2, s // 8)
+        draw_rect(surface, (14, 14, 18), rect.move(0, max(1, s // 22)), border_radius=radius)
+        draw_rect(surface, INPUT_HOUSING, rect, border_radius=radius)
+        draw_rect(surface, shade(INPUT_HOUSING, 1.35), rect, width=max(1, s // 40), border_radius=radius)
+        if s < 16:
+            draw_rect(surface, shade(self.color, 0.5), rect.inflate(-max(1, s // 3), -max(1, s // 3)))
+            return
+        chips, k = self._chip_rects(rect)
+
+        # The name, and the step / limits beside it.
+        size = round(16 * k)
+        if size >= 7:
+            font = get_font(size, "bahnschrift")
+            title = font.render(clip_text(self.title, font, rect.width * 0.5), True, (226, 228, 236))
+            surface.blit(title, (rect.x + round(FN_PAD * k), rect.y + round(FN_PAD * k)))
+            span = ""
+            if self.low is not None or self.high is not None:
+                span = f"  {'' if self.low is None else f'{self.low:g}'}…{'' if self.high is None else f'{self.high:g}'}"
+            info = get_font(max(7, round(13 * k)), "consolas", True).render(
+                f"step {self.step:g}{span}", True, shade(self.color, 0.85))
+            room = rect.right - round(FN_PAD * k) - (rect.x + round(FN_PAD * k) + title.get_width() + round(8 * k))
+            if info.get_width() <= room:
+                surface.blit(info, info.get_rect(midright=(rect.right - round(FN_PAD * k),
+                                                           rect.y + round(FN_PAD * k) + title.get_height() // 2)))
+
+        # Input chips: hollow until linked, filled once linked, brighter under the mouse.
+        mouse = pygame.mouse.get_pos() if self.is_hovered else None
+        csize = round(FN_CHIP_TEXT * k)
+        for name, r in chips:
+            linked = self.source(name) is not None
+            hot = mouse is not None and r.inflate(6, 6).collidepoint(mouse)
+            color = shade(self.color, 1.2) if hot else self.color
+            cr = max(2, r.height // 2)
+            if linked:
+                draw_rect(surface, color, r, border_radius=cr)
+            else:
+                draw_rect(surface, INPUT_WELL, r, border_radius=cr)
+                draw_rect(surface, color, r, width=max(1, round(2 * k)), border_radius=cr)
+            if csize >= 7:
+                ts = get_font(csize, "consolas", True).render(name, True, INPUT_WELL if linked else color)
+                surface.blit(ts, ts.get_rect(center=r.center))
+
+        # The value, Function-style, with the output nub on the right edge.
+        x, y, w, h = self._screen_box()
+        screen = pygame.Rect(rect.x + round(x * k), rect.y + round(y * k), round(w * k), round(h * k))
+        corner = max(2, round(6 * k))
+        draw_rect(surface, shade(self.color, 0.07), screen, border_radius=corner)
+        draw_rect(surface, (8, 8, 10), screen, width=max(1, s // 45), border_radius=corner)
+        pygame.draw.circle(surface, self.color, (rect.right, screen.centery), max(2, round(5 * k)))
+        pad = round(8 * k)
+        text = f"{self.value:.6g}"
+        at_limit = self.value in (self.low, self.high)
+        color = shade(self.color, 1.2 + 0.4 * (self._flash / 0.25)) if not at_limit else shade(self.color, 0.85)
+        size = round(h * 0.42 * k)
+        while size > 7 and get_font(size, "consolas", True).size(text)[0] > screen.width - 2 * pad:
+            size = max(7, int(size * 0.9))
+        if size >= 7:
+            ts = get_font(size, "consolas", True).render(text, True, color)
+            surface.blit(ts, ts.get_rect(midright=(screen.right - pad, screen.centery)))
+
+
 # ============================================================================
 # DATA — things that record other objects' values (E menu ▸ Data)
 # ============================================================================
