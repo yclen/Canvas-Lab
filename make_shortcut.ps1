@@ -1,7 +1,7 @@
 <#
 make_shortcut.ps1 — create a Start Menu shortcut for Canvas App, ready to pin.
 
-The shortcut runs game_loop.py with pythonw (no console window), uses icon.ico,
+The shortcut runs game_loop.py with pythonw (no console window), uses a local copy of icon.ico,
 and carries the AppUserModelID "Yaakov.CanvasApp" — the same ID game_loop.py sets
 at startup — so the pinned icon and the running window share one taskbar button.
 
@@ -17,12 +17,19 @@ $ErrorActionPreference = "Stop"
 $AppId = "Yaakov.CanvasApp"   # keep in sync with game_loop.py
 $AppDir = $PSScriptRoot
 $Script = Join-Path $AppDir "game_loop.py"
-$Icon = Join-Path $AppDir "icon.ico"
 $Lnk = Join-Path ([Environment]::GetFolderPath("Programs")) "Canvas App.lnk"
+$PinnedLnk = Join-Path $env:APPDATA "Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Canvas App.lnk"
 
 if (-not $Pythonw -or -not (Test-Path $Pythonw)) {
     throw "pythonw.exe not found; pass -Pythonw <path to the python that has pygame>"
 }
+
+# The app folder lives on Google Drive, which mounts after Explorer draws the
+# taskbar at login, so an icon read from there shows blank. Keep a local copy.
+$IconDir = Join-Path $env:LOCALAPPDATA "CanvasApp"
+New-Item -ItemType Directory -Force $IconDir | Out-Null
+$Icon = Join-Path $IconDir "icon.ico"
+Copy-Item (Join-Path $AppDir "icon.ico") $Icon -Force
 
 Add-Type -TypeDefinition @"
 using System;
@@ -111,4 +118,10 @@ public static class ShortcutMaker {
 [ShortcutMaker]::Create($Lnk, $Pythonw, "`"$Script`"", $AppDir, $Icon, $AppId)
 Write-Host "Created $Lnk"
 Write-Host "  runs: $Pythonw `"$Script`""
-Write-Host "Now: Start menu > 'Canvas App' > right-click > Pin to taskbar."
+# Pinning copies the .lnk, so refresh an existing pin too.
+if (Test-Path $PinnedLnk) {
+    [ShortcutMaker]::Create($PinnedLnk, $Pythonw, "`"$Script`"", $AppDir, $Icon, $AppId)
+    Write-Host "Updated taskbar pin."
+} else {
+    Write-Host "Now: Start menu > 'Canvas App' > right-click > Pin to taskbar."
+}
