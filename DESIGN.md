@@ -101,8 +101,8 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   `update()` (it gets the mouse + camera), saving once on release. Size, length, min, max,
   step, value, color editable. `value` is the parameter other objects will read later
 - **Inputs and outputs (takes / gives)** — one model for every link; see *Inputs and outputs*
-  below. Objects give live values (`outputs()`: Slider `value`, Switch `on`/`flips`, PushButton
-  `pressed`/`presses`, Lamp `on`, Neuron `firing` / `clock t` / `input W`, …) and take them on
+  below. Objects give live values (`outputs()`: Slider `value`, Switch `on`, PushButton
+  `pressed`, Lamp `on`, Neuron `firing` / `clock t` / `input W`, …) and take them on
   named inputs (`takes()`). The `Output` base (E menu ▸ **Displays**, was *Outputs*) has one
   input, `in`, read into `reading` every frame and passed on as `value`. First display:
   **Readout**, an LED display — seven-segment digits with unlit "ghost" segments, a unit
@@ -134,7 +134,8 @@ the classes they serve. If `canvas.py` gets unwieldy later, the natural next spl
   button counts once and a switch counts each off → on; a source already on when the canvas loads
   or the link is made doesn't count. Optional Minimum / Maximum (hidden
   `low` / `high`, blank = none): the value stops there, so presses past a limit do nothing (no
-  "stored-up" presses, unlike `presses` → Function), and a new limit pulls the value inside it.
+  "stored-up" presses), and a new limit pulls the value inside it. (Buttons and switches
+  don't count their own presses any more — link a Counter to count them.)
   Values are rounded to 12 places (0.1 × 3 = 0.3). Click the number to type one; the panel has
   + / - / Reset buttons (and Value / Minimum / Maximum under State). The value is saved (a `value` Prop, saved on each change) and is the
   output `value`. Drawn Function-style: chips, a screen with the number (brightens on a change,

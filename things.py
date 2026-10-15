@@ -133,14 +133,12 @@ class Input(Thing):
 
     CATEGORY = "Inputs"
     LAUNCHER = True
-    SHOW_PRESSES = True         # list "Presses (this session)" in the inspector
     SIZE = (64, 64)
     PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
                   prompt="Size (1 = normal, 2 = twice as big):")]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.presses = 0          # live count, not saved — handy to see it working
         self._held = False        # mouse went down on it and is still down
         self._flash = 0.0
 
@@ -158,7 +156,6 @@ class Input(Thing):
     def on_click(self, pos, app):
         self._held = True
         self._flash = INPUT_FLASH
-        self.presses += 1
         self.press(app)
         return True               # handled: a click presses it, it doesn't select it
 
@@ -167,13 +164,7 @@ class Input(Thing):
         run_action(self, app)
 
     def outputs(self):
-        return {"pressed": 1.0 if self.pressed else 0.0, "presses": float(self.presses)}
-
-    def state_rows(self, app):
-        rows = super().state_rows(app)
-        if self.SHOW_PRESSES:
-            rows.append(Row("Presses (this session)", self.presses))
-        return rows
+        return {"pressed": 1.0 if self.pressed else 0.0}    # to count presses, link a Counter
 
     @staticmethod
     def well_rect(rect):
@@ -349,7 +340,7 @@ class Switch(Input):
         return sample
 
     def outputs(self):
-        return {"on": 1.0 if self.on else 0.0, "flips": float(self.presses)}
+        return {"on": 1.0 if self.on else 0.0}
 
     def press(self, app):
         self.on = not self.on
@@ -423,7 +414,6 @@ class Slider(Input):
     MENU_LABEL = "Add slider"
     NAME = "Slider"
     LAUNCHER = False                # it holds a value; it doesn't launch a command
-    SHOW_PRESSES = False
     SIZE = (56, 0)                  # width; the height is the `length` prop
     DOT_COLOR = (90, 170, 240)
     PROPS = [Prop("value", "Value", "float", 0.5, state=True),
