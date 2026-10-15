@@ -8,9 +8,15 @@ at startup — so the pinned icon and the running window share one taskbar butto
 Usage:   powershell -ExecutionPolicy Bypass -File make_shortcut.ps1 [-Pythonw <path>]
 Then:    Start menu > find "Canvas App" > right-click > Pin to taskbar.
 Re-run it if you move the folder or change Python installs.
+
+It's safe to re-run after every update: the taskbar pin is only rewritten when the shortcut
+would actually change. The taskbar caches a pin's image and doesn't reload it when the .lnk is
+rewritten (the pin goes blank), so when it does change, Explorer is restarted to redraw the
+taskbar (pass -NoExplorerRestart to skip that and sign out / restart Explorer yourself).
 #>
 param(
-    [string]$Pythonw = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
+    [string]$Pythonw = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source,
+    [switch]$NoExplorerRestart
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,9 +35,13 @@ if (-not $Pythonw -or -not (Test-Path $Pythonw)) {
 $IconDir = Join-Path $env:LOCALAPPDATA "CanvasApp"
 # taskbar.ico is icon.ico at every size (16-256 px); a single 128 px image shows
 # blank on the taskbar. game_loop.py keeps loading icon.ico, which pygame can read.
+# The copy is named by its content, so a new icon gets a new path: Explorer caches icons by
+# path, and new bytes under an old path keep showing the old (or a blank) image.
 New-Item -ItemType Directory -Force $IconDir | Out-Null
-$Icon = Join-Path $IconDir "taskbar.ico"
-Copy-Item (Join-Path $AppDir "taskbar.ico") $Icon -Force
+$IconSrc = Join-Path $AppDir "taskbar.ico"
+$IconHash = (Get-FileHash $IconSrc -Algorithm SHA256).Hash.Substring(0, 8).ToLower()
+$Icon = Join-Path $IconDir "taskbar-$IconHash.ico"
+if (-not (Test-Path $Icon)) { Copy-Item $IconSrc $Icon }
 
 Add-Type -TypeDefinition @"
 using System;
@@ -117,13 +127,59 @@ public static class ShortcutMaker {
 }
 "@
 
-[ShortcutMaker]::Create($Lnk, $Pythonw, "`"$Script`"", $AppDir, $Icon, $AppId)
-Write-Host "Created $Lnk"
-Write-Host "  runs: $Pythonw `"$Script`""
-# Pinning copies the .lnk, so refresh an existing pin too.
-if (Test-Path $PinnedLnk) {
-    [ShortcutMaker]::Create($PinnedLnk, $Pythonw, "`"$Script`"", $AppDir, $Icon, $AppId)
-    Write-Host "Updated taskbar pin."
+# Build the shortcut once, next to the icon (same drive as the Start Menu and the pin, so the
+# moves below are a single rename and Explorer never reads a half-written file).
+$NewLnk = Join-Path $IconDir "Canvas App.new.lnk"
+[ShortcutMaker]::Create($NewLnk, $Pythonw, "`"$Script`"", $AppDir, $Icon, $AppId)
+
+# Compare what a shortcut does, not its bytes: a .lnk also stores timestamps of pythonw.exe
+# and the folders above it (they change all the time), and Explorer re-saves a pin itself.
+function Lnk-Fields($path) {
+    $s = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
+    $item = (New-Object -ComObject Shell.Application).Namespace((Split-Path $path)).ParseName((Split-Path $path -Leaf))
+    "$($s.TargetPath)|$($s.Arguments)|$($s.WorkingDirectory)|$($s.IconLocation)|$($item.ExtendedProperty('System.AppUserModel.ID'))"
+}
+function Same-File($a, $b) {
+    (Test-Path $b) -and ((Lnk-Fields $a) -eq (Lnk-Fields $b))
+}
+function Install-Lnk($dest) {
+    $tmp = "$NewLnk.copy"
+    Copy-Item $NewLnk $tmp -Force
+    Move-Item $tmp $dest -Force   # a rename onto the old file
+}
+
+if (Same-File $NewLnk $Lnk) {
+    Write-Host "Start Menu shortcut already up to date."
 } else {
+    Install-Lnk $Lnk
+    Write-Host "Created $Lnk"
+}
+Write-Host "  runs: $Pythonw `"$Script`""
+
+# Pinning copies the .lnk, so refresh an existing pin too — but only if it changed.
+$RestartExplorer = $false
+if (-not (Test-Path $PinnedLnk)) {
     Write-Host "Now: Start menu > 'Canvas App' > right-click > Pin to taskbar."
+} elseif (Same-File $NewLnk $PinnedLnk) {
+    Write-Host "Taskbar pin already up to date (left alone, so its icon stays)."
+} else {
+    Install-Lnk $PinnedLnk
+    Write-Host "Updated taskbar pin."
+    $RestartExplorer = $true
+}
+Remove-Item $NewLnk
+
+# Old icon copies nothing points at any more.
+Get-ChildItem $IconDir -Filter *.ico | Where-Object { $_.FullName -ne $Icon } | Remove-Item
+
+if ($RestartExplorer) {
+    if ($NoExplorerRestart) {
+        Write-Host "The pin's icon may show blank until Explorer restarts (or you sign out and back in)."
+    } else {
+        Write-Host "Restarting Explorer so the taskbar redraws the pin's icon..."
+        Stop-Process -Name explorer -Force
+        Start-Sleep -Seconds 2
+        # Windows normally relaunches the shell by itself; start it if it didn't.
+        if (-not (Get-Process explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
+    }
 }

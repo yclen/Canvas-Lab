@@ -544,6 +544,13 @@ Step 2 (MULTIPLAYER_STUDY.md): the world runs as its own program, and canvas win
 the world window is "Canvas Lab — World"). The Start-menu shortcut made by make_shortcut.ps1 is
 still called "Canvas App" (same AppUserModelID, so a pinned icon keeps working).
 
+**The taskbar pin's icon** goes blank whenever the pinned .lnk is rewritten: the taskbar caches
+the pin's image and doesn't reload it. So make_shortcut.ps1 (safe to re-run after every update)
+leaves the pin alone unless what it runs, its icon or its AppUserModelID changed — compared by
+those fields, not the .lnk's bytes, which hold ever-changing timestamps. When it does change the
+pin, it restarts Explorer to redraw the taskbar. The local icon copy is named by its content
+(`taskbar-<hash>.ico`) since Explorer caches icons by path.
+
 **The home screen's look** stays plain pygame shapes, like the rest of the app: the name, a
 status card, the buttons and the name row — tried a drifting backdrop and a live logo, but
 plain fits the app better. The window opens at 1180×740 (or 85% / 80% of a smaller screen).
