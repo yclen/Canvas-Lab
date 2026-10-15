@@ -7,7 +7,7 @@ run it by hand:
 
 It loads Nodes.json, ticks every object 60 times a second whether or not
 anyone is looking, saves, and talks to the instrument server (devices). Player
-windows join it over a local socket (see world_link.py) and see the same live
+windows join it over the network (see world_link.py) and see the same live
 world. What a player does (clicks, drags, panel clicks, menus, placing, …) is
 run here, by that player's WorldApp — the same object code a window on its own
 runs — and whatever it would show (a text box, a menu, a pick) is sent back to
@@ -17,7 +17,10 @@ Stop world) does — players are then sent back to their home screen.
 It has a small window of its own (and its own taskbar icon) so you can always
 see that it's running and who's in it.
 
-LOCAL ONLY for now: it listens on 127.0.0.1, so only windows on this PC can join.
+It listens on every address of this PC, so windows on other computers on the
+same network can join too (no password: it's for people you work with). While
+it runs, saves/world.json says where it is, so other computers running the app
+from this shared folder find it on their home screen.
 """
 
 import ctypes
@@ -267,6 +270,7 @@ class World:
                 next_send = now + 1 / SEND_HZ
                 changes = self.mirror.changes()
                 if changes:
+                    changes["clock"] = time.monotonic()     # players line their clocks up with it
                     self.broadcast(changes)
             if now >= next_presence:
                 next_presence = now + 1 / PRESENCE_HZ
@@ -301,8 +305,9 @@ class World:
         op = msg.get("op")
         if op == "hello":
             if msg.get("version") != world_link.VERSION:
-                conn.send({"op": "refused", "message": "This window and the world are different versions — "
-                                                       "restart both."})
+                conn.send({"op": "refused", "message": "This window's code is different from the world's — "
+                                                       "make sure both computers have the latest files, then "
+                                                       "restart the world and this window."})
                 conn.close()
                 return
             conn.name = self._free_name(str(msg.get("name") or "Player").strip()[:40] or "Player")
@@ -313,6 +318,7 @@ class World:
             if pending:
                 self.broadcast(pending)             # the players already here catch up first
             conn.send({"op": "welcome", "name": conn.name, "color": conn.color, "objects": objects, "state": states,
+                       "clock": time.monotonic(),
                        "players": self._roster(conn), "instruments": instruments.client.snapshot()})
             self.players.append(conn)
             self.apps[conn] = WorldApp(self, conn)
@@ -457,7 +463,8 @@ def run_window(world, listener, world_thread):
     pad = {"padx": 18, "anchor": "w"}
     tk.Label(root, text="● The world is running", fg=GREEN, bg=BG,
              font=("Segoe UI", 13, "bold")).pack(pady=(16, 2), **pad)
-    tk.Label(root, text="Local only: windows on this PC can join.", fg=DIM, bg=BG,
+    where = ", ".join([world_link.THIS_PC] + world_link.this_pc_addresses()[:1])
+    tk.Label(root, text=f"Others on this network can join: {where}", fg=DIM, bg=BG,
              font=("Segoe UI", 9)).pack(**pad)
     players = tk.Label(root, fg=FG, bg=BG, font=("Segoe UI", 10), justify="left")
     players.pack(pady=(12, 0), **pad)
@@ -517,12 +524,17 @@ def main():
     if world_link.solo_running():
         refuse("Can't start the world", "A canvas window is open working on its own (not in the world).\n"
                                         "Close it first, so only one program writes the canvas.")
+    host, _status, pc = world_link.find_world()
+    if host is not None and pc:
+        refuse("The world is already running", f"It's running on {pc}. Join it from a canvas window's "
+                                               "home screen, so only one world writes the canvas.")
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        listener.bind((world_link.HOST, world_link.PORT))      # 127.0.0.1: this PC only
+        listener.bind((world_link.LISTEN_HOST, world_link.PORT))   # every address: other PCs can join
     except OSError:
         refuse("The world is already running", "Join it from a canvas window's home screen.")
     listener.listen()
+    world_link.announce_world()
 
     world = World()
 
@@ -540,7 +552,10 @@ def main():
     world_thread = threading.Thread(target=world.run, name="world", daemon=True)
     world_thread.start()
     threading.Thread(target=world.listen, args=(listener,), name="listen", daemon=True).start()
-    run_window(world, listener, world_thread)
+    try:
+        run_window(world, listener, world_thread)
+    finally:
+        world_link.unannounce_world()
 
 
 if __name__ == "__main__":

@@ -305,7 +305,8 @@ it are now two things, still in one program.
 
 ## The world server and players
 
-Step 2 (docs/MULTIPLAYER_STUDY.md): the world runs as its own program, and canvas windows join it.
+Step 2 (docs/MULTIPLAYER_STUDY.md): the world runs as its own program, and canvas windows join it
+— from this PC or from other computers on the same network.
 
 **The name:** the app is **Canvas Lab** (`canvas.APP_NAME`: window titles, the home screen;
 the world window is "Canvas Lab — World"). The Start-menu shortcut made by make_shortcut.ps1 is
@@ -323,20 +324,23 @@ status card, the buttons and the name row — tried a drifting backdrop and a li
 plain fits the app better. The window opens at 1180×740 (or 85% / 80% of a smaller screen).
 
 **Using it.** The taskbar canvas opens to a **home screen** (`canvas.HomeScreen`): the world's
-status (running or not, who's in it, how many objects), then
-- **Join world** (green, Enter) when it's running;
+status (running or not, on which PC, who's in it, how many objects), then
+- **Join world** (green, Enter) when it's running — here or on another PC;
 - **Launch world** when it isn't: starts `world_server.py` (pythonw, no console), waits up to
   20 s for it, then joins by itself;
 - **Work on my own**: the canvas as it always was — loads, ticks and saves Nodes.json itself.
   Only while no world is running, so two programs never write the file;
-- **Playing as** *name* (click *change*): what other players see; saved in player.json.
+- **Playing as** *name* (click *change*): what other players see; saved in player.json;
+- **World on another PC?** *enter its address*: a PC name or IP, for a world the home screen
+  doesn't find by itself (see *Other computers* below).
 
 **The world app** (`world_server.py`, also runnable by hand) has a small window and its own
 taskbar icon (AppUserModelID `Yaakov.CanvasWorld`): *The world is running*, the players in it,
 object count, uptime, and **Stop world**. **Closing a player window never stops the world;
 closing the world's window (or Stop world) does** — it asks first if anyone's in it, saves, and
 sends players back to their home screen ("The world was stopped."). It refuses to start while
-a window is working on its own, and if a world is already running.
+a window on this PC is working on its own, and if a world is already running (here, or on the
+PC saves/world.json points to). Its window says how others can join (this PC's name and address).
 
 **In the world, everything works as on your own** — pressing buttons, flipping switches,
 dragging sliders, typing equations, linking (panel *link*, chips, dragging a wire out of a
@@ -394,10 +398,37 @@ sent back as a `ui` request and the answer comes back with its token:
   draws with too), checking the label so a click is never run on a different row. Folding a
   section (`view=True`) stays in the window.
 - A **click** asks the world and waits for its answer (`request` → `reply`): did the object
-  take it (then drags / release follow) or should it just select? Same PC: a few ms.
+  take it (then drags / release follow) or should it just select? Same PC: a few ms; over a
+  LAN, a few more.
 
-**How it works** (`world_link.py`, protocol in its docstring; JSON lines over
-127.0.0.1:47810 — local only):
+**Other computers** (same network). The world listens on every address of its PC
+(`world_link.LISTEN_HOST`, `0.0.0.0`; port 47810), with no password — it's for people you work
+with. How a window finds it (`world_link.find_world`, every half second on the home screen):
+1. this PC (127.0.0.1);
+2. **saves/world.json**: the world writes it when it starts (`announce_world`: PC name,
+   addresses, start time) and removes it when it stops. Computers running the app from this
+   shared Drive folder all see it, so they find the world without typing anything. If it names
+   a PC that doesn't answer (crashed, or blocked), the home screen says so in amber;
+3. the address typed under *World on another PC?* (kept per PC in player.json), for a PC that
+   doesn't share the folder.
+
+- **Same code or no entry:** the version a window sends in `hello` is a hash of the code files
+  (`world_link.CODE_FILES`), so a window whose files differ from the world's — another PC whose
+  Drive copy hasn't synced an edit yet, or a window opened before one — is refused with a message,
+  instead of half-working. After editing code, restart the world and the windows.
+- **Clocks:** objects keep moments as `time.monotonic()` values set in the world, and every PC's
+  clock starts somewhere else. The world sends its clock with the welcome and every change, and
+  object code that compares a stored moment with "now" where players draw it uses
+  `world_link.world_time()` — this PC's clock shifted to the world's (0 shift in the world and on
+  your own). Today that's the SuperK's "STARTING…" timer.
+- **Shared folder:** saves/ is shared too when PCs run from the Drive folder, so player.json keeps
+  each PC's name and typed address under its PC name (`{"names": {pc: name}, "join": {pc: address},
+  "views": {name: view}}`).
+- **Windows Firewall** on the world's PC must let `pythonw.exe` (Launch world) or `python.exe`
+  (by hand) accept connections on the network type it's on (Private / Public); Windows asks the
+  first time. A guest Wi-Fi often keeps devices from reaching each other at all.
+
+**How it works** (`world_link.py`, protocol in its docstring; JSON lines over TCP, port 47810):
 - The world thread (`World.run`) ticks the Scene 60×/s and, 30×/s, sends what changed. Network
   threads only queue messages; only the world thread touches the scene.
 - **Mirroring is generic** (`Mirror`): an object's state is its instance attributes —
@@ -416,22 +447,23 @@ sent back as a `ui` request and the answer comes back with its token:
   it: the world sends `instruments.client.snapshot()` (10×/s, when it changed) and the player's
   `instruments.client.mirror()`s it — never started, so it never connects anywhere.
 - **Names:** a second window with the same name gets "Yaakov 2". Views are kept per name in
-  player.json (`{"name", "views": {name: view}}`), so two windows each reopen where they were.
+  player.json (`"views": {name: view}`), so two windows each reopen where they were.
 - **Laser safety:** the world keeps running when everyone leaves, so the instrument server's
   "no clients" rule (emission off when the canvas goes) would no longer fire. Instead, when the
   last player leaves the world calls `on_no_players()` on every object; the SuperK turns
   emission off (unless its device's `off_when_canvas_closes` option is off). Stopping the world
   still disconnects it from the instrument server, so that rule fires too.
 - **"Work on my own" lock:** that window holds 127.0.0.1:47811 (a bound port is let go even
-  on a crash); the world won't start while it's held, and the home screen greys out Launch.
+  on a crash); the world won't start while it's held, and the home screen greys out Launch. It's
+  per PC: a world started on another PC doesn't see it (both would then write Nodes.json).
 - **Tests** point everything elsewhere with `CANVAS_WORLD_PORT`, `CANVAS_NODES_FILE`,
-  `CANVAS_PLAYER_FILE` (and `CANVAS_INSTRUMENT_PORT`), so they never touch the real world.
+  `CANVAS_PLAYER_FILE`, `CANVAS_WORLD_FILE` (and `CANVAS_INSTRUMENT_PORT`), so they never touch
+  the real world; `CANVAS_WORLD_LISTEN=127.0.0.1` keeps a test world off the network.
 - **Cost:** 500 objects ≈ 15 ms per send (tick + compare), ~8 KB a message — fine at today's
   sizes. If worlds grow: send less often, or only what's near each player's view.
 - **Known rough edges:** movement is updated 30×/s, so agents step slightly (smoothing
   between updates could fix it); a Switch's knob slide is mirrored, not animated locally;
-  times stored as `time.monotonic()` (e.g. the SuperK's "starting…" timer) are shared as-is,
-  which is right on one PC but won't be across computers; a collector's scroll position is
+  a collector's scroll position is
   shared when it's moved with the scrollbar (that runs in the world), not with the wheel
   (that's the window's own). Launchers' commands run on the PC the world runs on. Each action
   waits for the next world tick (≤ 16 ms) and its result shows with the next send (≤ 33 ms).

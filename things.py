@@ -55,6 +55,7 @@ import instruments
 from canvas import (OBJECT_TYPES, SAVES_DIR, WARN_COLOR, Btn, Field, Give, Prop, Row, Section,
                     Take, Thing, alpha_layer, clip_text, draw_arc, draw_rect, font_px, format_value, get_font,
                     panel_button, run_action, short_name)
+from world_link import world_time
 
 
 def shade(color, factor):
@@ -3725,7 +3726,7 @@ class SuperK(Device):
         emitting = self.laser_state()[0]
         wanted = not (emitting is None or emitting)       # unknown counts as on: never guess
         self._pending = (wanted, time.monotonic(), (self.info() or {}).get("message", ""))
-        self._on_asked = time.monotonic() if wanted else 0.0
+        self._on_asked = world_time() if wanted else 0.0     # world_time: drawn on other PCs too
         self.run_action(app, "emission_on" if wanted else "emission_off")   # on is refused if interlocked
 
     def on_click(self, pos, app):
@@ -3833,7 +3834,7 @@ class SuperK(Device):
         if status != "ok":
             word, color = DEVICE_STATUS_TEXT.get(status, status).upper(), shade(led_color, 1.1)
         elif emitting is None:                    # between states: right after "on" it's ramping up
-            starting = time.monotonic() - self._on_asked < SK_STARTING_SECONDS
+            starting = world_time() - self._on_asked < SK_STARTING_SECONDS
             word, color = ("STARTING…" if starting else "UNKNOWN"), (240, 190, 60)
         else:
             word, color = ("EMITTING", SK_RED) if emitting else ("IDLE", (150, 152, 166))

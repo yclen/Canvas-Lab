@@ -26,8 +26,10 @@ The window opens to a **home screen**:
 
 - **Launch world** starts the world (`world_server.py`, its own small window) and joins it.
   The world keeps running when player windows close; closing its window stops it.
-- **Join world** when one is already running. Each player has a name and a color, and sees
-  the others' cursors, views and selections.
+- **Join world** when one is already running — on this PC or another one on the same network
+  (found by itself when both run the app from this shared folder; otherwise enter the world PC's
+  name or IP on the home screen). Each player has a name and a color, and sees the others'
+  cursors, views and selections. The world's PC must let Python through its firewall.
 - **Work on my own**: the canvas by itself, no world (only while no world is running).
 
 The instrument server (`instrument_server.py`, the hardware) starts on its own when a device

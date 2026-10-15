@@ -7,8 +7,10 @@
 > runs the same object code for you, and sends its dialogs to your window", not one command
 > per change, so object types didn't need rewriting). The two-views-in-one-process step was
 > skipped: two real windows on one PC test the split better. Presence too: each player's
-> color, cursor, view box and selection, drawn in every other window. **Next:** who may hold
-> / grab what, then other computers (a password, LAN).
+> color, cursor, view box and selection, drawn in every other window. Other computers on the
+> same network (2026-10-15): the world listens on the LAN and is found through saves/world.json
+> or a typed address — no password, by choice (people you work with). **Next:** who may hold /
+> grab what.
 >
 > **The question:** what would it take to run
 > the world as its own **server**, with players joining from other computers, each

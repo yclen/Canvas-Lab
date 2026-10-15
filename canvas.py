@@ -2535,32 +2535,42 @@ class Scene:
 # selected, hover, drawing, and where they were looking at last close. The
 # world (Scene) is shared; each player window has its own Player.
 # ============================================================================
-PLAYER_FILE = (os.environ.get("CANVAS_PLAYER_FILE")      # players' own data on this PC, git-ignored
+PLAYER_FILE = (os.environ.get("CANVAS_PLAYER_FILE")      # players' own data, git-ignored
                or os.path.join(SAVES_DIR, "player.json"))
-# {"name": the name last played as, "views": {player name: view}} — a view per
-# name, so two windows on one PC (Yaakov, Yaakov 2) each reopen where they were.
+# {"names": {PC name: the name last played as there}, "views": {player name: view}}
+# — a view per name, so two windows (Yaakov, Yaakov 2) each reopen where they were.
+# Names are kept per PC because computers running the app from this shared folder
+# share the file; so is "join": {PC name: the world address typed on its home screen}.
 
 
 def load_players(path=PLAYER_FILE):
-    """player.json as {"name", "views"} (empty if missing; the first shape,
-    {"name", "view"}, is read as that name's view)."""
+    """player.json as {"name" (this PC's), "names", "views"} (empty if missing;
+    the older shapes — one "name", or {"name", "view"} — still read)."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
         data = {}
     views = data.get("views") if isinstance(data.get("views"), dict) else {}
-    name = data.get("name") or ""
+    names = data.get("names") if isinstance(data.get("names"), dict) else {}
+    name = names.get(world_link.THIS_PC) or data.get("name") or ""
     if "view" in data:                  # the first shape: one view, saved as "local"
         views.setdefault(name or "local", data["view"])
     if name == "local":                 # (that was never a name you chose)
         name = ""
-    return {"name": name, "views": views}
+    join = data.get("join") if isinstance(data.get("join"), dict) else {}
+    return {"name": name, "names": names, "views": views, "join": join,
+            "address": join.get(world_link.THIS_PC, "")}
 
 
 def save_players(data, path=PLAYER_FILE):
+    names, join = dict(data.get("names", {})), dict(data.get("join", {}))
+    if data.get("name"):
+        names[world_link.THIS_PC] = data["name"]
+    if "address" in data:
+        join[world_link.THIS_PC] = data["address"]
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"name": data.get("name", ""), "views": data.get("views", {})}, f, indent=2)
+        json.dump({"names": names, "join": join, "views": data.get("views", {})}, f, indent=2)
 
 
 def _clean_view(view):
@@ -4649,8 +4659,9 @@ class App:
 
 # ============================================================================
 # HOME SCREEN — what a canvas window opens to: join the world (it runs on its
-# own, in world_server.py), launch it, or work on your own (Nodes.json
-# directly, the way the canvas always worked — only while no world is running).
+# own, in world_server.py — on this PC or another one on the network), launch
+# it, or work on your own (Nodes.json directly, the way the canvas always
+# worked — only while no world is running).
 # ============================================================================
 APP_NAME = "Canvas Lab"
 HOME_W = 460                        # the column's width, px
@@ -4670,9 +4681,14 @@ class HomeScreen:
     is running (and whether a window is already working on its own)."""
 
     def __init__(self, message=""):
-        self.name = load_players()["name"] or world_link.default_name()
+        players = load_players()
+        self.name = players["name"] or world_link.default_name()
+        self.address = players["address"]   # a world on another PC, typed here ("" = none)
         self.message = message      # e.g. "The world stopped."
         self.status = None          # the running world's status, or None
+        self.host = None            # where it answered (world_link.HOST = this PC)
+        self.where = ""             # the PC it runs on, to show ("" = this one)
+        self.lost = None            # saves/world.json names a world on another PC that doesn't answer
         self.solo = False           # a canvas window is working on its own right now
         self.checked = False        # has the first check come back?
         self.starting_until = 0.0   # after Launch world: wait for it until then (monotonic)
@@ -4683,15 +4699,18 @@ class HomeScreen:
 
     def _poll(self):
         while not self._stop:
-            status = world_link.world_status()
+            host, status, where = world_link.find_world(self.address)
+            announced = world_link.announced_world() if status is None else None
+            self.lost = announced if announced and announced.get("pc") != world_link.THIS_PC else None
             self.solo = status is None and world_link.solo_running()
+            self.host, self.where = host, where
             self.status, self.checked = status, True
             time.sleep(0.5)
 
     # --- Choices -------------------------------------------------------------------
     def join(self):
-        self._draw_wait("Joining the world…")
-        link = world_link.WorldLink(self.name)
+        self._draw_wait(f"Joining the world on {self.where}…" if self.where else "Joining the world…")
+        link = world_link.WorldLink(self.name, self.host or world_link.HOST)
         try:
             welcome = link.connect()
         except (OSError, ValueError) as e:
@@ -4716,6 +4735,17 @@ class HomeScreen:
                 players["name"] = self.name
                 save_players(players)
         self.modal = TextInputModal("Your name (what other players see):", submit, value=self.name)
+
+    def set_address(self):
+        """A world on another PC that saves/world.json doesn't lead to (e.g. one
+        not running from this shared folder): its PC name or IP address."""
+        def submit(text):
+            self.address = text.strip()
+            players = load_players()
+            players["address"] = self.address
+            save_players(players)
+        self.modal = TextInputModal("The world's PC: its name or IP address (empty: none)", submit,
+                                    value=self.address)
 
     def primary(self):
         """What Enter does: the green button."""
@@ -4811,7 +4841,8 @@ class HomeScreen:
         if self.status is not None:
             names = [p if isinstance(p, str) else p.get("name", "?") for p in self.status.get("players", [])]
             pygame.draw.circle(surface, HOME_OK, (x + 7, cy + 13), 6)
-            cy = self._text(surface, "The world is running", (x + 22, cy), 24, HOME_OK, bold=True)
+            title = f"The world is running on {self.where}" if self.where else "The world is running"
+            cy = self._text(surface, title, (x + 22, cy), 24, HOME_OK, bold=True)
             self._text(surface, (f"In it: {', '.join(names)}" if names else "Nobody's in it yet")
                        + f"  ·  {self.status.get('objects', 0)} objects", (x, cy + 4))
         elif self.starting_until:
@@ -4822,8 +4853,13 @@ class HomeScreen:
         else:
             pygame.draw.circle(surface, (200, 200, 210), (x + 7, cy + 13), 6, width=2)
             cy = self._text(surface, "The world isn't running", (x + 22, cy), 24, (200, 200, 210), bold=True)
-            self._text(surface, "Launch it, and it keeps running on its own until you stop it — "
-                                "closing this window won't.", (x, cy + 4))
+            if self.lost is not None:
+                self._text(surface, f"A world was started on {self.lost['pc']} but doesn't answer. If it's "
+                                    f"still running, its firewall may be blocking port {world_link.PORT}.",
+                           (x, cy + 4), 18, HOME_WARN)
+            else:
+                self._text(surface, "Launch it, and it keeps running on its own until you stop it — "
+                                    "closing this window won't.", (x, cy + 4))
         y = card.bottom + 18
 
         # Buttons
@@ -4857,7 +4893,18 @@ class HomeScreen:
         change = pygame.Rect(x + lts.get_width() + nts.get_width(), y, cts.get_width(), nts.get_height())
         surface.blit(cts, (change.x, y + 1))
         self._buttons.append((change.inflate(8, 6), self.rename))
-        y += nts.get_height() + 14
+        y += nts.get_height() + 8
+
+        # A world on another PC, by address (for when saves/world.json doesn't lead to it)
+        ats = get_font(18).render(f"World at {self.address}" if self.address else "World on another PC?",
+                                  True, HOME_DIM)
+        ets = get_font(18).render("  change" if self.address else "  enter its address", True,
+                                  INSPECTOR_ACCENT)
+        surface.blit(ats, (x, y))
+        enter = pygame.Rect(x + ats.get_width(), y, ets.get_width(), ats.get_height())
+        surface.blit(ets, enter.topleft)
+        self._buttons.append((enter.inflate(8, 6), self.set_address))
+        y += ats.get_height() + 14
 
         if self.message:
             self._text(surface, self.message, (x, y), 20, HOME_WARN)
