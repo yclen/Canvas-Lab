@@ -1,7 +1,7 @@
 <#
 make_shortcut.ps1 — create a Start Menu shortcut for Canvas App, ready to pin.
 
-The shortcut runs game_loop.py with pythonw (no console window), uses a local copy of icon.ico,
+The shortcut runs game_loop.py with pythonw (no console window), uses a local copy of taskbar.ico,
 and carries the AppUserModelID "Yaakov.CanvasApp" — the same ID game_loop.py sets
 at startup — so the pinned icon and the running window share one taskbar button.
 
@@ -27,9 +27,11 @@ if (-not $Pythonw -or -not (Test-Path $Pythonw)) {
 # The app folder lives on Google Drive, which mounts after Explorer draws the
 # taskbar at login, so an icon read from there shows blank. Keep a local copy.
 $IconDir = Join-Path $env:LOCALAPPDATA "CanvasApp"
+# taskbar.ico is icon.ico at every size (16-256 px); a single 128 px image shows
+# blank on the taskbar. game_loop.py keeps loading icon.ico, which pygame can read.
 New-Item -ItemType Directory -Force $IconDir | Out-Null
-$Icon = Join-Path $IconDir "icon.ico"
-Copy-Item (Join-Path $AppDir "icon.ico") $Icon -Force
+$Icon = Join-Path $IconDir "taskbar.ico"
+Copy-Item (Join-Path $AppDir "taskbar.ico") $Icon -Force
 
 Add-Type -TypeDefinition @"
 using System;
