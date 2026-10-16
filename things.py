@@ -2512,6 +2512,7 @@ class Device(Thing):
     NAME = "Device"
     CATEGORY = "Devices"
     DRIVER = None                 # a subclass for one driver sets its module name (e.g. "fake_arduino")
+    COPY_SKIP = ("connect",)      # a copy starts as a view; Connect on it takes control
     DEFAULT_DEVICE = ""           # server device name to use when none of that driver is found
     SIZE = (230, 132)
     DOT_COLOR = (90, 220, 120)
@@ -2527,9 +2528,7 @@ class Device(Thing):
 
         def make(x, y):
             obj = cls(x, y)
-            used = {o.device for o in app.scene.objects if isinstance(o, Device)}
-            base = cls.DEFAULT_DEVICE or "device"           # a name no other object here uses
-            obj.device = next(n for n in [base] + [f"{base}{i}" for i in range(2, 1000)] if n not in used)
+            obj.device = obj.find_device()                  # another view of the one device
             return obj
         app.start_placing(make)
 
@@ -2560,7 +2559,7 @@ class Device(Thing):
         """Driver-specific objects set up their own device: add it to the
         server if it isn't there, or reconfigure it if its options changed."""
         client = instruments.client
-        if not (self.DRIVER and self.connect and self.device and client.connected):
+        if not (self.DRIVER and self.connect and self.device and client.connected and client.catalog_in):
             return
         now = time.monotonic()
         if now < self._next_request:
@@ -2575,12 +2574,68 @@ class Device(Thing):
             client.send({"op": "configure_device", "name": self.device, "options": options})
             self._next_request = now + DEVICE_RETRY_SECONDS
 
+    # --- Which device: the driver's, never one of its own ---------------------------
+    def is_my_device(self, options):
+        """Is a server device of this DRIVER (with these options) the one this
+        object shows? A driver runs one device (so: yes); a driver with a
+        device_key (flip_mirror: one per mirror) overrides this to match it."""
+        return True
+
+    def default_device_name(self):
+        """The name to add the device under when the server has none for it yet."""
+        return self.DEFAULT_DEVICE or self.DRIVER
+
+    def find_device(self):
+        """The server device this (driver-specific) object shows: the one the
+        server runs for its driver; else, while the server's catalog is in, the
+        name to add it under; else (offline) the one it showed last."""
+        if not self.DRIVER:
+            return self.device                     # the generic Device: picked by name
+        client = instruments.client
+        for name, options in client.devices_for(self.DRIVER):
+            if self.is_my_device(options):
+                return name
+        if (client.connected and client.catalog_in) or not self.device:
+            return self.default_device_name()
+        return self.device
+
     def connect_now(self, app):
+        client = instruments.client
+        if self.DRIVER:
+            self.device = self.find_device()
+            if self.take_control(app):
+                info = client.device(self.device)       # it's running: keep its settings (a
+                if info is not None:                    # different port would restart it)
+                    self.adopt_options(info.get("options", {}))
         self.connect = True
-        instruments.client.want(self.id, True)
-        instruments.client.retry_launch()
+        client.want(self.id, True)
+        client.retry_launch()
+        if client.device(self.device) is not None:
+            client.send({"op": "retry", "device": self.device})   # in error: try again now
         self._next_request = 0.0
         app.save()
+
+    def take_control(self, app):
+        """Disconnect the other objects showing this device — only
+        this object's view: the device keeps running, nothing is turned off.
+        True if one of them had it."""
+        taken = False
+        for o in app.scene.objects:
+            if o is not self and isinstance(o, Device) and o.device == self.device and o.connect:
+                o.connect = False
+                instruments.client.want(o.id, False)
+                o.on_control_taken()
+                taken = True
+        return taken
+
+    def on_control_taken(self):
+        """Another object took this device over."""
+
+    def adopt_options(self, options):
+        """Take on the running device's options (props named like them)."""
+        for key in self.device_options():
+            if key in options:
+                setattr(self, key, options[key])
 
     def disconnect(self, app):
         self.connect = False
@@ -2649,6 +2704,8 @@ class Device(Thing):
         if needed, remember its params / readings, and push each linked param's
         source value to the server (the client skips repeats and caps the rate)."""
         instruments.client.want(self.id, self.connect)
+        if self.DRIVER:
+            self.device = self.find_device()         # follows the server (an old save's "pda452" too)
         if not self.connect or not self.device or self.scene is None:
             return
         self._provision()
@@ -2976,7 +3033,10 @@ class ZaberStage(Device):
     stepper motor on the end of a rail, and the carriage sitting at the real
     position (read back from the stage) along its travel. An orange marker
     shows the target; the carriage glows while moving. Link target to a slider
-    and a readout to position. Home / Stop are buttons once it's connected."""
+    and a readout to position. Home / Stop are buttons once it's connected.
+    "Stage # in chain" picks which stage it shows: the server runs one device
+    per stage, and every object set to that stage is a view of it. Stages the
+    filter band drives (its longpass / shortpass) can't also be a stage device."""
 
     TYPE = "zaber_stage"
     MENU_LABEL = "Add Zaber stage"
@@ -2993,6 +3053,13 @@ class ZaberStage(Device):
 
     def device_options(self):
         return {"port": self.port or "auto", "stage": self.stage, "baud": self.baud}
+
+    def is_my_device(self, options):
+        """The driver runs one device per stage: this object's is the one for its stage."""
+        return str(options.get("stage", 0)) == str(self.stage)
+
+    def default_device_name(self):
+        return f"{self.DEFAULT_DEVICE}{self.stage}"          # zaber0, zaber1, …
 
     def _numbers(self):
         """(position, target, low, high, moving, homed) from the server, None where unknown."""
@@ -3742,6 +3809,9 @@ class SuperK(Device):
             self.run_action(app, "emission_off")  # no beam left running without its controls
         super().disconnect(app)
 
+    def on_control_taken(self):
+        self._pending = None          # its click is the new controller's business now
+
     def on_no_players(self):
         """The world keeps running when everyone leaves — but not the beam:
         nobody's left watching it (unless the device's off_when_canvas_closes
@@ -3950,15 +4020,20 @@ class FlipMirror(Device):
     def create(cls, app):
         def make(x, y):
             obj = cls(x, y)
-            used = {o.device for o in app.scene.objects if isinstance(o, Device)}
-            obj.device = next(n for n in [cls.DEFAULT_DEVICE] + [f"{cls.DEFAULT_DEVICE}{i}" for i in range(2, 1000)]
-                              if n not in used)
             names = {o.text for o in app.scene.objects if isinstance(o, FlipMirror)}
             obj.text = next(f"Flipper {i}" for i in range(1, 1000) if f"Flipper {i}" not in names)
             if any(isinstance(o, FlipMirror) and o.mirror == "detection" for o in app.scene.objects):
                 obj.mirror = "excitation"            # the second one is most likely the other mirror
+            obj.device = obj.find_device()           # that mirror's device
             return obj
         app.start_placing(make)
+
+    def is_my_device(self, options):
+        """The driver runs one device per mirror: this object's is the one for its mirror."""
+        return (options.get("mirror") or "detection") == self.mirror
+
+    def default_device_name(self):
+        return f"{self.DEFAULT_DEVICE}_{self.mirror}"
 
     def load_props(self, d):
         """Saved before names were editable: keep showing what it showed then —
@@ -4405,11 +4480,6 @@ class FilterWheel(Device):
             y += ts.get_height() * 1.05
 
 
-def server_object(scene):
-    """The canvas's Instrument server object, or None."""
-    return next((o for o in scene.objects if isinstance(o, InstrumentServer)), None)
-
-
 def device_class_for(driver):
     """The canvas object for a driver's devices: a Device subclass that names
     this driver in DRIVER (custom look/controls), else the generic Device."""
@@ -4429,29 +4499,23 @@ class InstrumentServer(Thing):
     launches) until you press Connect here; then it starts instrument_server.py
     if it isn't running and stays connected (also after a canvas restart).
     Its panel lists the server's devices (click one to place it / go to it)
-    and its drivers (click one to add a new device from it). Only one allowed."""
+    and its drivers (click one to add a new device from it). Place as many as
+    you like: there's one server, and each object is a view of the one link
+    (they all show its state). Connect on one takes over from the one that had
+    it; Disconnect all / Stop server turn every one off."""
 
     TYPE = "instrument_server"
     MENU_LABEL = "Add instrument server"
     NAME = "Instrument server"
     CATEGORY = "Devices"
-    SINGLETON = True
-    copyable = False
+    copyable = True
+    COPY_SKIP = ("connect",)        # a copy is a view; Connect on it takes over
     SIZE = (220, 170)               # the radio body is the bottom ~60%; the antenna rises above
     DOT_COLOR = (120, 220, 150)
     PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
                   prompt="Size (1 = normal, 2 = twice as big):"),
              Prop("connect", kind="bool", default=False, hidden=True)]   # Connect pressed (saved)
     STATE_COLORS = {"connected": (90, 220, 120), "connecting": (240, 190, 60), "off": (110, 110, 120)}
-
-    @classmethod
-    def create(cls, app):
-        existing = server_object(app.scene)
-        if existing is not None:                # only one: go to it instead
-            app.player.select_only(existing)
-            app.camera.look_at(existing.center, app.camera.zoom, app.screen_size)
-            return
-        app.start_placing(lambda x, y: cls(x, y))
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -4473,17 +4537,19 @@ class InstrumentServer(Thing):
         instruments.client.want(self.id, False)
 
     def connect_now(self, app):
+        for o in app.scene.objects:             # take over from the one that had it
+            if isinstance(o, InstrumentServer) and o is not self and o.connect:
+                o.connect = False
+                instruments.client.want(o.id, False)
         self.connect = True
         instruments.client.want(self.id, True)
         instruments.client.retry_launch()
         app.save()
 
     def _all_off(self, app):
-        """Master off: this and every device stop wanting the link."""
-        self.connect = False
-        instruments.client.want(self.id, False)
+        """Master off: every Instrument server object and every device stop wanting the link."""
         for o in app.scene.objects:
-            if isinstance(o, Device):
+            if isinstance(o, (Device, InstrumentServer)):
                 o.connect = False
                 instruments.client.want(o.id, False)
         app.save()

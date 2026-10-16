@@ -11,8 +11,12 @@ the Quantum Yield control GUI:
   driver's own disconnect turns it off).
 
 devices.json options:
-  port                    "auto" (nkt_tools scans the COM ports for the laser,
-                          as the lab GUIs do) or e.g. "COM7"; "sim://" pretends.
+  port                    "auto" or e.g. "COM7"; "sim://" pretends. "auto" tries,
+                          in order: the port the laser was last found on, the
+                          port with that USB adapter's serial number (if Windows
+                          gave it a new COM number), and only then nkt_tools'
+                          full scan, which opens every COM port (as the lab GUIs
+                          do). Where it was found is kept in saves/superk_port.json.
   off_when_canvas_closes  true (default): emission off when no canvas is
                           connected any more.
 
@@ -24,16 +28,23 @@ readings: emission (1 / 0, or missing while the laser is between states —
 actions:  emission_on, emission_off, reset_interlock
 
 The NKT DLL takes the port exclusively: close NKT's own Control Software first.
+There's one laser and one DLL, so the server runs one SuperK device (as for
+every driver; two would call the DLL from two threads) — every SuperK object
+on the canvas shows that one — and opens
+it before the other devices (`opens_first`), so a full scan can't grab a port
+another device is opening.
 """
 
+import json
 import os
 import sys
 import time
 
 from drivers.base import Driver, Param, Reading
 
-LAB_DRIVERS = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                            "..", "..", "hardware drivers"))
+HERE = os.path.dirname(os.path.abspath(__file__))
+LAB_DRIVERS = os.path.normpath(os.path.join(HERE, "..", "..", "hardware drivers"))
+LAST_PORT_FILE = os.path.normpath(os.path.join(HERE, "..", "saves", "superk_port.json"))
 
 
 def _lab_superk():
@@ -43,24 +54,89 @@ def _lab_superk():
     return superk
 
 
+def _comports():
+    """{port: USB serial number} for this PC's serial ports (empty without pyserial)."""
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        return {}
+    return {p.device: p.serial_number for p in list_ports.comports()}
+
+
+def load_last_port():
+    """{"port", "serial"} where the laser was last found, or {}."""
+    try:
+        with open(LAST_PORT_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_last_port(port):
+    try:
+        os.makedirs(os.path.dirname(LAST_PORT_FILE), exist_ok=True)
+        with open(LAST_PORT_FILE, "w", encoding="utf-8") as f:
+            json.dump({"port": port, "serial": _comports().get(port)}, f, indent=2)
+    except OSError as e:
+        print(f"  [superk] couldn't remember the port: {e}", flush=True)
+
+
+def auto_candidates(last, ports):
+    """The ports "auto" tries before a full scan: the last one, then the one
+    with the last one's USB serial number. Only ports that exist right now."""
+    out = []
+    if last.get("port") in ports:
+        out.append(last["port"])
+    serial = last.get("serial")
+    if serial:
+        out += [p for p, s in ports.items() if s == serial and p not in out]
+    return out
+
+
 class SuperKLaser(Driver):
     params = {"power_level": Param(0, 100, unit="%")}
     readings = {"emission": Reading(), "interlock_ok": Reading(), "interlock": Reading(),
                 "status": Reading(), "port": Reading()}
     actions = ["emission_on", "emission_off", "reset_interlock"]
     poll_hz = 2          # emission changes when somebody does something; each read crosses the DLL
+    opens_first = True   # "auto" may scan every COM port
 
     def open(self):
         port = str(self.options.get("port") or "auto")
         if port.startswith("sim://"):
             self.laser = SimLaser()
             self.actions = SuperKLaser.actions + ["sim_open_interlock"]   # for testing refusals
+        elif port.lower() == "auto":
+            self.laser = self._find()
         else:
-            self.laser = _lab_superk().SuperK(address=None if port.lower() == "auto" else port)
-            if not self.laser.connect():
-                raise IOError("couldn't open the SuperK (is NKT's Control Software holding the port?)")
+            self.laser = self._connect(port)
+            if self.laser is None:
+                raise IOError(f"couldn't open the SuperK on {port} (is it on? is NKT's "
+                              f"Control Software holding the port? \"auto\" would look for it)")
         self.values["power_level"] = round(self.laser.get_power_level(), 1)   # don't change it
         print(f"  [superk] connected @ {self.laser.address}", flush=True)
+
+    def _connect(self, address):
+        """The lab driver's SuperK, connected on `address` (None: a full scan), or None."""
+        laser = _lab_superk().SuperK(address=address)
+        return laser if laser.connect() else None
+
+    def _find(self):
+        """port "auto": the remembered port first, a full scan only if that fails."""
+        tried = auto_candidates(load_last_port(), _comports())
+        for port in tried:
+            laser = self._connect(port)
+            if laser is not None:
+                save_last_port(laser.address)
+                return laser
+        print(f"  [superk] not on {', '.join(tried) or 'a remembered port'}: scanning every COM port",
+              flush=True)
+        laser = self._connect(None)
+        if laser is None:
+            raise IOError("couldn't find the SuperK on any COM port (is it on and plugged in? "
+                          "is NKT's Control Software holding the port?)")
+        save_last_port(laser.address)
+        return laser
 
     def apply(self, name, value):
         if name == "power_level":

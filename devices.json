@@ -18,15 +18,6 @@
       }
     },
     {
-      "name": "zaber2",
-      "driver": "zaber_stage",
-      "options": {
-        "port": "COM3",
-        "stage": 0,
-        "baud": 115200
-      }
-    },
-    {
       "name": "pm100d",
       "driver": "pm100d_meter",
       "options": {

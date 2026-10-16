@@ -346,7 +346,14 @@ Each one is a Device object for one driver in `drivers/`; how devices connect is
   read error / server stop — the lab driver turns it off on disconnect). Param `power_level`
   (0–100 %, 0.1 % steps, starts at the laser's own setpoint). Text readings `interlock`,
   `status`, `port` are shown but not outputs (Device outputs are numbers only). Port `auto`
-  scans like the lab GUIs; set it explicitly to avoid opening other ports. `sim://` pretends.
+  tries the port the laser was last found on (`saves/superk_port.json`), then the port with
+  that USB adapter's serial number, and only then nkt_tools' full scan (which opens every COM
+  port, like the lab GUIs). `sim://` pretends. **One laser, one device** (as for every
+  driver — and here it matters: the NKT DLL can't be used from two threads, and two devices
+  broke it); the driver is `opens_first` (its scan opens before other devices claim their
+  ports). Every SuperK object shows the one `superk` device; **Connect** on one takes control
+  from the object that had it (that one just shows "not connected"; the laser keeps running,
+  emission untouched, and the new controller keeps the device's port).
   The object: laser head with a warning triangle, EMITTING / IDLE / UNKNOWN, power bar,
   interlock / status lines, and a rainbow beam from the output port while emitting.
 - **Built-in emission switch** (SuperK): the safety lives in the object. The SuperK draws its

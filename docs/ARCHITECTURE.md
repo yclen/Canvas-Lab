@@ -84,7 +84,7 @@
   whole. Select objects, right-click ▸ *Create machine…*, name it: the selection's saved data
   (`to_dict`, minus each type's `COPY_SKIP` — a data collector's `rows`, a neuron's weights) goes
   into `saves/machines.json` next to Nodes.json (git-ignored, like it) with the group's center. Only
-  copyable, non-`SINGLETON` objects go in — trains and the instrument server are left out (the
+  copyable, non-`SINGLETON` objects go in — trains are left out (the
   confirmation says which). A taken name gets " (2)". The E menu's **Machines** tab (always shown;
   empty, it says how to make one) has a tile per machine — its icon a miniature of its objects
   (`draw_machine_preview`) — and right-click on one renames / deletes it (`App.machine_menu`,
@@ -487,12 +487,24 @@ Real hardware runs outside the canvas. Each device type's canvas object is descr
   open (so restarting the canvas never resets an Arduino, and devices **hold their last
   value** when the canvas closes), and serves JSON-lines over a socket. One worker thread per
   device applies the *newest* requested value per param, then polls `read()` at the driver's
-  `poll_hz`; a failing driver shows "error" and is retried (module re-imported) every 3 s.
+  `poll_hz`; a failing driver shows "error" (with when it'll retry) and is retried (module
+  re-imported) after 3 s, then 6, 12 … up to 60 s; the full traceback is logged only when the
+  error changes. A `retry` request (sent by a Device's **Connect**) tries at once.
+- **Startup order:** the server listens first, then opens devices **one at a time** (an open
+  lock — a port-scanning driver must never overlap another device's open), drivers marked
+  `opens_first` (the SuperK's scan) before the rest.
+- **One device per piece of hardware — the driver decides.** A driver runs one device
+  (`one_device`, the default), or one per value of its `device_key` option (`flip_mirror`:
+  `"mirror"` — detection, excitation; `zaber_stage`: `"stage"` — the chain index). Zaber
+  stages are also claimed across drivers (`zaber_stage.claim_stage`): the filter band owns its
+  longpass / shortpass stages, so a Zaber stage device on one of them fails, saying why. A devices.json entry that would be a second one is
+  skipped (logged), and `add_device` / `configure_device` refuse to make one.
 - **Local only, by design:** it listens on `127.0.0.1:47800` — the devices are plugged into
   this PC, and only programs on this PC can reach the server.
 - Drivers (`drivers/base.py`): `params` (things you set: `Param(min, max, unit, default)`,
   clamped by the server before `set_<name>` is called), `readings` (things you read:
-  `Reading(unit)`), `open` / `read` / `close`. `drivers/fake_arduino.py` simulates a servo
+  `Reading(unit)`), `open` / `read` / `close`, and `one_device` / `device_key` / `opens_first`.
+  `drivers/fake_arduino.py` simulates a servo
   (`angle` → `position`, which travels at ~120°/s) and a light sensor, for testing without
   hardware. Each module names its class with `DRIVER = …`.
 - `instruments.py` is the canvas's side: a background thread that (re)connects every second,
@@ -510,8 +522,9 @@ Real hardware runs outside the canvas. Each device type's canvas object is descr
   saved as a hidden `"data"` Prop (`Prop(kind="data")` holds any JSON; defaults are deep-copied
   per object, and so is the value written by `to_json` — before that, a copy made with **C**
   shared the original's link dicts, so relinking one rewired both).
-- **Instrument server object** (E menu ▸ Devices, one only — `SINGLETON`, picking it again
-  goes to it): a radio with an antenna (signal waves while connected, blinking amber while
+- **Instrument server object** (E menu ▸ Devices; place as many as you like, or copy one with
+  **C** — each is a view of the one link and shows its state; **Connect** on one takes over
+  from the one that had it, *Disconnect all* / *Stop server* turn every one off): a radio with an antenna (signal waves while connected, blinking amber while
   connecting). It's the on/off switch for the hardware side: `instruments.client` only
   connects while its saved `connect` flag is on. **Connect** launches `instrument_server.py`
   in its own console if nothing is listening yet (also after a canvas restart, if it was left
@@ -525,9 +538,17 @@ Real hardware runs outside the canvas. Each device type's canvas object is descr
 - **Connecting is per object now.** `instruments.client.want(key, on)`: the link is open while
   anything wants it (a Device's **Connect**, or the Instrument server's), and the client itself
   launches `instrument_server.py` once if nothing is listening. A driver-specific Device
-  (`DRIVER` set) **provisions its own device**: it picks a free name (`servo`, `servo2`, …),
-  owns its options (`device_options()` — e.g. the servo's Port / Baud props), and asks the
-  server to `add_device` / `configure_device` until the server's copy matches. Status: off →
+  (`DRIVER` set) **never makes a device of its own**: every object of it is a view of the
+  one device the server runs for its driver (`find_device`, matched by driver — and by
+  `is_my_device` for a keyed driver: a Flip mirror's `mirror`, a Zaber stage's `stage`), so placing or copying more
+  objects adds views, not devices. Only one object per device is connected at a time:
+  **Connect** on one takes control (`take_control` — the others just show "not connected";
+  the device keeps running, nothing is switched off, and the new one adopts the running
+  device's options). A copy starts disconnected (`COPY_SKIP`). The connected object owns
+  the device's options (`device_options()` — e.g. the servo's Port / Baud props) and asks
+  the server to `add_device` (under `DEFAULT_DEVICE`, if the server has none for the driver
+  yet — only once the catalog is in, `client.catalog_in`) / `configure_device` until the
+  server's copy matches. Status: off →
   connecting → starting → connected (or error, with the driver's message). The generic Device
   is no longer in the E menu (placed from the Instrument server's device list). The Instrument
   server object is optional; its *Disconnect all* / *Stop server* turn every device off.

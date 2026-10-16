@@ -18,6 +18,12 @@ params:   target   — where to move (mm), clamped to the stage's travel range
 readings: position — where it is (mm), moving (1/0), homed (1/0)
 actions:  home, stop
 
+One device per stage (`device_key = "stage"`): every Zaber stage object set to
+stage 1 shows the one stage-1 device. A stage belongs to one device at a time,
+across drivers: the filter band (filter_band.py) claims its two stages on the
+same chain, and a Zaber stage device on one of them fails with a message
+saying so (and the other way round), so two devices never drive one motor.
+
 Moves don't wait to finish, so a dragged slider keeps re-targeting the stage.
 The target starts at the stage's current position — connecting never moves it.
 A refused move (e.g. not homed yet) shows as the device's message.
@@ -40,6 +46,8 @@ ZABER_USB_VENDOR = 0x2939
 # still open, and the next stage on it would fail with "port in use".
 _chains = globals().get("_chains", {})
 _chains_lock = globals().get("_chains_lock") or threading.Lock()
+# Claimed stages: (port, chain index) -> (owner id, what it is, e.g. "the filter band's longpass").
+_claims = globals().get("_claims", {})
 
 
 def _lab_zaber():
@@ -87,11 +95,32 @@ def _release_chain(port):
                 pass
 
 
+def claim_stage(port, index, owner, what):
+    """Mark a stage as driven by `owner` (any object; `what` says what it is,
+    for the message). Raises if something else already drives it."""
+    with _chains_lock:
+        held = _claims.get((port, index))
+        if held is not None and held[0] != id(owner):
+            raise IOError(f"stage {index} on {port} is already driven by {held[1]}")
+        _claims[(port, index)] = (id(owner), what)
+
+
+def release_stages(owner):
+    with _chains_lock:
+        for key in [k for k, (o, _) in _claims.items() if o == id(owner)]:
+            del _claims[key]
+
+
 class ZaberStage(Driver):
     params = {"target": Param(unit="mm")}            # the real range is set in open()
     readings = {"position": Reading(unit="mm"), "moving": Reading(), "homed": Reading()}
     actions = ["home", "stop"]
     poll_hz = 10
+    device_key = "stage"     # one device per stage of the chain
+
+    @classmethod
+    def device_key_value(cls, options):
+        return str(int(options.get("stage", 0)))
 
     def open(self):
         port = str(self.options.get("port") or "auto")
@@ -102,7 +131,9 @@ class ZaberStage(Driver):
         self.port = None
         chain = _open_chain(port, int(self.options.get("baud", 115200)))
         self.port = port
-        self.stage = chain.stage(int(self.options.get("stage", 0)))
+        index = int(self.options.get("stage", 0))
+        claim_stage(port, index, self, f"Zaber stage device (stage {index})")
+        self.stage = chain.stage(index)
         low, high = self.stage.travel_range()
         self.params = {"target": Param(low, high, unit="mm")}   # this stage's own range
         self.values["target"] = round(self.stage.get_position(), 4)   # connecting never moves it
@@ -124,6 +155,7 @@ class ZaberStage(Driver):
         self.stage.stop()
 
     def close(self):
+        release_stages(self)
         if getattr(self, "port", None):
             _release_chain(self.port)
             self.port = None

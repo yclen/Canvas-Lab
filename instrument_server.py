@@ -21,6 +21,7 @@ Protocol: JSON, one object per line, both ways.
     {"op": "remove_device", "name": "arm"}
     {"op": "configure_device", "name": "servo", "options": {"port": "COM11"}}   (restarts it)
     {"op": "action", "device": "zaber", "name": "home"}       (runs a driver action, e.g. home / stop)
+    {"op": "retry", "device": "superk"}               (a device in error: try opening it now)
     {"op": "shutdown"}                                -> closes every device and exits
   server -> client
     {"op": "catalog", "devices": [{name, driver, status, message,
@@ -37,9 +38,17 @@ Protocol: JSON, one object per line, both ways.
 Each device runs on its own worker thread: it applies the newest requested
 value per param (older ones are dropped — a dragged slider sends many), then
 polls read() at the driver's poll_hz. If a driver fails, the device shows
-"error" and is retried every few seconds, with the driver module re-imported,
-so you can fix a driver while the server keeps running. Devices added or
-removed from the canvas are written back to devices.json.
+"error" and is retried — after 3 s, then 6, 12 … up to a minute (a "retry"
+request, e.g. the canvas's Connect, tries at once) — with the driver module
+re-imported, so you can fix a driver while the server keeps running. The full
+traceback is logged only when the error changes. Devices added or removed from
+the canvas are written back to devices.json.
+
+Startup: devices open one at a time (a driver that scans COM ports would grab
+ports another device is opening), those whose driver says `opens_first`
+before the rest. A driver runs one device (one piece of hardware), or one per
+value of its `device_key` option (flip_mirror: one per mirror); a devices.json
+entry that would be a second one is skipped, and add_device refuses it.
 """
 
 import importlib
@@ -58,7 +67,9 @@ PORT = int(os.environ.get("CANVAS_INSTRUMENT_PORT", 47800))   # keep in sync wit
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(HERE, "devices.json")
 DRIVERS_DIR = os.path.join(HERE, "drivers")
-RETRY_SECONDS = 3
+RETRY_SECONDS = 3                      # first retry after a failure; doubles each time …
+RETRY_MAX_SECONDS = 60                 # … up to this
+FIRST_OPEN_TIMEOUT = 60                # at startup, wait at most this for the opens_first devices
 NO_CLIENTS = "__no_clients__"          # internal action: the last client (canvas) went away
 
 sys.path.insert(0, HERE)               # so "drivers" imports from this folder
@@ -115,6 +126,15 @@ def list_drivers():
     return out
 
 
+def driver_attr(driver, name, default):
+    """A driver class's setting (one_device, device_key, opens_first), or
+    `default` if the driver won't import."""
+    try:
+        return getattr(load_driver_module(driver).DRIVER, name, default)
+    except Exception:
+        return default
+
+
 class DeviceRunner:
     """One configured device: its driver, a worker thread, and the newest
     value requested for each param."""
@@ -131,6 +151,8 @@ class DeviceRunner:
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
+        self._retry = threading.Event()   # cuts a wait between failed opens short
+        self.first_try = threading.Event()    # set once the first open has worked or failed
 
     def config(self):
         return {"name": self.name, "driver": self.driver_name, "options": self.options}
@@ -160,9 +182,13 @@ class DeviceRunner:
             self._actions.append(name)
         self._wake.set()
 
+    def retry_now(self):
+        self._retry.set()
+
     def stop(self):
         self._stop.set()
         self._wake.set()
+        self._retry.set()
 
     def _warn(self, message):
         """Show (or clear) a message without changing the status — the device is still running."""
@@ -183,26 +209,44 @@ class DeviceRunner:
             pass
 
     def run(self):
+        failures, last_error = 0, None
         while not self._stop.is_set():
             try:
-                self._set_status("starting")
-                if self.driver is not None:       # a retry: keep the last values (no jump to defaults)
-                    self.driver_values = dict(self.driver.values)
-                self.driver = load_driver_module(self.driver_name).DRIVER(**self.options)
-                if self.driver_values:
-                    self.driver.values.update({k: v for k, v in self.driver_values.items()
-                                               if k in self.driver.params})
-                self.driver.open()
+                if failures == 0:                 # retries keep showing the error until one works
+                    self._set_status("starting")
+                self._retry.clear()
+                with self.server.open_lock:       # one device opening at a time
+                    if self._stop.is_set():
+                        break
+                    if self.driver is not None:   # a retry: keep the last values (no jump to defaults)
+                        self.driver_values = dict(self.driver.values)
+                    self.driver = load_driver_module(self.driver_name).DRIVER(**self.options)
+                    if self.driver_values:
+                        self.driver.values.update({k: v for k, v in self.driver_values.items()
+                                                   if k in self.driver.params})
+                    self.driver.open()
+                failures, last_error = 0, None
                 self.status, self.message = "ok", ""
+                self.first_try.set()
                 self.server.broadcast_catalog()      # status + params/readings arrive together
                 log(f"{self.name}: running ({self.driver_name})")
                 self._loop()
             except Exception as e:
-                log(f"{self.name}: ERROR {type(e).__name__}: {e}\n{traceback.format_exc()}")
-                self._set_status("error", f"{type(e).__name__}: {e}")
+                failures += 1
+                error = f"{type(e).__name__}: {e}"
+                delay = min(RETRY_MAX_SECONDS, RETRY_SECONDS * 2 ** (failures - 1))
+                if error != last_error:           # the whole story once; then one line per try
+                    log(f"{self.name}: ERROR {error}\n{traceback.format_exc()}")
+                else:
+                    log(f"{self.name}: still failing (try {failures}), next in {delay} s: {error}")
+                last_error = error
                 self._close()
-                self._stop.wait(RETRY_SECONDS)
+                self.first_try.set()
+                next_try = time.strftime("%H:%M:%S", time.localtime(time.time() + delay))
+                self._set_status("error", f"{error} (retrying at {next_try})")
+                self._retry.wait(delay)
         self._close()
+        self.first_try.set()
         log(f"{self.name}: stopped")
 
     def _loop(self):
@@ -265,9 +309,36 @@ class Server:
         self.clients = set()
         self._clients_lock = threading.Lock()
         self._catalog_lock = threading.Lock()   # build + send catalogs one at a time, in order
+        self.open_lock = threading.Lock()       # held while a device opens (see DeviceRunner.run)
         self.devices = {}
         for d in config.get("devices", []):
+            holder = self.same_device(d["driver"], d.get("options") or {})
+            if holder is not None:
+                log(f"skipping {d['name']}: it would be a second {holder} "
+                    f"(the {d['driver']} driver runs one device{self._key_text(d['driver'])})")
+                continue
             self.devices[d["name"]] = DeviceRunner(d["name"], d["driver"], d.get("options"), self)
+
+    def same_device(self, driver, options, besides=None):
+        """The device (other than `besides`) that already drives the hardware a
+        device with this driver and these options would, else None. A driver
+        runs one device, or one per value of its device_key option."""
+        try:
+            cls = load_driver_module(driver).DRIVER
+        except Exception:
+            return None                              # it won't import: it'll show its own error
+        if not getattr(cls, "one_device", True):
+            return None
+        which = cls.device_key_value(options)
+        for r in self.devices.values():
+            if r.name != besides and r.driver_name == driver and cls.device_key_value(r.options) == which:
+                return r.name
+        return None
+
+    @staticmethod
+    def _key_text(driver):
+        key = driver_attr(driver, "device_key", None)
+        return f" per {key}" if key else ""
 
     def catalog(self):
         return {"op": "catalog", "devices": [r.describe() for r in self.devices.values()],
@@ -346,6 +417,11 @@ class Server:
                 if runner is None:
                     raise ValueError(f"no device {msg.get('device')!r}")
                 runner.request_action(str(msg["name"]))
+            elif op == "retry":
+                runner = self.devices.get(msg.get("device"))
+                if runner is None:
+                    raise ValueError(f"no device {msg.get('device')!r}")
+                runner.retry_now()
             elif op == "add_device":
                 name, driver = str(msg["name"]).strip(), str(msg["driver"])
                 if not re.fullmatch(r"[A-Za-z0-9_\- ]{1,40}", name):
@@ -354,6 +430,10 @@ class Server:
                     raise ValueError(f"there's already a device called {name!r}")
                 if driver not in {d["module"] for d in list_drivers()}:
                     raise ValueError(f"no driver {driver!r}")
+                holder = self.same_device(driver, msg.get("options") or {})
+                if holder is not None:
+                    raise ValueError(f"the {driver} driver runs one device{self._key_text(driver)}, "
+                                     f"and {holder!r} is it")
                 self.start_device(DeviceRunner(name, driver, msg.get("options") or {}, self))
                 self.save_config()
                 log(f"added {name} ({driver})")
@@ -370,8 +450,12 @@ class Server:
                 old = self.devices.get(msg.get("name"))
                 if old is None:
                     raise ValueError(f"no device {msg.get('name')!r}")
-                old.stop()
                 options = dict(old.options, **(msg.get("options") or {}))
+                holder = self.same_device(old.driver_name, options, besides=old.name)
+                if holder is not None:
+                    raise ValueError(f"{holder!r} already runs that ({old.driver_name} runs one "
+                                     f"device{self._key_text(old.driver_name)})")
+                old.stop()
                 runner = DeviceRunner(old.name, old.driver_name, options, self)
                 runner.driver_values = dict(old.driver.values) if old.driver else None
                 self.start_device(runner)
@@ -389,13 +473,26 @@ class Server:
         except (ValueError, KeyError, TypeError) as e:
             client.send({"op": "error", "message": str(e)})
 
-    def serve(self):
-        for runner in list(self.devices.values()):
+    def start_devices(self):
+        """Start every configured device: the opens_first ones (they may scan
+        COM ports) first, the rest once those have had their first try. The
+        open lock then has them open one at a time."""
+        runners = list(self.devices.values())
+        first = [r for r in runners if driver_attr(r.driver_name, "opens_first", False)]
+        for runner in first:
             self.start_device(runner)
+        for runner in first:
+            runner.first_try.wait(FIRST_OPEN_TIMEOUT)
+        for runner in runners:
+            if runner not in first and self.devices.get(runner.name) is runner:   # not removed meanwhile
+                self.start_device(runner)
+
+    def serve(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.bind((HOST, PORT))      # 127.0.0.1: this PC only
+        listener.bind((HOST, PORT))      # 127.0.0.1: this PC only (first: a second server stops here)
         listener.listen()
         log(f"instrument server listening on {HOST}:{PORT} - devices: {', '.join(self.devices) or 'none'}")
+        threading.Thread(target=self.start_devices, name="startup", daemon=True).start()
         while True:
             sock, addr = listener.accept()
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)

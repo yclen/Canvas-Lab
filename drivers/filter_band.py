@@ -148,7 +148,10 @@ class FilterBand(Driver):
         self.port = port
         self.calibration = load_calibration()
         self.filters = {role: LinearFilter(calibration_points(self.calibration, role)) for role in ROLES}
-        self.stages = {role: chain.stage(self._index(chain, role)) for role in ROLES}
+        indexes = {role: self._index(chain, role) for role in ROLES}
+        for role, index in indexes.items():      # its stages are its own: no Zaber stage device on them
+            zaber_stage.claim_stage(port, index, self, f"the filter band ({role})")
+        self.stages = {role: chain.stage(index) for role, index in indexes.items()}
         self.reach = {role: self.filters[role].reach(self.stages[role].travel_range())
                       for role in ROLES}
         (lp_lo, lp_hi), (sp_lo, sp_hi) = self.reach["longpass"], self.reach["shortpass"]
@@ -229,6 +232,7 @@ class FilterBand(Driver):
             stage.stop()
 
     def close(self):
+        zaber_stage.release_stages(self)
         if getattr(self, "port", None):
             zaber_stage._release_chain(self.port)
             self.port = None

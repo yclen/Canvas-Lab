@@ -24,6 +24,10 @@ set_<name> or an action raises, the error is shown as the device's message
 and the device keeps running (only open() / read() failures restart it).
 A driver can replace `params` / `readings` per instance in open() — e.g. a
 stage whose travel range is only known once it's connected.
+
+How many devices a driver runs is the driver's call, not the canvas's: one
+(the default), or one per value of its `device_key` option. Canvas objects
+never make devices of their own — each finds the one for its driver.
 """
 
 
@@ -59,10 +63,22 @@ class Driver:
     readings = {}     # name -> Reading
     actions = []      # method names the canvas shows as buttons (e.g. "home", "stop")
     poll_hz = 20      # how often the server calls read()
+    one_device = True     # a driver drives one piece of hardware: the server runs at most one
+                          # device with it, and every canvas object for it shows that device …
+    device_key = None     # … or, naming an option here, one device per value of that option
+                          # (flip_mirror: "mirror" — one device per mirror)
+    opens_first = False   # True: open before the other devices at startup (it may scan the
+                          # COM ports, which would grab ports the others are opening)
 
     def __init__(self, **options):
         self.options = options                          # from devices.json
         self.values = {name: p.default for name, p in self.params.items()}
+
+    @classmethod
+    def device_key_value(cls, options):
+        """Which piece of hardware a device with these options drives, by its
+        device_key option (as text; a driver fills in its own default)."""
+        return str(options.get(cls.device_key)) if cls.device_key else ""
 
     def open(self):
         pass

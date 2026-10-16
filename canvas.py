@@ -4627,7 +4627,7 @@ class App:
         kept, skipped = machine_parts(objs)
         if not kept:
             self.confirm("Can't make a machine from these",
-                         "Trains and one-only objects (the instrument server) can't go in one.",
+                         "Trains and one-only objects can't go in one.",
                          lambda: None, ok_label="OK")
             return
 

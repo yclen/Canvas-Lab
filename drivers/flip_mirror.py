@@ -57,6 +57,11 @@ class FlipMirror(Driver):
                 "down_label": Reading(), "flips": Reading()}
     actions = ["flip", "find_position", "sync_up", "sync_down"]
     poll_hz = 2          # nothing is measured; this just reports the assumed position
+    device_key = "mirror"    # one device per mirror (detection, excitation)
+
+    @classmethod
+    def device_key_value(cls, options):
+        return str(options.get("mirror") or "detection")
 
     def open(self):
         name = str(self.options.get("mirror") or "detection")

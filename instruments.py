@@ -39,6 +39,7 @@ class InstrumentClient:
         self._wants = set()             # keys (object ids) that want the connection open
         self._launch_tried = False      # launched the server for the current want?
         self.connected = False
+        self.catalog_in = False         # the server's device list has arrived on this connection
         self.drivers = []               # driver modules the server offers (from the catalog)
         self.ports = []                 # serial ports on this PC: {device, description, arduino}
         self.last_error = ""            # the server's last complaint (e.g. a duplicate name)
@@ -80,6 +81,12 @@ class InstrumentClient:
     def device_names(self):
         with self._lock:
             return list(self._devices)
+
+    def devices_for(self, driver):
+        """[(name, options)] for the server's devices that run `driver`."""
+        with self._lock:
+            return [(n, dict(d.get("options") or {})) for n, d in self._devices.items()
+                    if d.get("driver") == driver]
 
     def device(self, name):
         """A snapshot of one device: {driver, status, message, params: {p: {min,
@@ -126,6 +133,7 @@ class InstrumentClient:
         so it never connects anywhere."""
         with self._lock:
             self.connected = snap.get("connected", False)
+            self.catalog_in = self.connected
             self._wants = set(snap.get("wants", []))
             self._devices = snap.get("devices", {})
             self.drivers = snap.get("drivers", [])
@@ -145,6 +153,7 @@ class InstrumentClient:
                     sock.settimeout(2.0)
                     with self._lock:
                         self._sent.clear()          # a (re)started server: resend everything
+                    self.catalog_in = False
                     self.connected = True
                     self._serve(sock)
             except (OSError, ValueError):
@@ -194,6 +203,7 @@ class InstrumentClient:
                 self._devices = {d["name"]: d for d in msg["devices"]}
                 self.drivers = msg.get("drivers", [])
                 self.ports = msg.get("ports", [])
+                self.catalog_in = True
                 return
             if op == "error":
                 self.last_error = msg.get("message", "")
