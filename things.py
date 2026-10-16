@@ -1053,9 +1053,9 @@ class Graph(YScale, Thing):
         return rows
 
     def more_sections(self, app):
-        items = [("Latest — follows new runs", "✓" if not self.dataset else "",
+        items = [("Latest — follows new runs", "shown" if not self.dataset else "",   # (the font has no ✓)
                   lambda app: self.choose_dataset(app, ""))]
-        items += [(name, ("✓ " if name == self.dataset else "") + when,
+        items += [(name, "shown" if name == self.dataset else when,
                    lambda app, n=name: self.choose_dataset(app, n)) for name, when in self.datasets]
         return [Section("Datasets", [ScrollList("In this folder, newest first", items,
                                                 empty="— (no CSV files)", key=self)])]

@@ -3590,9 +3590,11 @@ class InspectorPanel:
             return self._label_value(surface, x + indent, y, max_w - indent, row.label, row.value,
                                      get_font(18) if row.sub else label, body, row.color or INSPECTOR_VALUE)
         if isinstance(row, Stepper):
-            surface.blit(label.render(row.label, True, INSPECTOR_LABEL), (x, y + 2))
-            text = body.render(row.value, True, INSPECTOR_VALUE)
+            name = label.render(row.label, True, INSPECTOR_LABEL)
+            surface.blit(name, (x, y + 2))
             size = 22
+            room = max_w - name.get_width() - 12 - 2 * size - 16     # between the label and the arrows
+            text = body.render(clip_text(str(row.value), body, max(20, room)), True, INSPECTOR_VALUE)
             up = pygame.Rect(x + max_w - size, y, size, size)
             down = pygame.Rect(up.x - 8 - text.get_width() - 8 - size, y, size, size)
             cy = down.centery
