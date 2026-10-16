@@ -31,8 +31,11 @@ if (-not $Pythonw -or -not (Test-Path $Pythonw)) {
 }
 
 # The app folder lives on Google Drive, which mounts after Explorer draws the
-# taskbar at login, so an icon read from there shows blank. Keep a local copy.
-$IconDir = Join-Path $env:LOCALAPPDATA "CanvasApp"
+# taskbar at login, so an icon read from there shows blank. Keep a local copy, in
+# %LOCALAPPDATA%\Programs (the per-user install folder): the Start menu and taskbar showed
+# the same icon blank from %LOCALAPPDATA%\CanvasApp, but draw it from here.
+$IconDir = Join-Path $env:LOCALAPPDATA "Programs\CanvasApp"
+$OldIconDir = Join-Path $env:LOCALAPPDATA "CanvasApp"   # where copies used to go
 # taskbar.ico is icon.ico at every size (16-256 px); a single 128 px image shows
 # blank on the taskbar. game_loop.py keeps loading icon.ico, which pygame can read.
 # The copy is named by its content, so a new icon gets a new path: Explorer caches icons by
@@ -171,6 +174,7 @@ Remove-Item $NewLnk
 
 # Old icon copies nothing points at any more.
 Get-ChildItem $IconDir -Filter *.ico | Where-Object { $_.FullName -ne $Icon } | Remove-Item
+if (Test-Path $OldIconDir) { Remove-Item $OldIconDir -Recurse -Force }
 
 if ($RestartExplorer) {
     if ($NoExplorerRestart) {

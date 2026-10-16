@@ -317,7 +317,12 @@ the pin's image and doesn't reload it. So make_shortcut.ps1 (safe to re-run afte
 leaves the pin alone unless what it runs, its icon or its AppUserModelID changed — compared by
 those fields, not the .lnk's bytes, which hold ever-changing timestamps. When it does change the
 pin, it restarts Explorer to redraw the taskbar. The local icon copy is named by its content
-(`taskbar-<hash>.ico`) since Explorer caches icons by path.
+(`taskbar-<hash>.ico`) since Explorer caches icons by path, and lives in
+`%LOCALAPPDATA%\Programs\CanvasApp` (the per-user install folder): from `%LOCALAPPDATA%\CanvasApp`
+the Start menu and taskbar drew it blank even for a brand-new shortcut, with the same file and
+permissions, while File Explorer drew it fine. Explorer restarts, clearing the icon cache and
+re-pinning didn't help; moving the folder did. `taskbar.ico` keeps PNG only for 256 px, with
+classic bitmaps for the smaller sizes.
 
 **The home screen's look** stays plain pygame shapes, like the rest of the app: the name, a
 status card, the buttons and the name row — tried a drifting backdrop and a live logo, but
