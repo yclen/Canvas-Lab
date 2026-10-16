@@ -422,3 +422,28 @@ Each one is a Device object for one driver in `drivers/`; how devices connect is
   unnamed / open), set from the panel. The object draws the wheel face-on with the slot in the
   beam at the top (it turns there, the short way); click a slot to go (amber ring until the wheel
   reports, as the flip mirror does), off while `position` is linked ("follows …" shown instead).
+- **Spectrometer** (`drivers/ccs200_spectrometer.py`, canvas object *Spectrometer*): wraps the lab
+  driver `../hardware drivers/ccs200.py` (Thorlabs CCS200, TLCCS DLL over VISA; its amplitude
+  correction, window and background are used as they are). Address `auto` / a VISA resource /
+  `sim://` (a lamp, a 532 nm line and a breathing fluorescence band). Nothing is scanned until
+  **GO LIVE** (the button drawn on the object — click it on the canvas — or the panel's Go live /
+  Stop); Single scan takes one. While live, each poll (≤ 5 a second) takes one scan, so Stop
+  lands within one integration time; the last scan stays on screen. Params `integration_ms`,
+  `min_nm` / `max_nm`, `correction` (1/0) are the object's **Settings** (integration time shown
+  on the object), sent by the object and re-sent after a server restart; changing integration or
+  correction clears the background (a dark under other settings doesn't fit). Take background…
+  (block the light: 10 scans averaged) / Clear background; **Save spectrum** writes the last scan
+  at full precision to `saves/data/spectrum <time>.csv` (on the PC running the server). Outputs
+  `peak_nm`, `peak`, `total`, `saturated` (raw, before correction, ≥ 0.98). ThorSpectra (or a
+  script) must let go of it first.
+  **Transfer:** the world sends players all device data whenever it changes, so a scan is packed:
+  intensities as 16-bit integers in base64 with a `scale` (1/32767 of the scan's top — below any
+  screen's resolution), the wavelength axis as a polynomial over the point index (the CCD's own
+  calibration is one; fitted to 0.01 nm), not 2,800 numbers — ~8 KB a scan at full resolution
+  (`Reading(kind="data")`: drawn by its object, never a text row or a linkable output).
+  **Zoom:** the object decodes each scan once and draws one column per screen pixel into a cached
+  image (redrawn per scan / resize / pan, ~1 ms at normal size): columns holding several points
+  draw their lowest-to-highest value, so a narrow line never drops out; once points are > 1.5 px
+  apart they're joined, with dots from 8 px; a plot under 48 px wide is a blank screen. Under the
+  curve, a fill in each column's wavelength color, over a rainbow strip on the axis; a marker
+  and label at the peak, SATURATED in the corner. Off-screen parts (zoomed far in) skip their text.

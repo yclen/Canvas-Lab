@@ -503,7 +503,9 @@ Real hardware runs outside the canvas. Each device type's canvas object is descr
   this PC, and only programs on this PC can reach the server.
 - Drivers (`drivers/base.py`): `params` (things you set: `Param(min, max, unit, default)`,
   clamped by the server before `set_<name>` is called), `readings` (things you read:
-  `Reading(unit)`), `open` / `read` / `close`, and `one_device` / `device_key` / `opens_first`.
+  `Reading(unit)`; `kind="text"` for text, `kind="data"` for bulk data such as a spectrum — drawn
+  by its own object, never a text row or a linkable output), `open` / `read` / `close`, and
+  `one_device` / `device_key` / `opens_first`.
   `drivers/fake_arduino.py` simulates a servo
   (`angle` → `position`, which travels at ~120°/s) and a light sensor, for testing without
   hardware. Each module names its class with `DRIVER = …`.

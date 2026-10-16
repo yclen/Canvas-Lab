@@ -41,6 +41,7 @@ app.ask(prompt, on_submit), app.confirm(...), app.place(obj).
 See "Adding an object type" in docs/ARCHITECTURE.md.
 """
 
+import base64
 import csv
 import math
 import os
@@ -2606,7 +2607,7 @@ class Device(Thing):
             if self.take_control(app):
                 info = client.device(self.device)       # it's running: keep its settings (a
                 if info is not None:                    # different port would restart it)
-                    self.adopt_options(info.get("options", {}))
+                    self.adopt_device(info)
         self.connect = True
         client.want(self.id, True)
         client.retry_launch()
@@ -2630,6 +2631,11 @@ class Device(Thing):
 
     def on_control_taken(self):
         """Another object took this device over."""
+
+    def adopt_device(self, info):
+        """Taking control of a running device: take on its settings rather than
+        push this object's (options here; a subclass may add params)."""
+        self.adopt_options(info.get("options", {}))
 
     def adopt_options(self, options):
         """Take on the running device's options (props named like them)."""
@@ -2656,8 +2662,10 @@ class Device(Thing):
                     "text": self.catalog.get("text", [])}
         text = set(self.catalog.get("text", []))
         text |= {k for k, v in info["values"].items() if isinstance(v, str)}
+        text |= {r for r, spec in info["readings"].items() if spec.get("kind") == "text"}
         return {"params": {p: spec.get("unit", "") for p, spec in info["params"].items()},
-                "readings": {r: spec.get("unit", "") for r, spec in info["readings"].items() if r not in text},
+                "readings": {r: spec.get("unit", "") for r, spec in info["readings"].items()
+                             if r not in text and spec.get("kind") != "data"},   # data: drawn, not linked
                 "text": sorted(text)}
 
     @staticmethod
@@ -2858,6 +2866,8 @@ class Device(Thing):
                 lines.append((f"{p} →", "—" if v is None else f"{v:.1f} {spec.get('unit', '')}", (255, 190, 90)))
             for r, spec in info["readings"].items():
                 v = info["values"].get(r)
+                if spec.get("kind") == "data" or isinstance(v, (dict, list)):
+                    continue                        # bulk data (a spectrum): its own object draws it
                 lines.append((r, "—" if v is None else str(v) if isinstance(v, str)
                               else f"{v:.1f} {spec.get('unit', '')}", (120, 230, 150)))
         line_h = screen.height / max(3, len(lines) + 0.6)
@@ -3977,6 +3987,500 @@ class SuperK(Device):
         pygame.draw.circle(surface, (240, 240, 244), (kx, sw.centery), knob_r)
         if pending is not None:
             pygame.draw.circle(surface, (240, 190, 60), (kx, sw.centery), knob_r, max(1, knob_r // 4))
+
+
+
+# ---- Spectrometer: a Thorlabs CCS200 with a live plot ------------------------
+SPEC_BODY = (36, 38, 46)
+SPEC_SCREEN = (7, 9, 13)
+SPEC_GRID = (28, 34, 46)
+SPEC_CURVE = (150, 230, 255)
+SPEC_LIVE = (235, 70, 60)
+SPEC_FIBER = (240, 150, 40)          # an orange multimode fiber jacket
+SPEC_BRASS = (196, 162, 92)          # the SMA connector
+SPEC_MIN_PLOT_PX = 48                # a plot narrower than this shows a blank screen
+SPEC_PENDING_SECONDS = 2.0           # longest a clicked Live button shows where it was asked to go
+
+
+def wavelength_rgb(nm):
+    """Roughly the color of light at nm (380-750 nm); a dim grey outside it."""
+    if nm < 380 or nm > 750:
+        return (70, 72, 84)
+    if nm < 440:
+        r, g, b = (440 - nm) / 60, 0.0, 1.0
+    elif nm < 490:
+        r, g, b = 0.0, (nm - 440) / 50, 1.0
+    elif nm < 510:
+        r, g, b = 0.0, 1.0, (510 - nm) / 20
+    elif nm < 580:
+        r, g, b = (nm - 510) / 70, 1.0, 0.0
+    elif nm < 645:
+        r, g, b = 1.0, (645 - nm) / 65, 0.0
+    else:
+        r, g, b = 1.0, 0.0, 0.0
+    fade = 0.3 + 0.7 * (nm - 380) / 40 if nm < 420 else 0.3 + 0.7 * (750 - nm) / 50 if nm > 700 else 1.0
+    return tuple(int(255 * (c * fade) ** 0.8) for c in (r, g, b))
+
+
+def decode_spectrum(spec):
+    """A driver's packed spectrum (see drivers/ccs200_spectrometer.py) ->
+    (wavelengths, intensities) as numpy arrays, at full resolution."""
+    y = np.frombuffer(base64.b64decode(spec["y"]), dtype="<i2").astype(float) * float(spec["scale"])
+    t = np.linspace(0.0, 1.0, len(y)) if len(y) > 1 else np.zeros(len(y))
+    return np.polyval(spec["axis"], t), y
+
+
+def nice_step(span, max_ticks):
+    """A round tick step (1, 2 or 5 × 10^k) giving at most max_ticks ticks over span."""
+    raw = span / max(1, max_ticks)
+    if raw <= 0:
+        return 1.0
+    k = 10 ** math.floor(math.log10(raw))
+    return next(m * k for m in (1, 2, 5, 10) if m * k >= raw)
+
+
+def format_ms(ms):
+    if ms >= 1000:
+        return f"{ms / 1000:g} s"
+    return f"{ms:.3g} ms" if ms < 1 else f"{ms:g} ms"
+
+
+class Spectrometer(Device):
+    """A Thorlabs CCS200 spectrometer (driver: ccs200_spectrometer), drawn as
+    the instrument: an orange fiber into its SMA port, and a screen with the
+    live spectrum over a wavelength axis with a rainbow strip.
+
+    GO LIVE (the button on the object, or the panel) starts scanning; click it
+    again to stop — the last scan stays on screen. Integration time,
+    wavelength window and amplitude correction are Settings: this object sends
+    them to the device (and again after a server restart). The integration time
+    is shown on the object. Peak wavelength / height, total and saturated are
+    outputs; the spectrum itself is drawn, not linked.
+
+    Zoom: the whole spectrum comes over at full resolution; the screen draws
+    one column per pixel — every point, joined, once there's room for them,
+    and each column's lowest-to-highest value when there isn't, so a narrow
+    line never drops out. Too small to read, the screen stays blank."""
+
+    TYPE = "ccs200_spectrometer"
+    MENU_LABEL = "Add spectrometer"
+    NAME = "Spectrometer"
+    DRIVER = "ccs200_spectrometer"
+    DEFAULT_DEVICE = "spectrometer"
+    SIZE = (380, 240)
+    DOT_COLOR = SPEC_CURVE
+    PROPS = [Prop("integration_ms", "Integration time", "float", 100.0, min=0.01, max=60000, unit="ms",
+                  prompt="Integration time in ms (0.01 – 60000):"),
+             Prop("min_nm", "Window from", "float", 360.0, min=190, max=1020, unit="nm",
+                  prompt="Start of the wavelength window (nm):"),
+             Prop("max_nm", "Window to", "float", 1000.0, min=190, max=1020, unit="nm",
+                  prompt="End of the wavelength window (nm):"),
+             Prop("correction", "Amplitude correction", "bool", True),
+             Prop("y_max", "Plot top", "float", 0.0, min=0,
+                  prompt="Top of the plot's y axis (0 = fit each scan):"),
+             Prop("address", "Address", "str", "auto",
+                  prompt="The spectrometer's VISA address (auto finds it; sim:// to simulate):")]
+    SETTINGS = ("integration_ms", "min_nm", "max_nm", "correction")    # props sent as the device's params
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._phase = 0.0
+        self._pending = None         # (asked-for live, when) after a click, until the device confirms
+        self._button_hover = False
+        self._decoded = None         # (key, wavelengths, intensities) of the scan last decoded
+        self._plot_cache = (None, None)      # (key, surface): the curve, redrawn only when it changes
+        self._strip_cache = (None, None)
+
+    # --- The device ---------------------------------------------------------------------
+    def device_options(self):
+        return {"address": self.address or "auto"}
+
+    def settings(self):
+        return {"integration_ms": float(self.integration_ms), "min_nm": float(self.min_nm),
+                "max_nm": float(self.max_nm), "correction": 1.0 if self.correction else 0.0}
+
+    def adopt_device(self, info):
+        """Taking control: keep the running spectrometer's settings."""
+        super().adopt_device(info)
+        for key in self.SETTINGS:
+            value = info.get("params", {}).get(key, {}).get("value")
+            if value is not None:
+                setattr(self, key, value >= 0.5 if key == "correction" else float(value))
+
+    def takes(self):
+        return []                    # its settings are Settings (kept, and re-sent), not inputs
+
+    def running(self):
+        return self.connect and self.status() == "ok"
+
+    def readings_now(self):
+        info = self.info() if self.connect else None
+        return info["values"] if info and info.get("status") == "ok" else {}
+
+    def is_live(self):
+        if self._pending is not None:
+            return self._pending[0]
+        return bool(self.readings_now().get("live"))
+
+    def tick(self, dt):
+        super().tick(dt)
+        self._phase += dt
+        if self.running():
+            for key, value in self.settings().items():      # the client skips repeats
+                instruments.client.set(self.device, key, value)
+        if self._pending is not None:
+            wanted, since = self._pending
+            if (bool(self.readings_now().get("live")) == wanted
+                    or time.monotonic() - since > SPEC_PENDING_SECONDS):
+                self._pending = None
+
+    def spectrum(self):
+        """(key, wavelengths, intensities) of the latest scan, decoded once; or None."""
+        spec = self.readings_now().get("spectrum")
+        if not isinstance(spec, dict):
+            return None
+        key = (spec.get("seq"), spec.get("scale"), spec.get("n"))
+        if self._decoded is None or self._decoded[0] != key:
+            try:
+                nm, y = decode_spectrum(spec)
+            except (ValueError, KeyError, TypeError):
+                return None
+            if len(y) < 2:
+                return None
+            self._decoded = (key, nm, y)
+        return self._decoded
+
+    # --- Live / stop and the panel ------------------------------------------------------
+    def toggle_live(self, app):
+        wanted = not self.is_live()
+        self._pending = (wanted, time.monotonic())
+        self.run_action(app, "go_live" if wanted else "stop")
+
+    def on_control_taken(self):
+        self._pending = None
+
+    def hover(self, mouse_pos, mouse_pressed, camera):
+        super().hover(mouse_pos, mouse_pressed, camera)
+        self._button_hover = (self.running() and self.is_hovered and
+                              self._layout(self.screen_rect(camera))["button"].collidepoint(mouse_pos))
+
+    def on_click(self, pos, app):
+        """A click on the Live button toggles scanning (and doesn't select)."""
+        if self.running() and self._layout(self.screen_rect(app.camera))["button"].inflate(6, 6).collidepoint(pos):
+            self.toggle_live(app)
+            return True
+        return False
+
+    def take_background(self, app):
+        app.confirm("Take a background?", "Block the light into the spectrometer first — 10 scans are "
+                    "averaged and subtracted from every scan after.",
+                    lambda: self.run_action(app, "take_background"), ok_label="Take it")
+
+    def actions(self, app):
+        out = []
+        if self.running():
+            live = self.is_live()
+            out.append(Btn("Stop" if live else "Go live", self.toggle_live, style="stop" if live else "go"))
+            out.append(Btn("Single scan", lambda app: self.run_action(app, "single"), enabled=not live))
+            out.append(Btn("Take background…", self.take_background))
+            if self.readings_now().get("background"):
+                out.append(Btn("Clear background", lambda app: self.run_action(app, "clear_background")))
+            out.append(Btn("Save spectrum", lambda app: self.run_action(app, "save"),
+                           enabled=self.spectrum() is not None))
+        return out + [self.connect_button()]
+
+    def state_rows(self, app):
+        rows = super().state_rows(app)            # the device's message, the last saved file
+        v = self.readings_now()
+        if v:
+            if v.get("peak_nm") is not None:
+                rows.append(Row("Peak", f"{v.get('peak', 0):.4g} at {v['peak_nm']:.1f} nm"))
+            rows.append(Row("Background", "subtracted" if v.get("background") else "none"))
+            if v.get("saturated"):
+                rows.append(Field("Detector", "saturated — shorten the integration time", color=WARN_COLOR))
+        return rows
+
+    # --- Layout (shared by drawing and clicking) ----------------------------------------
+    def _layout(self, rect):
+        s = rect.height
+        pad = max(2, round(s * 0.05))
+        port_w = max(3, round(rect.width * 0.07))            # the fiber + SMA port, left of the body
+        body = pygame.Rect(rect.x + port_w, rect.y, rect.width - port_w, rect.height)
+        header_h = round(s * 0.11)
+        footer_h = round(s * 0.14)
+        screen = pygame.Rect(body.x + pad, body.y + pad + header_h, body.width - 2 * pad,
+                             body.height - 2 * pad - header_h - footer_h)
+        btn_h = max(4, footer_h - pad)
+        button = pygame.Rect(body.x + pad, screen.bottom + pad, round(btn_h * 3.4), btn_h)
+        return {"body": body, "pad": pad, "port_w": port_w, "header_h": header_h, "screen": screen,
+                "button": button}
+
+    # --- Drawing ------------------------------------------------------------------------
+    def draw_shape(self, surface, rect, camera):
+        status = self.status()
+        led_color = DEVICE_STATUS_COLORS.get(status, (110, 110, 120))
+        s = rect.height
+        lay = self._layout(rect)
+        body, pad, screen = lay["body"], lay["pad"], lay["screen"]
+        radius = max(2, s // 14)
+        if s < 24:                                            # tiny: the box and its light
+            draw_rect(surface, SPEC_BODY, body, border_radius=radius)
+            pygame.draw.circle(surface, led_color, body.center, max(1, s // 5))
+            return
+
+        # Fiber: an orange jacket into a brass SMA connector on the body's left face.
+        cy = body.y + round(body.height * 0.42)
+        conn_h = max(3, round(s * 0.1))
+        conn = pygame.Rect(body.x - round(lay["port_w"] * 0.55), cy - conn_h // 2, round(lay["port_w"] * 0.55), conn_h)
+        pygame.draw.line(surface, shade(SPEC_FIBER, 0.6), (rect.x, cy + max(1, s // 60)), (conn.x, cy + max(1, s // 60)),
+                         max(2, s // 28))
+        pygame.draw.line(surface, SPEC_FIBER, (rect.x, cy), (conn.x, cy), max(2, s // 32))
+        draw_rect(surface, SPEC_BRASS, conn, border_radius=max(1, conn_h // 5))
+        draw_rect(surface, shade(SPEC_BRASS, 0.6), conn, width=max(1, s // 90), border_radius=max(1, conn_h // 5))
+
+        # Body: housing with a light top edge, name + status light in the header.
+        draw_rect(surface, (12, 12, 16), body.move(0, max(1, s // 40)), border_radius=radius)
+        draw_rect(surface, SPEC_BODY, body, border_radius=radius)
+        draw_rect(surface, shade(SPEC_BODY, 1.6), body, width=max(1, s // 90), border_radius=radius)
+        led_r = max(2, s // 36)
+        led = (body.right - pad - led_r, body.y + pad + lay["header_h"] // 2)
+        if status in ("ok", "starting", "error", "missing", "connecting"):
+            pygame.draw.circle(surface, shade(led_color, 0.4), led, round(led_r * 1.8))
+        pygame.draw.circle(surface, led_color, led, led_r)
+        size = round(lay["header_h"] * 0.78)
+        seen = surface.get_clip()                 # zoomed far in, most of it is off screen: skip its text
+        if size >= 8 and seen.colliderect((body.x, body.y, body.width, pad + lay["header_h"])):
+            font = get_font(size, "bahnschrift")
+            ts = font.render(clip_text(self.text or "CCS200 spectrometer", font, body.width - 4 * pad - 2 * led_r),
+                             True, (200, 204, 218))
+            surface.blit(ts, (body.x + pad, led[1] - ts.get_height() // 2))
+
+        # Screen.
+        bezel = max(1, s // 70)
+        draw_rect(surface, (16, 16, 20), screen.inflate(2 * bezel, 2 * bezel), border_radius=max(2, radius - 2))
+        draw_rect(surface, SPEC_SCREEN, screen, border_radius=max(2, radius - 4))
+        prev_clip = surface.get_clip()
+        surface.set_clip(screen.clip(prev_clip))
+        try:
+            self._draw_screen(surface, screen, status, led_color)
+        finally:
+            surface.set_clip(prev_clip)
+
+        # Footer: the Live button, and the integration time (+ BG while a dark is subtracted).
+        if not seen.colliderect((body.x, screen.bottom, body.width, body.bottom - screen.bottom)):
+            return
+        self._draw_button(surface, lay["button"], s)
+        size = round(lay["button"].height * 0.62)
+        if size >= 8:
+            font = get_font(size, "bahnschrift")
+            v = self.readings_now()
+            info = self.info() if self.running() else None
+            ms = (info or {}).get("params", {}).get("integration_ms", {}).get("value") or self.integration_ms
+            text = format_ms(ms) + ("   BG" if v.get("background") else "")
+            ts = font.render(text, True, (170, 190, 220) if self.running() else (110, 112, 126))
+            surface.blit(ts, ts.get_rect(midright=(body.right - pad, lay["button"].centery)))
+
+    def _draw_button(self, surface, button, s):
+        """GO LIVE (dark) / LIVE (red, with a pulsing dot); an amber ring while a
+        click waits for the device; greyed out while it isn't running."""
+        running = self.running()
+        live = running and self.is_live()
+        r = max(2, button.height // 3)
+        fill = SPEC_LIVE if live else (52, 56, 68) if running else (34, 36, 44)
+        if self._button_hover:
+            fill = shade(fill, 1.2)
+        draw_rect(surface, fill, button, border_radius=r)
+        draw_rect(surface, (8, 8, 10), button, width=max(1, s // 90), border_radius=r)
+        if self._pending is not None:
+            draw_rect(surface, (240, 190, 60), button.inflate(2, 2), width=max(1, s // 100), border_radius=r)
+        size = round(button.height * 0.58)
+        if size < 8:
+            return
+        font = get_font(size, "bahnschrift", True)
+        label = "LIVE" if live else "GO LIVE"
+        ts = font.render(label, True, (250, 240, 236) if live else (180, 186, 200) if running else (90, 92, 104))
+        dot_r = max(2, button.height // 6)
+        total = ts.get_width() + (3 * dot_r if live else 0)
+        x = button.centerx - total // 2
+        if live:
+            glow = 0.6 + 0.4 * math.sin(self._phase * 6)
+            pygame.draw.circle(surface, shade((255, 240, 240), glow), (x + dot_r, button.centery), dot_r)
+            x += 3 * dot_r
+        surface.blit(ts, ts.get_rect(midleft=(x, button.centery)))
+
+    def _draw_screen(self, surface, screen, status, led_color):
+        inner = screen.inflate(-max(4, screen.width // 30), -max(4, screen.height // 22))
+        if status != "ok":                                    # what it's doing instead
+            size = round(inner.height * 0.12)
+            if size >= 8:
+                font = get_font(size, "bahnschrift")
+                ts = font.render(clip_text(DEVICE_STATUS_TEXT.get(status, status), font, inner.width), True,
+                                 shade(led_color, 0.7) if status == "error" else (90, 96, 110))
+                surface.blit(ts, ts.get_rect(center=inner.center))
+            return
+        axis_h = round(inner.height * 0.16) if inner.height >= 70 else 0     # rainbow strip + labels
+        plot = pygame.Rect(inner.x, inner.y, inner.width, inner.height - axis_h)
+        if plot.width < SPEC_MIN_PLOT_PX or plot.height < 16:
+            return                                            # too small to read: a blank screen
+        vis = plot.clip(surface.get_clip())
+        if vis.width <= 0 or vis.height <= 0:
+            return
+        data = self.spectrum()
+        lo, hi = (float(data[1][0]), float(data[1][-1])) if data else (float(self.min_nm), float(self.max_nm))
+        if hi <= lo:
+            hi = lo + 1.0
+        to_x = lambda nm: plot.x + (nm - lo) / (hi - lo) * (plot.width - 1)
+
+        # Grid: a line at each labelled wavelength, four across.
+        step = nice_step(hi - lo, max(1, plot.width // 60))
+        ticks = [t for t in np.arange(math.ceil(lo / step) * step, hi + 1e-9, step)]
+        for t in ticks:
+            x = round(to_x(t))
+            if vis.left <= x < vis.right:
+                pygame.draw.line(surface, SPEC_GRID, (x, plot.y), (x, plot.bottom - 1))
+        for k in range(1, 4):
+            y = plot.y + round(plot.height * k / 4)
+            pygame.draw.line(surface, SPEC_GRID, (vis.left, y), (vis.right - 1, y))
+
+        if axis_h:
+            self._draw_axis(surface, plot, vis, axis_h, lo, hi, ticks, to_x)
+
+        if data is None:                                      # nothing scanned yet
+            size = round(plot.height * 0.1)
+            if size >= 8 and vis.collidepoint(plot.center):
+                font = get_font(size, "bahnschrift")
+                ts = font.render("press GO LIVE", True, (80, 88, 104))
+                surface.blit(ts, ts.get_rect(center=plot.center))
+            return
+
+        _key, nm, y = data
+        ymax = float(self.y_max) if self.y_max and self.y_max > 0 else max(float(np.max(y)) * 1.08, 1e-9)
+        ymin = min(0.0, float(np.min(y)))
+        if ymax <= ymin:
+            ymax = ymin + 1e-9
+        live = self.is_live()
+        surf = self._plot_surface(plot, vis, data, lo, hi, ymin, ymax, live)
+        surface.blit(surf, vis.topleft)
+
+        # Peak marker + label; SATURATED / the plot's top value in the corner.
+        i = int(np.argmax(y))
+        px, py = to_x(float(nm[i])), plot.y + (ymax - float(y[i])) / (ymax - ymin) * (plot.height - 1)
+        mk = max(3, plot.height // 30)
+        if vis.left - mk <= px <= vis.right + mk:
+            top = max(plot.y + mk, round(py) - mk)
+            pygame.draw.polygon(surface, (255, 236, 160), [(px, top + mk), (px - mk, top - mk), (px + mk, top - mk)])
+            size = round(plot.height * 0.075)
+            if size >= 8 and plot.width >= 160:
+                font = get_font(size, "bahnschrift")
+                ts = font.render(f"{float(nm[i]):.1f} nm", True, (255, 236, 160))
+                r = ts.get_rect(midbottom=(px, top - mk - 1))
+                if r.top < plot.top:                 # no room above the marker: beside it
+                    r = ts.get_rect(midleft=(px + 2 * mk, top))
+                    if r.right > plot.right:
+                        r.midright = (px - 2 * mk, top)
+                r.clamp_ip(plot)
+                surface.blit(ts, r)
+        size = round(plot.height * 0.07)
+        if size >= 8 and vis.colliderect((plot.x, plot.y, size * 6, size + 4)):
+            font = get_font(size, "bahnschrift", self.readings_now().get("saturated", 0) > 0)
+            if self.readings_now().get("saturated"):
+                ts = font.render("SATURATED", True, SPEC_LIVE)
+            else:
+                ts = font.render(f"{ymax:.3g}", True, (80, 88, 104))
+            surface.blit(ts, (plot.x + 3, plot.y + 2))
+
+    def _plot_surface(self, plot, vis, data, lo, hi, ymin, ymax, live):
+        """The curve over the visible part of the plot, drawn once per new scan
+        (or new size / pan): one column per pixel. Columns that hold several
+        points draw their lowest-to-highest value (so a narrow peak never
+        drops out); once the points are spread apart they're joined by lines,
+        with dots when there's room. Under the curve, a fill in the color of
+        each column's wavelength."""
+        key = (data[0], plot.size, vis.x - plot.x, vis.y - plot.y, vis.size, lo, hi, ymin, ymax, live)
+        if self._plot_cache[0] == key:
+            return self._plot_cache[1]
+        _k, nm, y = data
+        w, h = plot.width, plot.height
+        ox, oy = vis.x - plot.x, vis.y - plot.y                # the surface's offset in the plot
+        px = (nm - lo) / (hi - lo) * (w - 1)                   # each point's plot column
+        to_y = lambda v: (ymax - v) / (ymax - ymin) * (h - 1) - oy
+        cols = np.arange(ox, ox + vis.width)
+        at = np.interp(cols, px, y)                           # the curve at each column (linear between points)
+        spacing = (w - 1) / max(1, len(y) - 1)                # pixels between points
+        if spacing < 1.5:                                     # several points a column: each one's range
+            top, bot = at.copy(), at.copy()
+            c = np.floor(px).astype(int) - ox
+            inside = (c >= 0) & (c < vis.width)
+            np.maximum.at(top, c[inside], y[inside])
+            np.minimum.at(bot, c[inside], y[inside])
+        else:
+            top = bot = at
+        curve = SPEC_CURVE if live else shade(SPEC_CURVE, 0.7)
+
+        # Fill (and, packed, the columns' ranges) as one image: a row × column mask.
+        rows = np.arange(vis.height)[:, None]
+        y_top, y_bot = np.round(to_y(top))[None, :], np.round(to_y(bot))[None, :]
+        img = np.zeros((vis.height, vis.width, 4), dtype=np.uint8)
+        fill = (rows >= y_top) & (rows <= round(to_y(max(ymin, 0.0))))
+        img[..., :3] = np.where(fill[..., None], self._column_colors(lo, hi, w, ox, vis.width)[None, :, :], 0)
+        img[..., 3] = np.where(fill, 70 if live else 45, 0)
+        if spacing < 1.5:
+            img[(rows >= y_top) & (rows <= y_bot)] = (*curve, 255)
+        surf = pygame.image.frombuffer(img.tobytes(), vis.size, "RGBA").copy()
+        if spacing >= 1.5:                                    # every point, joined
+            first = max(0, int(np.searchsorted(px, ox)) - 1)
+            last = min(len(y), int(np.searchsorted(px, ox + vis.width)) + 1)
+            pts = [(float(px[k] - ox), float(to_y(y[k]))) for k in range(first, last)]
+            if len(pts) >= 2:
+                pygame.draw.aalines(surf, curve, False, pts)
+                if spacing >= 3:
+                    pygame.draw.lines(surf, curve, False, pts, 2)
+            if spacing >= 8:
+                dot = max(2, min(5, round(spacing / 8)))
+                for p in pts:
+                    pygame.draw.circle(surf, curve, (round(p[0]), round(p[1])), dot)
+        self._plot_cache = (key, surf)
+        return surf
+
+    def _column_colors(self, lo, hi, w, ox, count):
+        """The fill color (each column's wavelength, a little dimmed) of the
+        visible columns, as a (count, 3) array — kept until the window, size or pan moves."""
+        key = (lo, hi, w, ox, count)
+        if getattr(self, "_colors_cache", (None,))[0] != key:
+            nms = lo + (np.arange(ox, ox + count)) / max(1, w - 1) * (hi - lo)
+            colors = np.array([shade(wavelength_rgb(float(v)), 0.8) for v in nms], dtype=np.uint8).reshape(-1, 3)
+            self._colors_cache = (key, colors)
+        return self._colors_cache[1]
+
+    def _draw_axis(self, surface, plot, vis, axis_h, lo, hi, ticks, to_x):
+        """Under the plot: a strip in the color of each wavelength, then the labels."""
+        strip_h = max(2, axis_h // 4)
+        strip = pygame.Rect(vis.x, plot.bottom + 1, vis.width, strip_h)
+        key = (plot.width, vis.x - plot.x, vis.width, strip_h, lo, hi)
+        if self._strip_cache[0] != key:
+            s = pygame.Surface(strip.size)
+            for j in range(vis.width):
+                nm = lo + (vis.x - plot.x + j) / max(1, plot.width - 1) * (hi - lo)
+                pygame.draw.line(s, wavelength_rgb(nm), (j, 0), (j, strip_h - 1))
+            self._strip_cache = (key, s)
+        surface.blit(self._strip_cache[1], strip.topleft)
+        size = round((axis_h - strip_h) * 0.72)
+        if size < 8 or not surface.get_clip().colliderect((plot.x, strip.bottom, plot.width, axis_h)):
+            return
+        font = get_font(size, "bahnschrift")
+        label_y = strip.bottom + max(1, size // 4)
+        us = font.render("nm", True, (100, 106, 120))              # the unit, at the row's right end
+        unit = us.get_rect(topright=(plot.right, label_y))
+        surface.blit(us, unit)
+        for t in ticks:
+            x = round(to_x(t))
+            if vis.left - 40 <= x < vis.right + 40:
+                pygame.draw.line(surface, (110, 116, 130), (x, strip.bottom), (x, label_y))
+                ts = font.render(f"{t:g}", True, (140, 146, 160))
+                r = ts.get_rect(midtop=(x, label_y))
+                r.clamp_ip(pygame.Rect(plot.x, r.y, plot.width, r.height))
+                if not r.colliderect(unit.inflate(size // 2, 0)):
+                    surface.blit(ts, r)
 
 
 

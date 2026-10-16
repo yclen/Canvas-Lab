@@ -70,6 +70,13 @@
       "options": {
         "port": "auto"
       }
+    },
+    {
+      "name": "spectrometer",
+      "driver": "ccs200_spectrometer",
+      "options": {
+        "address": "auto"
+      }
     }
   ]
 }

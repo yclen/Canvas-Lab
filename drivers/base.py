@@ -49,13 +49,17 @@ class Param:
 
 
 class Reading:
-    """Something a device reports back: a sensor value, an actual position."""
+    """Something a device reports back: a sensor value, an actual position.
+    kind="text": text, shown in the panel, never a linkable output (a reading
+    that sends text is treated so anyway; this says so before the first one).
+    kind="data": a bulk value (e.g. a whole spectrum) for its own canvas object
+    to draw — never shown as text or offered as a linkable output."""
 
-    def __init__(self, unit=""):
-        self.unit = unit
+    def __init__(self, unit="", kind=""):
+        self.unit, self.kind = unit, kind
 
     def describe(self):
-        return {"unit": self.unit}
+        return {"unit": self.unit, "kind": self.kind} if self.kind else {"unit": self.unit}
 
 
 class Driver:
