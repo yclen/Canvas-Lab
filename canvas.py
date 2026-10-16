@@ -654,14 +654,15 @@ class Take:
     """One input of an object: something it can follow from another object.
 
     kind: "number" (follows the value), "onoff" (on while the source isn't 0),
-    or "press" (acts once each time the source goes 0 → 1: the object's
-    on_press(port) runs). verb is what the panel says it does ("follows",
+    "press" (acts once each time the source goes 0 → 1: the object's
+    on_press(port) runs), or "data" (takes a data output — e.g. a Script's
+    runs, for a Graph; links only to a data output, and a data output only to it). verb is what the panel says it does ("follows",
     "records"; default by kind). current() is what it uses while unlinked (a
     device param's setting — a number, or text like "always"),
     set_by_hand(app) lets you type one, and on_label(app) runs when its name is
     clicked (e.g. a collector column's menu)."""
 
-    KINDS = ("number", "onoff", "press")
+    KINDS = ("number", "onoff", "press", "data")
 
     def __init__(self, key, label=None, kind="number", *, unit="", verb=None,
                  current=None, set_by_hand=None, on_label=None):
@@ -679,16 +680,24 @@ class Take:
 
 class Give:
     """One output of an object: a named live value (a number, or None while it
-    has none). The value itself comes from obj.outputs()[key]."""
+    has none). The value itself comes from obj.outputs()[key]. kind="data": the
+    value is a dict (with a "label" for the panel) that only a data input takes."""
 
-    def __init__(self, key, label=None, unit=""):
+    def __init__(self, key, label=None, unit="", kind="number"):
         self.key = key
         self.label = label or key
         self.unit = unit
+        self.kind = kind
+
+
+def kinds_match(take_kind, give_kind):
+    """Can an input of take_kind follow an output of give_kind? Data only with data."""
+    return (take_kind == "data") == (give_kind == "data")
 
 
 LINK_COLOR = (120, 220, 150)        # number wires (flowing dots)
 LINK_ONOFF_COLOR = (240, 200, 90)   # on/off and press wires
+LINK_DATA_COLOR = (110, 160, 255)   # data wires (flowing while the data is live)
 PRESS_FLASH = 0.35                  # seconds a press wire stays lit after it fires
 
 
@@ -696,6 +705,10 @@ def format_value(value, unit=""):
     """A live value for the panel: 6 significant digits + unit, or "—"."""
     if value is None:
         return "—"
+    if isinstance(value, dict):                 # a data output: its own label
+        return str(value.get("label", "data"))
+    if not isinstance(value, (int, float)):
+        return str(value)
     return f"{value:.6g}" + (f" {unit}" if unit else "")
 
 
@@ -917,6 +930,10 @@ class CanvasObject:
             start, end = output_point(src), self.input_point(take.key)
             if take.kind == "number":
                 draw_wire(surface, camera, start, end, LINK_COLOR)
+            elif take.kind == "data":
+                value = self.take(take.key)
+                live = isinstance(value, dict) and bool(value.get("live"))
+                draw_wire(surface, camera, start, end, LINK_DATA_COLOR, flow=live, width=3)
             elif take.kind == "onoff":
                 on = self.take_on(take.key)
                 draw_wire(surface, camera, start, end, LINK_ONOFF_COLOR, flow=bool(on))
@@ -983,7 +1000,12 @@ class CanvasObject:
         return None if value is None else value != 0
 
     def link(self, port, src, key, app=None):
-        """Make input `port` follow src's output `key`."""
+        """Make input `port` follow src's output `key` (not across data / number:
+        a mismatch is ignored)."""
+        take = self.find_take(port)
+        give = next((g for g in src.gives() if g.key == key), None)
+        if take is not None and give is not None and not kinds_match(take.kind, give.kind):
+            return
         self.links = dict(self.links, **{port: {"id": src.id, "key": key}})
         self._press_last.pop(port, None)
         self.on_links_changed()
@@ -3240,7 +3262,8 @@ INSPECTOR_PAD = 16
 PANEL_SCROLL_STEP = 40                 # px the body scrolls per wheel notch
 PANEL_MAX_BUTTONS = 4                  # footer buttons; the rest go in the ⋯ menu
 SCROLL_LIST_ROWS = 10                  # a ScrollList's height, in rows
-VERBS = {"number": "follows", "onoff": "on while it's on", "press": "acts each time it turns on"}
+VERBS = {"number": "follows", "onoff": "on while it's on", "press": "acts each time it turns on",
+         "data": "shows"}
 
 
 def clip_text(text, font, max_width):
@@ -3689,7 +3712,7 @@ class InspectorPanel:
             self._hover_src = src
         y += 24
         value = obj.take(take.key)
-        if take.kind == "number":
+        if take.kind in ("number", "data"):
             text = format_value(value, take.unit)
         else:
             text = "—" if value is None else "on" if value != 0 else "off"
@@ -4451,20 +4474,22 @@ class App:
                 obj.unlink(port, self)
             else:
                 self.choose_give(obj, port, src)
+        kind = take.kind if take is not None else "number"
         self.start_picking(f"Click what '{label}' takes from{hint}{note}", picked,
-                           accept=lambda o: (o is obj and linked) or (o is not obj and bool(o.gives())),
+                           accept=lambda o: (o is obj and linked) or (o is not obj and any(
+                               kinds_match(kind, g.kind) for g in o.gives())),
                            origin=obj.input_point(port), on_empty=on_empty)
 
     def choose_give(self, obj, port, src):
         """Link obj's input `port` to one of src's outputs: right away if it has
         one, else from a menu listing each with its live value (the likeliest first)."""
-        gives = src.gives()
+        take = obj.find_take(port)
+        gives = [g for g in src.gives() if kinds_match(take.kind if take else "number", g.kind)]
         if not gives:
             return
         if len(gives) == 1:
             obj.link(port, src, gives[0].key, self)
             return
-        take = obj.find_take(port)
         prefer = ("value",) if take is None or take.kind == "number" else ("pressed", "on", "value")
         gives = sorted(gives, key=lambda g: prefer.index(g.key) if g.key in prefer else len(prefer))
         values = src.outputs()
@@ -4477,15 +4502,20 @@ class App:
     def pick_target(self, src, key):
         """The other way round: link src's output `key` into an input of an
         object you click (a menu, if it has several inputs)."""
+        give = next((g for g in src.gives() if g.key == key), None)
+        kind = give.kind if give is not None else "number"
+
         def picked(target):
             self.choose_take(target, src, key)
         self.start_picking(f"Click what should take '{key}' from this {src.type_name().lower()}", picked,
-                           accept=lambda o: o is not src and bool(o.takes()), origin=output_point(src))
+                           accept=lambda o: o is not src and any(kinds_match(t.kind, kind) for t in o.takes()),
+                           origin=output_point(src))
 
     def choose_take(self, target, src, key, port=None):
         """Link src's output `key` into target's input `port`, or into one picked
         from a menu of target's inputs (right away if it has just one)."""
-        takes = target.takes()
+        give = next((g for g in src.gives() if g.key == key), None)
+        takes = [t for t in target.takes() if kinds_match(t.kind, give.kind if give else "number")]
         if port is not None or len(takes) == 1:
             target.link(port or takes[0].key, src, key, self)
             return

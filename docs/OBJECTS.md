@@ -40,7 +40,12 @@
   **Readout**, an LED display — seven-segment digits with unlit "ghost" segments, a unit
   beside them (free text: mW, ms, V, …), decimals, digit slots, color, size, and the object's
   name printed on the bezel. Dashes when unlinked
-- **Graph** (E menu ▸ Displays): one column of a data file against another. Settings ▸ **Data
+- **Graph** (E menu ▸ Displays): one column of a data file against another. Link its **Runs from**
+  input to a Script's `runs` (a thick blue wire, flowing while the script runs): it then shows that
+  script's folder; on Latest it follows the run the script is writing, point by point, and starts on
+  the script's suggested columns (power_mW vs count_rate for the sweep) until you step X / Y; a
+  column the run hasn't reached yet shows "no count_rate yet", and the axes fit only the points
+  that have both values so far. Unlinked, it uses Settings ▸ **Data
   folder** (relative to the app's folder or a full path; default `experiments/detector_sweep`):
   its CSV files are the datasets, newest first (the panel's *Datasets* list, and a Dataset
   stepper). **Latest** (the default) follows new runs: a new file shows as soon as it appears,
@@ -175,6 +180,9 @@
   A run survives a canvas restart (the status file and the script's pid); a script that dies
   without reporting shows "ended unexpectedly". Outputs `running` (1/0), `progress` (0–1). The
   pulsing badge runs on the world clock, so nothing changes per frame for the world to resend.
+  **`runs`** (a data output): the script's data folder, this object's current / last dataset,
+  whether it's running and the columns the script suggests (`plot` in `canvas_run.start`) —
+  link it to a Graph's *Runs from*.
 
 ---
 

@@ -207,7 +207,9 @@ Every panel has the same parts, always in this order (a section with nothing in 
 **An output (Give) is a named value an object offers. An input (Take) is a named slot that
 follows one output.** Every wire runs from an output to an input; an output can feed any
 number of inputs, an input has at most one source. Every value is just a number; on/off is 0
-or 1 (anything that isn't 0 counts as on). Text stays display-only.
+or 1 (anything that isn't 0 counts as on). Text stays display-only. The one exception is
+**data**: a `Give(kind="data")` offers a dict (with a `"label"` for the panel) that only a
+`Take(kind="data")` takes — a Script's `runs` into a Graph.
 
 - **Outputs:** `outputs()` → `{name: number or None}` is how values are read; `gives()`
   declares them (name, unit), so the panel and the pickers can list them even while a value is
@@ -220,8 +222,11 @@ or 1 (anything that isn't 0 counts as on). Text stays display-only.
   | `number` | follows the value | Readout, Function variables, device params, Relay, Tag value, collector columns ("records") |
   | `onoff` | on while the source isn't 0 | Tag *streaming* |
   | `press` | acts once each time the source goes 0 → 1 (`on_press(port)`); already on when first read doesn't count | Counter up / down / reset, collector *collect* |
+  | `data` | takes a data output (a dict), drawn as a thick blue wire, flowing while the data's `live` | Graph *Runs from* (a Script's `runs`) |
 
-  Any input can link to any output.
+  Any input can link to any output — except across data: `link()` ignores a data output into a
+  number / on/off / press input or the reverse (`kinds_match`), and the pickers only offer
+  matching ends. `format_value` shows a data value by its label.
 - **One storage shape:** every object's links are one hidden Prop, `links = {port: {"id", "key"}}`
   (saved only when not empty). Older saves are converted on load by each type's `migrate(d)`:
   a readout's `source_id` / `source_key`, a relay's `source`, a tag's `stream`, and a
@@ -576,8 +581,8 @@ Real hardware runs outside the canvas. Each device type's canvas object is descr
   `STATUS.json.stop` as Stop. From a terminal it all does nothing. Each script's runs go to
   `experiments/<name>/`, one CSV per run — a Graph's datasets. `detector_power_sweep.py` is the
   first (plot defaults: power_mW vs count_rate). The **Script** object (OBJECTS.md, *Data*) runs
-  them from the canvas: inputs as panel rows, RUN / STOP, progress. Next: a data link from a
-  Script to Graphs (the latest run, followed live).
+  them from the canvas: inputs as panel rows, RUN / STOP, progress; its `runs` data output links
+  to Graphs (the latest run, followed live while it runs).
 
 ---
 

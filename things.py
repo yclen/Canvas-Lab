@@ -788,8 +788,9 @@ def list_datasets(folder):
 
 def read_csv_columns(path):
     """(headers, {header: numpy array}) for a CSV's number columns: the first
-    row is the headers, lines starting with # are comments, a blank or text
-    cell is NaN, and a column with no numbers at all is left out."""
+    row is the headers, lines starting with # are comments, a blank cell is
+    NaN. A text column (a cell that isn't a number) is left out; an all-blank
+    one stays (all NaN) — a script fills it in as it goes."""
     with open(path, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.reader(line for line in f if not line.lstrip().startswith("#")))
     if not rows:
@@ -798,16 +799,16 @@ def read_csv_columns(path):
     body = rows[1:GRAPH_MAX_ROWS + 1]
     columns = {}
     for i, header in enumerate(headers):
-        values = []
+        values, text = [], False
         for row in body:
             cell = row[i].strip() if i < len(row) else ""
             try:
                 values.append(float(cell) if cell else math.nan)
             except ValueError:
                 values.append(math.nan)
-        array = np.array(values, dtype=float)
-        if np.isfinite(array).any():
-            columns[header] = array
+                text = True
+        if not text or np.isfinite(values).any():       # text cells among numbers: those are gaps
+            columns[header] = np.array(values, dtype=float)
     return [h for h in headers if h in columns], columns
 
 
@@ -878,6 +879,7 @@ class Graph(YScale, Thing):
     MENU_LABEL = "Add graph"
     NAME = "Graph"
     CATEGORY = "Displays"
+    TAKES = (Take("runs", "Runs from", kind="data", verb="shows"),)    # a Script's runs
     SIZE = (440, 290)
     DOT_COLOR = (120, 200, 255)
     PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
@@ -916,15 +918,28 @@ class Graph(YScale, Thing):
         self.y_scale_changed(key)
         self.recheck()
 
+    def on_links_changed(self):
+        self.recheck()
+
+    def source_runs(self):
+        """The linked Script's runs ({folder, latest, live, plot, label, …}), or None."""
+        value = self.take("runs")
+        return value if isinstance(value, dict) and value.get("folder") else None
+
     def auto_y_range(self):
         """The y range fitted to what's shown, in the data's units."""
         data = self.data()
         if data is None:
             return None
-        fitted = plotting.data_range(self._plot_ys(data[2]), self.log_y)
+        px, py = self._plot_xs(data[1]), self._plot_ys(data[2])
+        fitted = plotting.data_range(py[np.isfinite(px)], self.log_y)
         if fitted is None:
             return None
         return (10 ** fitted[0], 10 ** fitted[1]) if self.log_y else fitted
+
+    def _plot_xs(self, xs):
+        """x values on the plot's scale: log10 of the positive ones on a log axis."""
+        return np.where(xs > 0, np.log10(np.where(xs > 0, xs, 1.0)), np.nan) if self.log_x else xs
 
     def _plot_ys(self, ys):
         """y values on the plot's scale: log10 of the positive ones on a log axis."""
@@ -940,7 +955,8 @@ class Graph(YScale, Thing):
         if now < w.next_check:
             return
         w.next_check = now + GRAPH_CHECK_SECONDS
-        folder = resolve_folder(self.folder)
+        runs = self.source_runs()                      # linked to a Script: its folder, its run
+        folder = resolve_folder(runs["folder"] if runs else self.folder)
         try:
             files = list_datasets(folder)
         except OSError:
@@ -953,7 +969,13 @@ class Graph(YScale, Thing):
             self._set_problem("no CSV files in this folder yet")
             return
         names = [f[0] for f in files]
-        name, path, mtime = files[names.index(self.dataset)] if self.dataset in names else files[0]
+        current = os.path.basename(runs.get("latest") or "") if runs and runs.get("live") else ""
+        if self.dataset in names:                      # a run you picked
+            name, path, mtime = files[names.index(self.dataset)]
+        elif current in names:                         # Latest, while the script writes its run
+            name, path, mtime = files[names.index(current)]
+        else:                                          # Latest: the newest file
+            name, path, mtime = files[0]
         if w.loaded is not None and w.loaded[:2] == (path, mtime) and w.loaded[2:] == (self.x_col, self.y_col):
             return
         try:
@@ -967,8 +989,10 @@ class Graph(YScale, Thing):
             return
         if headers != self.columns:
             self.columns = headers
-        x = self.x_col if self.x_col in columns else headers[0]
-        y = self.y_col if self.y_col in columns else headers[1 if len(headers) > 1 else 0]
+        plot = (runs or {}).get("plot") or [None, None]  # the script's suggested columns
+        x = self.x_col if self.x_col in columns else plot[0] if plot[0] in columns else headers[0]
+        y = (self.y_col if self.y_col in columns else plot[1] if len(plot) > 1 and plot[1] in columns
+             else headers[1 if len(headers) > 1 else 0])
         w.seq += 1
         w.loaded = (path, mtime, self.x_col, self.y_col)
         self.shown = {"name": name, "x_col": x, "y_col": y, "n": int(len(columns[x])), "seq": w.seq,
@@ -1012,7 +1036,8 @@ class Graph(YScale, Thing):
         shown = self.shown or {}
         latest = self.datasets[0][0] if self.datasets else "—"
         dataset = f"Latest ({latest})" if not self.dataset else self.dataset
-        rows = [Row("Folder", self.folder, on_click=self.edit_folder),
+        runs = self.source_runs()
+        rows = [Row("Folder", runs["label"] if runs else self.folder, on_click=None if runs else self.edit_folder),
                 Stepper("Dataset", dataset, lambda app: self.step_dataset(app, -1),
                         lambda app: self.step_dataset(app, +1), down_enabled=bool(self.datasets),
                         up_enabled=bool(self.datasets))]
@@ -1105,9 +1130,8 @@ class Graph(YScale, Thing):
         _key, xs, ys = data
         shown = self.shown
         # Log axes: plot log10 of the positive values (the rest can't be shown).
-        px = np.where(xs > 0, np.log10(np.where(xs > 0, xs, 1.0)), np.nan) if self.log_x else xs
-        py = self._plot_ys(ys)
-        x_range = plotting.data_range(px, self.log_x)
+        px, py = self._plot_xs(xs), self._plot_ys(ys)
+        x_range = plotting.data_range(px[np.isfinite(py)], self.log_x)   # points with both: a run filling in
         y_range = self.y_range(self.auto_y_range())             # fitted, or the fixed one
         if y_range is not None and self.log_y:                  # the plot's scale is log10
             fitted = plotting.data_range(py, True)
@@ -1130,7 +1154,10 @@ class Graph(YScale, Thing):
             return                                            # too small to read: a blank screen
         if x_range is None or y_range is None:
             if labels:
-                ts = font.render(f"no {'positive ' if self.log_x or self.log_y else ''}values to show",
+                waiting = (shown["y_col"] if not np.isfinite(ys).any() else
+                           shown["x_col"] if not np.isfinite(xs).any() else None)   # a column still empty
+                ts = font.render(f"no {waiting} yet" if waiting else
+                                 f"no {'positive ' if self.log_x or self.log_y else ''}values to show",
                                  True, (90, 96, 110))
                 surface.blit(ts, ts.get_rect(center=plot.center))
             return
@@ -1515,10 +1542,24 @@ class Script(Thing):
         return 1.0 if self.state() == "complete" else 0.0
 
     def gives(self):
-        return [Give("running"), Give("progress")]
+        return [Give("running"), Give("progress"), Give("runs", kind="data")]
 
     def outputs(self):
-        return {"running": 1.0 if self.running() else 0.0, "progress": self.progress_fraction()}
+        return {"running": 1.0 if self.running() else 0.0, "progress": self.progress_fraction(),
+                "runs": self.runs()}
+
+    def runs(self):
+        """What a Graph linked to `runs` follows: the script's data folder, the
+        dataset of this object's current (or last) run, whether it's running,
+        and the columns the script suggests plotting. None until the script's
+        inputs are read (they say where its data goes)."""
+        folder = (self.spec or {}).get("data_folder")
+        if not folder:
+            return None
+        return {"label": f"experiments/{folder}" + (" — running" if self.running() else ""),
+                "folder": os.path.join(APP_DIR, "experiments", folder), "script": self.script,
+                "latest": self.status.get("dataset"), "live": self.running(),
+                "plot": (self.spec or {}).get("plot")}
 
     def panel_status(self, app):
         state = self.state()
