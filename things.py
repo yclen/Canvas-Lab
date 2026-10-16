@@ -46,6 +46,7 @@ import csv
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -851,29 +852,68 @@ class YScale:
             self.autoscale = False                             # a typed range means: hold this
 
 
+GRAPH_MAX_SERIES = 8             # runs overlaid on one graph at most
+GRAPH_PALETTE = [(120, 200, 255), (255, 170, 60), (120, 230, 140), (240, 110, 170),
+                 (190, 150, 255), (240, 220, 90), (90, 220, 220), (250, 120, 100)]
+FOLDER_FILE = "canvas.json"      # a data folder's graphing hints (scripts/canvas_run.py writes it)
+_STAMP = re.compile(r"[_ -]?\d{8}[_ -]?\d{6}$")
+
+
+def read_folder_file(folder):
+    """A data folder's canvas.json: {"plot": {x, y, labels}, "runs": {file: label}}, or {}."""
+    try:
+        with open(os.path.join(folder, FOLDER_FILE), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def plot_choices(plot):
+    """A plot hint as {"x": [...], "y": [...], "labels": {...}}; an older (x, y) pair works too."""
+    if isinstance(plot, dict):
+        listed = lambda v: [v] if isinstance(v, str) else [c for c in (v or []) if isinstance(c, str)]  # noqa: E731
+        return {"x": listed(plot.get("x")), "y": listed(plot.get("y")), "labels": dict(plot.get("labels") or {})}
+    if isinstance(plot, (list, tuple)) and len(plot) == 2:
+        return {"x": [plot[0]], "y": [plot[1]], "labels": {}}
+    return {"x": [], "y": [], "labels": {}}
+
+
+def run_label(name, labels):
+    """A run's legend name: the label its script gave it, else its file name
+    without the extension and the trailing date_time stamp."""
+    return labels.get(name) or _STAMP.sub("", os.path.splitext(name)[0]) or os.path.splitext(name)[0]
+
+
 class _GraphWatch:
     """The world's bookkeeping for a Graph (not sent to players, not saved)."""
 
     def __init__(self):
         self.next_check = 0.0
-        self.loaded = None           # (path, modified time, x column, y column) on screen
+        self.key = None              # what's on screen: (files + modified times, columns, hints)
+        self.files = {}              # path -> (modified time, headers, columns): each file read once per change
         self.seq = 0
 
 
 class Graph(YScale, Thing):
-    """A graph of one column of a data file against another. Point it at a
-    data folder (Settings ▸ Data folder — e.g. a script's experiments/… folder):
-    its CSV files are the datasets, newest first. "Latest" follows new runs —
-    a new file shows as soon as it appears, and a file being written (a script
-    rewrites its CSV after every point) redraws as it grows. Or pick any
-    earlier run. X / Y pick the columns (number columns only); log axes and
-    lines / points are Settings.
+    """A graph of one column of a data folder's runs against another — one
+    run, or several overlaid. Link **Runs from** to a Script's runs (or set
+    Settings ▸ Data folder): the folder's CSV files are the runs, newest first,
+    in the panel's Datasets list — click a run to add it to the graph (it gets
+    the next color and a line in the legend), again to take it off. **Latest**
+    is one of them: on (the default), the newest run is shown too, and while a
+    linked Script runs, the run it's writing, growing point by point.
 
-    The world reads the file (on the PC with the data) and sends the two
-    columns to every window, packed as float32; nothing is saved with the
-    canvas — the file is read again when the world starts. Drawing uses the
-    shared plotter (plotting.py): one column per pixel, so zoom decides the
-    detail; too small to read, the screen stays blank."""
+    X / Y cycle the columns the folder's script declared (its canvas.json —
+    e.g. power against count rate or voltage for the detector sweep), with
+    their axis names; Settings ▸ All columns offers every number column.
+    Legends use the run labels the script gave (e.g. "550 nm · sampleA").
+    Log axes, auto-scale (over all the runs shown) and lines / points are
+    Settings.
+
+    The world reads the files (on the PC with the data) and sends the two
+    columns of each run to every window, packed as float32; nothing is saved
+    with the canvas. Drawing uses the shared plotter (plotting.py)."""
 
     TYPE = "graph"
     MENU_LABEL = "Add graph"
@@ -886,34 +926,48 @@ class Graph(YScale, Thing):
                   prompt="Size (1 = normal, 2 = twice as big):"),
              Prop("folder", "Data folder", "str", "experiments/detector_sweep",
                   prompt="Folder of CSV files (relative to the app's folder, or a full path):"),
-             Prop("dataset", kind="str", default="", hidden=True),     # a file name; "" = the latest
+             Prop("latest", kind="bool", default=True, hidden=True),   # show the newest run
+             Prop("pinned", kind="data", default=[], hidden=True),     # runs added by hand (file names)
              Prop("x_col", kind="str", default="", hidden=True),
              Prop("y_col", kind="str", default="", hidden=True),
+             Prop("all_columns", "All columns", "bool", False),
              Prop("log_x", "Log x axis", "bool", False),
              Prop("log_y", "Log y axis", "bool", False),
-             Prop("style", "Draw", "choice", "both", choices=["both", "lines", "points"]),
-             Prop("color", "Color", "color", (120, 200, 255))]
+             Prop("style", "Draw", "choice", "both", choices=["both", "lines", "points"])]
+
+    @classmethod
+    def migrate(cls, d):
+        """Before overlays a graph showed one run: `dataset` ("" = the latest)."""
+        if "dataset" in d and "pinned" not in d:
+            d = dict(d)
+            name = d.pop("dataset") or ""
+            d["latest"], d["pinned"] = not name, [name] if name else []
+        return d
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Sent to players (plain values): what's in the folder, and what's on screen.
-        self.datasets = []           # [[file name, "YYYY-MM-DD HH:MM"]], newest first
-        self.columns = []            # the shown file's number columns
-        self.shown = None            # {"name", "x_col", "y_col", "n", "x", "y", "seq"} — x / y packed
-        self.problem = ""            # why nothing is shown, if so
+        self.datasets = []           # [[file name, "YYYY-MM-DD HH:MM", legend label]], newest first
+        self.x_choices = []          # the columns X / Y cycle through
+        self.y_choices = []
+        self.shown = None            # {"x_col", "y_col", "x_label", "y_label", "series": [{"name", "label",
+        #                              "latest", "n", "seq", "x", "y"}]} — x / y packed
+        self.problem = ""            # why nothing (or not everything) is shown
         self._watch = _GraphWatch()  # the world's own (skipped when sending: not plain data)
-        self._curve = plotting.CurveImage()
-        self._decoded = None         # (key, xs, ys) of `shown`, decoded once
+        self._curves = []            # one CurveImage per series
+        self._decoded = {}           # series name -> (seq, xs, ys)
 
     @classmethod
     def icon_sample(cls):
         sample = cls(0, 0)
-        x = np.linspace(0, 1, 40)
-        sample.shown = {"name": "", "x_col": "x", "y_col": "y", "n": 40, "seq": 0,
-                        "x": plotting.pack_floats(x), "y": plotting.pack_floats(np.exp(-3 * x) + 0.1 * x)}
+        x = np.linspace(0, 1, 30)
+        series = [{"name": f"r{k}", "label": "", "latest": False, "n": 30, "seq": 0,
+                   "x": plotting.pack_floats(x), "y": plotting.pack_floats((1 - np.exp(-3 * x)) * (1 - 0.3 * k))}
+                  for k in range(2)]
+        sample.shown = {"x_col": "x", "y_col": "y", "x_label": "", "y_label": "", "series": series}
         return sample
 
-    # --- The world: watch the folder, read the file -------------------------------------
+    # --- The world: watch the folder, read the files ------------------------------------
     def on_prop_changed(self, key):
         self.y_scale_changed(key)
         self.recheck()
@@ -926,28 +980,21 @@ class Graph(YScale, Thing):
         value = self.take("runs")
         return value if isinstance(value, dict) and value.get("folder") else None
 
-    def auto_y_range(self):
-        """The y range fitted to what's shown, in the data's units."""
-        data = self.data()
-        if data is None:
-            return None
-        px, py = self._plot_xs(data[1]), self._plot_ys(data[2])
-        fitted = plotting.data_range(py[np.isfinite(px)], self.log_y)
-        if fitted is None:
-            return None
-        return (10 ** fitted[0], 10 ** fitted[1]) if self.log_y else fitted
-
-    def _plot_xs(self, xs):
-        """x values on the plot's scale: log10 of the positive ones on a log axis."""
-        return np.where(xs > 0, np.log10(np.where(xs > 0, xs, 1.0)), np.nan) if self.log_x else xs
-
-    def _plot_ys(self, ys):
-        """y values on the plot's scale: log10 of the positive ones on a log axis."""
-        return np.where(ys > 0, np.log10(np.where(ys > 0, ys, 1.0)), np.nan) if self.log_y else ys
-
     def recheck(self):
         self._watch.next_check = 0.0
-        self._watch.loaded = None
+        self._watch.key = None
+
+    def _read(self, path, mtime):
+        """(headers, columns) of a file, read again only when it changed."""
+        cached = self._watch.files.get(path)
+        if cached is not None and cached[0] == mtime:
+            return cached[1], cached[2]
+        headers, columns = read_csv_columns(path)
+        if columns:                                    # empty: caught mid-write, keep the last good read
+            self._watch.files[path] = (mtime, headers, columns)
+        elif cached is not None:
+            return cached[1], cached[2]
+        return headers, columns
 
     def tick(self, dt):
         w = self._watch
@@ -962,64 +1009,114 @@ class Graph(YScale, Thing):
         except OSError:
             self._set_problem(f"no folder {folder}")
             return
-        listing = [[name, datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")] for name, _p, mtime in files]
+        hints = read_folder_file(folder)
+        labels = hints.get("runs") if isinstance(hints.get("runs"), dict) else {}
+        listing = [[name, datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M"), run_label(name, labels)]
+                   for name, _p, mtime in files]
         if listing != self.datasets:
             self.datasets = listing
         if not files:
             self._set_problem("no CSV files in this folder yet")
             return
-        names = [f[0] for f in files]
-        current = os.path.basename(runs.get("latest") or "") if runs and runs.get("live") else ""
-        if self.dataset in names:                      # a run you picked
-            name, path, mtime = files[names.index(self.dataset)]
-        elif current in names:                         # Latest, while the script writes its run
-            name, path, mtime = files[names.index(current)]
-        else:                                          # Latest: the newest file
-            name, path, mtime = files[0]
-        if w.loaded is not None and w.loaded[:2] == (path, mtime) and w.loaded[2:] == (self.x_col, self.y_col):
+
+        # Which runs: the pinned ones (in the order added), then Latest.
+        by_name = {f[0]: f for f in files}
+        chosen = [[by_name[n], False] for n in self.pinned if n in by_name]
+        if self.latest:
+            live = os.path.basename(runs.get("latest") or "") if runs and runs.get("live") else ""
+            newest = by_name[live] if live in by_name else files[0]
+            for entry in chosen:
+                if entry[0] is newest:
+                    entry[1] = True                    # pinned and the latest: shown once
+                    break
+            else:
+                chosen.append([newest, True])
+        dropped = max(0, len(chosen) - GRAPH_MAX_SERIES)
+        if dropped:                                    # keep Latest; drop the last pinned
+            latest = [c for c in chosen if c[1]]
+            chosen = [c for c in chosen if not c[1]][:GRAPH_MAX_SERIES - len(latest)] + latest
+        if not chosen:
+            self._set_problem("no run selected — pick one in Datasets (or turn Latest on)")
             return
-        try:
-            headers, columns = read_csv_columns(path)
-        except (OSError, UnicodeDecodeError, csv.Error) as e:
-            self._set_problem(f"can't read {name}: {e}")
+
+        plot = plot_choices(hints.get("plot") or (runs or {}).get("plot"))
+        key = (tuple((f[1], f[2], latest) for f, latest in chosen), self.x_col, self.y_col, self.all_columns,
+               json.dumps(plot, sort_keys=True), json.dumps(labels, sort_keys=True))
+        if key == w.key:
             return
-        if not columns:                       # empty, or caught mid-write: try again next check
-            if self.shown is None or self.shown.get("name") != name:
-                self._set_problem(f"no number columns in {name} (yet)")
+        read, problems = [], []
+        for (name, path, mtime), latest in chosen:
+            try:
+                headers, columns = self._read(path, mtime)
+            except (OSError, UnicodeDecodeError, csv.Error) as e:
+                problems.append(f"can't read {name}: {e}")
+                continue
+            if columns:
+                read.append((name, latest, headers, columns))
+            else:
+                problems.append(f"no number columns in {name} (yet)")
+        if not read:
+            self._set_problem("; ".join(problems) or "nothing to show")
             return
-        if headers != self.columns:
-            self.columns = headers
-        plot = (runs or {}).get("plot") or [None, None]  # the script's suggested columns
-        x = self.x_col if self.x_col in columns else plot[0] if plot[0] in columns else headers[0]
-        y = (self.y_col if self.y_col in columns else plot[1] if len(plot) > 1 and plot[1] in columns
-             else headers[1 if len(headers) > 1 else 0])
-        w.seq += 1
-        w.loaded = (path, mtime, self.x_col, self.y_col)
-        self.shown = {"name": name, "x_col": x, "y_col": y, "n": int(len(columns[x])), "seq": w.seq,
-                      "x": plotting.pack_floats(columns[x]), "y": plotting.pack_floats(columns[y])}
-        self.problem = ""
+
+        # Columns: the script's choices (those this run has), or every number column.
+        headers = read[-1][2]
+        mine_x = [c for c in plot["x"] if c in headers]
+        mine_y = [c for c in plot["y"] if c in headers]
+        x_choices = headers if self.all_columns or not mine_x else mine_x
+        y_choices = headers if self.all_columns or not mine_y else mine_y
+        x = self.x_col if self.x_col in x_choices else (mine_x or headers)[0]
+        y = (self.y_col if self.y_col in y_choices else mine_y[0] if mine_y
+             else next((c for c in headers if c != x), headers[0]))
+        series = []
+        for name, latest, _h, columns in read:
+            if x in columns and y in columns:
+                w.seq += 1
+                series.append({"name": name, "label": run_label(name, labels), "latest": latest,
+                               "n": int(len(columns[x])), "seq": w.seq,
+                               "x": plotting.pack_floats(columns[x]), "y": plotting.pack_floats(columns[y])})
+            else:
+                problems.append(f"{name} has no {x if x not in columns else y}")
+        if dropped:
+            problems.append(f"showing {GRAPH_MAX_SERIES} runs at most")
+        w.key = key
+        self.x_choices, self.y_choices = list(x_choices), list(y_choices)
+        self.shown = {"x_col": x, "y_col": y, "x_label": plot["labels"].get(x, x),
+                      "y_label": plot["labels"].get(y, y), "series": series}
+        self.problem = "; ".join(problems)
 
     def _set_problem(self, text):
-        self.problem, self.shown, self.columns = text, None, []
-        self._watch.loaded = None
+        self.problem, self.shown = text, None
+        self._watch.key = None
 
     # --- Choosing what to show (inspector) ----------------------------------------------
-    def choose_dataset(self, app, name):
-        self.dataset = name
+    def toggle_run(self, app, name):
+        pinned = list(self.pinned)
+        if name in pinned:
+            pinned.remove(name)
+        else:
+            pinned.append(name)
+        self.pinned = pinned
         self.recheck()
         app.save()
 
-    def step_dataset(self, app, direction):
-        names = [""] + [d[0] for d in self.datasets]
-        i = names.index(self.dataset) if self.dataset in names else 0
-        self.choose_dataset(app, names[(i + direction) % len(names)])
+    def toggle_latest(self, app):
+        self.latest = not self.latest
+        self.recheck()
+        app.save()
+
+    def only_latest(self, app):
+        self.pinned, self.latest = [], True
+        self.recheck()
+        app.save()
 
     def step_column(self, app, which, direction):
-        if not self.columns:
+        choices = self.x_choices if which == "x_col" else self.y_choices
+        if not choices:
             return
         current = (self.shown or {}).get(which) or getattr(self, which)
-        i = self.columns.index(current) if current in self.columns else -1
-        setattr(self, which, self.columns[(i + direction) % len(self.columns)])
+        i = choices.index(current) if current in choices else -1
+        setattr(self, which, choices[(i + direction) % len(choices)])
         self.recheck()
         app.save()
 
@@ -1027,60 +1124,91 @@ class Graph(YScale, Thing):
         def submit(text):
             if text.strip():
                 self.folder = text.strip()
-                self.dataset = ""                  # a new folder starts on its latest run
+                self.pinned, self.latest = [], True     # a new folder starts on its latest run
                 self.recheck()
                 app.save()
         app.ask("Folder of CSV files (relative to the app's folder, or a full path):", submit, value=self.folder)
 
+    def series(self):
+        return (self.shown or {}).get("series") or []
+
     def state_rows(self, app):
         shown = self.shown or {}
-        latest = self.datasets[0][0] if self.datasets else "—"
-        dataset = f"Latest ({latest})" if not self.dataset else self.dataset
         runs = self.source_runs()
-        rows = [Row("Folder", runs["label"] if runs else self.folder, on_click=None if runs else self.edit_folder),
-                Stepper("Dataset", dataset, lambda app: self.step_dataset(app, -1),
-                        lambda app: self.step_dataset(app, +1), down_enabled=bool(self.datasets),
-                        up_enabled=bool(self.datasets))]
-        if self.columns:
-            rows += [Stepper("X", shown.get("x_col", "—"), lambda app: self.step_column(app, "x_col", -1),
-                             lambda app: self.step_column(app, "x_col", +1)),
-                     Stepper("Y", shown.get("y_col", "—"), lambda app: self.step_column(app, "y_col", -1),
-                             lambda app: self.step_column(app, "y_col", +1))]
+        rows = [Row("Folder", runs["label"] if runs else self.folder, on_click=None if runs else self.edit_folder)]
+        series = self.series()
+        if series:
+            names = ", ".join(s["label"] + (" (latest)" if s["latest"] else "") for s in series)
+            rows.append(Row("Showing", names))
         if shown:
-            rows.append(Row("Points", str(shown.get("n", 0))))
+            rows += [Stepper("X", shown.get("x_label") or shown.get("x_col", "—"),
+                             lambda app: self.step_column(app, "x_col", -1),
+                             lambda app: self.step_column(app, "x_col", +1),
+                             down_enabled=len(self.x_choices) > 1, up_enabled=len(self.x_choices) > 1),
+                     Stepper("Y", shown.get("y_label") or shown.get("y_col", "—"),
+                             lambda app: self.step_column(app, "y_col", -1),
+                             lambda app: self.step_column(app, "y_col", +1),
+                             down_enabled=len(self.y_choices) > 1, up_enabled=len(self.y_choices) > 1)]
         if self.problem:
-            rows.append(Field("Nothing to show", self.problem, color=WARN_COLOR))
+            rows.append(Field("Note" if series else "Nothing to show", self.problem, color=WARN_COLOR))
         return rows
 
     def more_sections(self, app):
-        items = [("Latest — follows new runs", "shown" if not self.dataset else "",   # (the font has no ✓)
-                  lambda app: self.choose_dataset(app, ""))]
-        items += [(name, "shown" if name == self.dataset else when,
-                   lambda app, n=name: self.choose_dataset(app, n)) for name, when in self.datasets]
-        return [Section("Datasets", [ScrollList("In this folder, newest first", items,
+        shown = {s["name"] for s in self.series()}
+        items = [("Latest — follows new runs", "on" if self.latest else "off", self.toggle_latest)]
+        items += [(label or name, "shown" if name in self.pinned else when,
+                   lambda app, n=name: self.toggle_run(app, n)) for name, when, label in self.datasets]
+        hint = "click a run to add / remove it" if shown else "click a run to show it"
+        return [Section("Datasets", [ScrollList(f"Newest first — {hint}", items,
                                                 empty="— (no CSV files)", key=self)])]
 
+    def actions(self, app):
+        return [Btn("Only latest", self.only_latest)] if self.pinned or not self.latest else []
+
     def panel_status(self, app):
+        series = self.series()
+        if series:
+            points = sum(s["n"] for s in series)
+            return (f"{len(series)} runs, {points} points" if len(series) > 1 else f"{points} points"), (120, 200, 150)
         if self.problem:
             return self.problem, WARN_COLOR
-        if self.shown:
-            return f"{self.shown['n']} points", (120, 200, 150)
         return "loading…", (150, 152, 166)
 
     # --- Drawing ------------------------------------------------------------------------
     def data(self):
-        """(key, xs, ys) of what's shown, decoded once per new load; or None."""
-        shown = self.shown
-        if not shown:
+        """[(key, label, latest, xs, ys)] for the series shown, each decoded once per new load."""
+        out = []
+        for s in self.series():
+            cached = self._decoded.get(s["name"])
+            if cached is None or cached[0] != s.get("seq"):
+                try:
+                    cached = (s.get("seq"), plotting.unpack_floats(s["x"]), plotting.unpack_floats(s["y"]))
+                except (ValueError, KeyError, TypeError):
+                    continue
+                self._decoded[s["name"]] = cached
+            out.append(((s["name"], cached[0]), s["label"], s["latest"], cached[1], cached[2]))
+        if len(self._decoded) > 2 * GRAPH_MAX_SERIES:      # forget runs no longer shown
+            keep = {s["name"] for s in self.series()}
+            self._decoded = {k: v for k, v in self._decoded.items() if k in keep}
+        return out
+
+    def auto_y_range(self):
+        """The y range fitted to all the runs shown, in the data's units."""
+        ys = [self._plot_ys(y)[np.isfinite(self._plot_xs(x))] for _k, _l, _t, x, y in self.data()]
+        if not ys:
             return None
-        key = (shown.get("name"), shown.get("seq"), shown.get("x_col"), shown.get("y_col"))
-        if self._decoded is None or self._decoded[0] != key:
-            try:
-                xs, ys = plotting.unpack_floats(shown["x"]), plotting.unpack_floats(shown["y"])
-            except (ValueError, KeyError, TypeError):
-                return None
-            self._decoded = (key, xs, ys)
-        return self._decoded
+        fitted = plotting.data_range(np.concatenate(ys), self.log_y)
+        if fitted is None:
+            return None
+        return (10 ** fitted[0], 10 ** fitted[1]) if self.log_y else fitted
+
+    def _plot_xs(self, xs):
+        """x values on the plot's scale: log10 of the positive ones on a log axis."""
+        return np.where(xs > 0, np.log10(np.where(xs > 0, xs, 1.0)), np.nan) if self.log_x else xs
+
+    def _plot_ys(self, ys):
+        """y values on the plot's scale: log10 of the positive ones on a log axis."""
+        return np.where(ys > 0, np.log10(np.where(ys > 0, ys, 1.0)), np.nan) if self.log_y else ys
 
     def draw_shape(self, surface, rect, camera):
         s = min(rect.width, rect.height)
@@ -1094,14 +1222,16 @@ class Graph(YScale, Thing):
         header_h = round(s * 0.1)
         seen = surface.get_clip()
         size = round(header_h * 0.8)
+        series = self.series()
         if size >= 8 and seen.colliderect((rect.x, rect.y, rect.width, pad + header_h)):
             font = get_font(size, "bahnschrift")
             title = self.text or "Graph"
             ts = font.render(clip_text(title, font, rect.width // 2), True, (200, 204, 218))
             surface.blit(ts, (rect.x + pad, rect.y + pad + (header_h - ts.get_height()) // 2))
-            if self.shown:                       # which run it is, on the right
+            if series:                           # which run(s), on the right
                 small = get_font(max(8, round(size * 0.75)), "bahnschrift")
-                name = ("latest · " if not self.dataset else "") + os.path.splitext(self.shown["name"])[0]
+                name = (("latest · " if series[0]["latest"] else "") + series[0]["label"] if len(series) == 1
+                        else f"{len(series)} runs")
                 ns = small.render(clip_text(name, small, rect.width - ts.get_width() - 4 * pad), True, (110, 116, 130))
                 surface.blit(ns, ns.get_rect(midright=(rect.right - pad, rect.y + pad + header_h // 2)))
         screen = pygame.Rect(rect.x + pad, rect.y + pad + header_h, rect.width - 2 * pad,
@@ -1119,7 +1249,7 @@ class Graph(YScale, Thing):
         font_size = round(inner.height * 0.06)
         labels = font_size >= 8
         data = self.data()
-        if data is None:
+        if not data:
             size = round(inner.height * 0.08)
             if size >= 8:
                 font = get_font(size, "bahnschrift")
@@ -1127,21 +1257,21 @@ class Graph(YScale, Thing):
                 ts = font.render(clip_text(text, font, inner.width), True, (90, 96, 110))
                 surface.blit(ts, ts.get_rect(center=inner.center))
             return
-        _key, xs, ys = data
         shown = self.shown
         # Log axes: plot log10 of the positive values (the rest can't be shown).
-        px, py = self._plot_xs(xs), self._plot_ys(ys)
-        x_range = plotting.data_range(px[np.isfinite(py)], self.log_x)   # points with both: a run filling in
+        plotted = [(key, label, self._plot_xs(xs), self._plot_ys(ys)) for key, label, _l, xs, ys in data]
+        both = [px[np.isfinite(py)] for _k, _l, px, py in plotted]           # points with both: a run filling in
+        x_range = plotting.data_range(np.concatenate(both), self.log_x) if both else None
         y_range = self.y_range(self.auto_y_range())             # fitted, or the fixed one
         if y_range is not None and self.log_y:                  # the plot's scale is log10
-            fitted = plotting.data_range(py, True)
+            fitted = plotting.data_range(np.concatenate([py for *_r, py in plotted]), True)
             y_range = (math.log10(y_range[0]) if y_range[0] > 0 else (fitted or (0, 1))[0],
                        math.log10(y_range[1]) if y_range[1] > 0 else (fitted or (0, 1))[1])
             if y_range[1] <= y_range[0]:
                 y_range = (y_range[0], y_range[0] + 1.0)
         font = get_font(font_size, "bahnschrift") if labels else None
 
-        # Margins for the labels: y tick labels on the left, x ticks + the x column's name below.
+        # Margins for the labels: y tick labels on the left, x ticks + the x axis's name below.
         if labels:
             left = font.size("-0.0000")[0] + font_size
             bottom = round(font_size * 2.6)
@@ -1154,11 +1284,13 @@ class Graph(YScale, Thing):
             return                                            # too small to read: a blank screen
         if x_range is None or y_range is None:
             if labels:
-                waiting = (shown["y_col"] if not np.isfinite(ys).any() else
-                           shown["x_col"] if not np.isfinite(xs).any() else None)   # a column still empty
-                ts = font.render(f"no {waiting} yet" if waiting else
-                                 f"no {'positive ' if self.log_x or self.log_y else ''}values to show",
-                                 True, (90, 96, 110))
+                xs_all = np.concatenate([d[3] for d in data])
+                ys_all = np.concatenate([d[4] for d in data])
+                waiting = (shown["y_label"] if not np.isfinite(ys_all).any() else
+                           shown["x_label"] if not np.isfinite(xs_all).any() else None)   # a column still empty
+                ts = font.render(clip_text(f"no {waiting} yet" if waiting else
+                                           f"no {'positive ' if self.log_x or self.log_y else ''}values to show",
+                                           font, plot.width), True, (90, 96, 110))
                 surface.blit(ts, ts.get_rect(center=plot.center))
             return
         vis = plot.clip(surface.get_clip())
@@ -1181,10 +1313,15 @@ class Graph(YScale, Thing):
                 pygame.draw.line(surface, GRAPH_GRID, (plot.x + 1, y), (plot.right - 2, y))
 
         if vis.width > 0 and vis.height > 0:
-            sorted_x = len(px) > 1 and bool(np.all(np.diff(px[np.isfinite(px)]) >= 0))
-            surf = self._curve.get((_key, self.log_x, self.log_y), plot, vis, px, py, x_range, y_range,
-                                   color=tuple(self.color), style=self.style, sorted_x=sorted_x)
-            surface.blit(surf, vis.topleft)
+            while len(self._curves) < len(plotted):
+                self._curves.append(plotting.CurveImage())
+            for i, (key, _label, px, py) in enumerate(plotted):
+                finite = px[np.isfinite(px)]
+                sorted_x = len(finite) > 1 and bool(np.all(np.diff(finite) >= 0))
+                surf = self._curves[i].get((key, self.log_x, self.log_y), plot, vis, px, py, x_range, y_range,
+                                           color=GRAPH_PALETTE[i % len(GRAPH_PALETTE)], style=self.style,
+                                           sorted_x=sorted_x)
+                surface.blit(surf, vis.topleft)
 
         if not labels:
             return
@@ -1197,7 +1334,7 @@ class Graph(YScale, Thing):
                 r = ts.get_rect(midtop=(x, plot.bottom + font_size // 3))
                 r.clamp_ip(pygame.Rect(inner.x, r.y, inner.width, r.height))
                 surface.blit(ts, r)
-            ts = font.render(clip_text(shown["x_col"] + ("  (log)" if self.log_x else ""), font, plot.width),
+            ts = font.render(clip_text(shown["x_label"] + ("  (log)" if self.log_x else ""), font, plot.width),
                              True, (110, 116, 130))
             surface.blit(ts, ts.get_rect(midbottom=(plot.centerx, inner.bottom)))
         if seen.colliderect((inner.x, plot.y, left, plot.height)):
@@ -1208,9 +1345,53 @@ class Graph(YScale, Thing):
                 r = ts.get_rect(midright=(plot.x - font_size // 2, y))
                 r.clamp_ip(pygame.Rect(r.x, inner.y, r.width, inner.height))
                 surface.blit(ts, r)
-        name = font.render(clip_text(shown["y_col"] + ("  (log)" if self.log_y else ""), font, plot.width - 8),
+        name = font.render(clip_text(shown["y_label"] + ("  (log)" if self.log_y else ""), font, plot.width - 8),
                            True, (110, 116, 130))
-        surface.blit(name, (plot.x + 4, plot.y + 2))           # the y column's name, top-left inside
+        surface.blit(name, (plot.x + 4, plot.y + 2))           # the y axis's name, top-left inside
+        if len(plotted) > 1:
+            points = [(to_x(px), to_y(py)) for _k, _l, pxs, pys in plotted
+                      for px, py in zip(pxs.tolist(), pys.tolist()) if px == px and py == py]
+            self._draw_legend(surface, plot, [(label, latest) for _k, label, latest, _x, _y in data], font_size,
+                              points, name.get_height() + 4)
+
+    def _draw_legend(self, surface, plot, entries, font_size, points, below_name):
+        """A color swatch and each run's label (as many as fit), in the plot's
+        corner with the fewest points under it: top right, top left (under the
+        y axis's name) or bottom right."""
+        size = max(8, round(font_size * 0.9))
+        font = get_font(size, "bahnschrift")
+        line = round(size * 1.3)
+        room = max(0, (plot.height - 2 * line) // line)
+        if not room:
+            return
+        texts = [label + (" (latest)" if latest else "") for label, latest in entries[:room]]
+        swatch = round(size * 1.2)
+        width = min(plot.width // 2, max(font.size(t)[0] for t in texts) + swatch + size)
+        box = pygame.Rect(0, 0, width + size, line * len(texts) + size // 2)
+        corners = []
+        for place, at in (("topright", (plot.right - 4, plot.y + 4)),
+                          ("topleft", (plot.x + 4, plot.y + below_name)),
+                          ("bottomright", (plot.right - 4, plot.bottom - 4))):
+            r = box.copy()
+            setattr(r, place, at)
+            if plot.contains(r):
+                corners.append((sum(1 for p in points if r.collidepoint(p)), len(corners), r))
+        if not corners:
+            return
+        box = min(corners)[2]                          # fewest points hidden (ties: the order above)
+        layer, area = alpha_layer(surface, box)
+        if layer is not None:
+            layer.fill((10, 12, 16, 200))
+            surface.blit(layer, area)
+        y = box.y + size // 4
+        for i, text in enumerate(texts):
+            color = GRAPH_PALETTE[i % len(GRAPH_PALETTE)]
+            cy = y + line // 2
+            pygame.draw.line(surface, color, (box.x + size // 2, cy), (box.x + size // 2 + swatch, cy), 3)
+            pygame.draw.circle(surface, color, (box.x + size // 2 + swatch // 2, cy), max(2, size // 5))
+            ts = font.render(clip_text(text, font, width - swatch - size // 2), True, (190, 196, 210))
+            surface.blit(ts, ts.get_rect(midleft=(box.x + size + swatch, cy)))
+            y += line
 
 
 # ---- Script: run an experiment script from the canvas ------------------------

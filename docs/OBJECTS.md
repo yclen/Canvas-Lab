@@ -40,29 +40,37 @@
   **Readout**, an LED display — seven-segment digits with unlit "ghost" segments, a unit
   beside them (free text: mW, ms, V, …), decimals, digit slots, color, size, and the object's
   name printed on the bezel. Dashes when unlinked
-- **Graph** (E menu ▸ Displays): one column of a data file against another. Link its **Runs from**
-  input to a Script's `runs` (a thick blue wire, flowing while the script runs): it then shows that
-  script's folder; on Latest it follows the run the script is writing, point by point, and starts on
-  the script's suggested columns (power_mW vs count_rate for the sweep) until you step X / Y; a
-  column the run hasn't reached yet shows "no count_rate yet", and the axes fit only the points
-  that have both values so far. Unlinked, it uses Settings ▸ **Data
-  folder** (relative to the app's folder or a full path; default `experiments/detector_sweep`):
-  its CSV files are the datasets, newest first (the panel's *Datasets* list, and a Dataset
-  stepper). **Latest** (the default) follows new runs: a new file shows as soon as it appears,
-  and a file being rewritten — a script saving after every point — redraws as it grows (the
-  world checks the folder once a second). Or pick any earlier run. X / Y steppers pick the
-  columns (number columns only: `#` lines are comments, text or blank cells are gaps); log x /
-  log y (non-positive values left out), draw both / lines / points, color. **Auto-scale y** (on
-  by default) fits the y axis to the data; switching it off freezes the axis where it is, into
-  **Y from / Y to** (data units, also on a log axis), and typing either switches it off — so the
-  axis holds while new runs come in (the `YScale` add-on, shared with the Spectrometer). The **world** reads
-  the file — on the PC that has it — and sends players the two columns packed as float32 in
-  `shown` (plain attributes reach players by themselves; its bookkeeping, `_watch`, isn't plain,
-  so it stays put); nothing is saved with the canvas. Drawing uses the shared plotter
-  (`plotting.py`, also the Spectrometer's): a cached image, one column per pixel, so zoom
-  decides the detail — each column's range for dense sorted data, every point joined (gaps at
-  blanks) once they're apart; tick labels 1-2-5 on linear axes, decades (plus 2s and 5s when
-  there's room) on log axes; blank when too small.
+- **Graph** (E menu ▸ Displays): one column of a data folder's runs against another — one run, or
+  several overlaid. Link its **Runs from** input to a Script's `runs` (a thick blue wire, flowing
+  while the script runs) to show that script's folder; unlinked, it uses Settings ▸ **Data
+  folder** (relative to the app's folder or a full path; default `experiments/detector_sweep`).
+  The folder's CSV files are its runs, newest first, in the panel's **Datasets** list: click a run
+  to add it to the graph (next color in a fixed 8-color palette, a line in the legend), click
+  again to take it off; up to 8 at once. **Latest** (on by default, toggled from the same list)
+  shows the newest run too — while a linked Script runs, the run it's writing, growing point by
+  point — so a pinned 500 nm run and a live 600 nm run can be watched together. *Only latest*
+  (a button) goes back. Saved: `latest` and `pinned` (file names); older saves' single `dataset`
+  converts (`migrate`).
+  **Columns:** a script declares what to plot (`plot={"x": [...], "y": [...], "labels": {...}}`
+  in `canvas_run.start`), and the helper writes it to the folder's `canvas.json` (with each run's
+  legend label from `dataset(path, label=…)`, e.g. "550 nm · sampleA") — so it covers old runs and
+  unlinked graphs. X / Y cycle only those columns (the sweep: power; count rate ↔ voltage), and the
+  axes use their names; Settings ▸ **All columns** offers every number column (`#` lines are
+  comments, text cells left out, blank cells gaps; an all-blank column stays, for a run filling it
+  in: "no count rate yet"). No `canvas.json`: every column, file names as labels (the date_time
+  stamp trimmed). The legend sits in whichever corner (top right, top left, bottom right) hides
+  the fewest points.
+  The axes fit the points that have both values (all runs shown); log x / log y (non-positive
+  values left out), draw both / lines / points. **Auto-scale y** (on by default) fits the y axis
+  to the data; switching it off freezes the axis where it is, into **Y from / Y to** (data units,
+  also on a log axis), and typing either switches it off (the `YScale` add-on, shared with the
+  Spectrometer). The **world** reads the files — on the PC that has them, each re-read only when it
+  changes — and sends players each run's two columns packed as float32 in `shown["series"]`
+  (plain attributes reach players by themselves; its bookkeeping, `_watch`, isn't plain, so it
+  stays put); nothing is saved with the canvas. Drawing uses the shared plotter (`plotting.py`,
+  also the Spectrometer's): a cached image per run, one column per pixel, so zoom decides the
+  detail; tick labels 1-2-5 on linear axes, decades (plus 2s and 5s when there's room) on log
+  axes; blank when too small.
 
 ---
 
@@ -181,7 +189,7 @@
   without reporting shows "ended unexpectedly". Outputs `running` (1/0), `progress` (0–1). The
   pulsing badge runs on the world clock, so nothing changes per frame for the world to resend.
   **`runs`** (a data output): the script's data folder, this object's current / last dataset,
-  whether it's running and the columns the script suggests (`plot` in `canvas_run.start`) —
+  whether it's running and the columns the script declares (`plot` in `canvas_run.start`) —
   link it to a Graph's *Runs from*.
 
 ---

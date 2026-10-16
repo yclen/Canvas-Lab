@@ -580,7 +580,7 @@ Real hardware runs outside the canvas. Each device type's canvas object is descr
   `--canvas-run STATUS.json` makes it write state / progress / dataset there and treat
   `STATUS.json.stop` as Stop. From a terminal it all does nothing. Each script's runs go to
   `experiments/<name>/`, one CSV per run — a Graph's datasets. `detector_power_sweep.py` is the
-  first (plot defaults: power_mW vs count_rate). The **Script** object (OBJECTS.md, *Data*) runs
+  first (it declares x = power, y = count rate or voltage, and labels each run with its wavelength and --name; both go to the folder's `canvas.json` for Graphs). The **Script** object (OBJECTS.md, *Data*) runs
   them from the canvas: inputs as panel rows, RUN / STOP, progress; its `runs` data output links
   to Graphs (the latest run, followed live while it runs).
 

@@ -66,6 +66,10 @@ import canvas_run                                                               
 import power_to_position                                                          # noqa: E402
 
 DATA_FOLDER = "detector_sweep"                  # experiments/detector_sweep/: one run per CSV
+PLOT = {"x": ["power_mW"],                      # what a Graph offers: x / y choices and axis names
+        "y": ["count_rate", "voltage_V"],
+        "labels": {"power_mW": "power (mW)", "count_rate": "count rate (counts/s)",
+                   "voltage_V": "voltage (V)"}}
 OUT_DIR = os.path.join(canvas_run.EXPERIMENTS, DATA_FOLDER)
 BAND_TIMEOUT_S = 60.0
 BAND_TOL_NM = 1.0
@@ -349,7 +353,7 @@ def main():
                         "before (default 1)")
     p.add_argument("--leave-laser-on", action="store_true", help="don't turn emission off at the end")
     p.add_argument("--home", action="store_true", help="home the ND stage first")
-    job = canvas_run.start(p, data_folder=DATA_FOLDER, plot=("power_mW", "count_rate"))
+    job = canvas_run.start(p, data_folder=DATA_FOLDER, plot=PLOT)
     args = job.args
     if args.points < 2:
         p.error("--points must be at least 2")
@@ -438,7 +442,8 @@ def measure(client, args):
                 "spacing_slope_dex_per_mm": power_to_position.SLOPE if args.spacing == "power" else None}
     warmup = []
     rows = [{"index": i, "target_mm": x} for i, x in enumerate(positions, 1)]
-    canvas_run.dataset(base + ".csv")                    # this run's dataset (written after each point)
+    canvas_run.dataset(base + ".csv",                    # this run's dataset (written after each point),
+                       label=f"{args.wavelength:g} nm" + (f" · {args.name}" if args.name else ""))   # its legend
     total = 2 * len(rows)                                # a power pass, then a detector pass
     print(f"{args.points} points, {args.start:g} → {args.stop:g} mm ({args.spacing} spacing)")
     print(f"Writing {os.path.relpath(base, ROOT)}.xlsx / .csv / .png\n")

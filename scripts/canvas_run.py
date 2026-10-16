@@ -8,11 +8,13 @@ the parser to start() instead of calling parse_args(), and reports as it goes:
     p = argparse.ArgumentParser(description="…")
     p.add_argument("--wavelength", type=float, required=True, help="nm")
     …
-    run = canvas_run.start(p, data_folder="detector_sweep", plot=("power_mW", "count_rate"))
+    run = canvas_run.start(p, data_folder="detector_sweep",
+                           plot={"x": ["power_mW"], "y": ["count_rate", "voltage_V"],
+                                 "labels": {"power_mW": "power (mW)", "count_rate": "count rate (counts/s)"}})
     args = run.args
     out_dir = canvas_run.data_folder("detector_sweep")      # experiments/detector_sweep/
     …
-    run.dataset(csv_path)                     # the file this run writes (a Graph shows it)
+    run.dataset(csv_path, label=f"{args.wavelength:g} nm")  # this run's file, and its legend name
     for i, x in enumerate(points, 1):
         canvas_run.check_stop()               # raises canvas_run.Stopped if Stop was pressed
         …measure…
@@ -34,11 +36,20 @@ exit hook records it as failed, with the error that ended it if there was one.
 
 Data folders: every script writes its runs to experiments/<name>/ — one CSV per
 run, named with when it started — so a Graph can list them and follow the latest.
+Next to them, canvas.json says how to graph them (written by start() and
+dataset(), from a terminal run too, so it covers old runs and unlinked graphs):
+
+    {"plot": {"x": [columns for x], "y": [columns for y], "labels": {column: "axis name"}},
+     "runs": {"<file>.csv": "<legend label>"}}
+
+A Graph cycles only those x / y columns (it can show all of them too) and names
+the axes and the legend with the labels.
 """
 
 import argparse
 import atexit
 import json
+import threading
 import os
 import sys
 import time
@@ -48,6 +59,46 @@ from datetime import datetime
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 EXPERIMENTS = os.path.join(ROOT, "experiments")
 WRITE_EVERY_S = 0.25        # progress is written at most this often (the end is always written)
+
+
+FOLDER_FILE = "canvas.json"
+_folder_lock = threading.Lock()
+
+
+def plot_spec(plot):
+    """A script's plot= as {"x": [...], "y": [...], "labels": {...}}; an (x, y)
+    pair is one choice each; None stays None."""
+    if not plot:
+        return None
+    if isinstance(plot, dict):
+        listed = lambda v: [v] if isinstance(v, str) else list(v or [])   # noqa: E731
+        return {"x": listed(plot.get("x")), "y": listed(plot.get("y")), "labels": dict(plot.get("labels") or {})}
+    x, y = plot
+    return {"x": [x], "y": [y], "labels": {}}
+
+
+def update_folder_file(folder, **changes):
+    """Merge changes into <folder>/canvas.json ("plot" replaces; "runs" adds).
+    Never fails a run: a problem here only costs the Graph its hints."""
+    path = os.path.join(folder, FOLDER_FILE)
+    with _folder_lock:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        if "plot" in changes:
+            data["plot"] = changes["plot"]
+        if "runs" in changes:
+            data["runs"] = dict(data.get("runs") or {}, **changes["runs"])
+        try:
+            os.makedirs(folder, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=1)
+            os.replace(tmp, path)
+        except OSError:
+            pass
 
 
 class Stopped(Exception):
@@ -80,15 +131,16 @@ def describe(parser, data_folder=None, plot=None):
                        "choices": list(action.choices) if action.choices else None,
                        "help": (action.help or "").replace("%%", "%")})
     return {"description": parser.description or "", "inputs": inputs,
-            "data_folder": data_folder, "plot": list(plot) if plot else None}
+            "data_folder": data_folder, "plot": plot_spec(plot)}
 
 
 class Run:
     """One run of a script. Without --canvas-run, a quiet stand-in."""
 
-    def __init__(self, args, status_path=None):
+    def __init__(self, args, status_path=None, folder=None):
         self.args = args
         self.path = status_path
+        self.folder = folder                   # experiments/<name>/, if the script said
         self.status = {"state": "running", "pid": os.getpid(),
                        "started": datetime.now().isoformat(sep=" ", timespec="seconds"),
                        "progress": None, "stage": "", "dataset": None, "message": ""}
@@ -129,9 +181,14 @@ class Run:
             pass                               # the canvas can't see it this time; next write
 
     # --- What a script calls ------------------------------------------------------
-    def dataset(self, path):
-        """The file this run writes (a Graph following the latest run shows it)."""
+    def dataset(self, path, label=None):
+        """The file this run writes (a Graph following the latest run shows it),
+        and its name in a Graph's legend (e.g. "550 nm · sampleA")."""
         self.status["dataset"] = os.path.abspath(path)
+        if label:
+            self.status["label"] = label
+            update_folder_file(os.path.dirname(os.path.abspath(path)),
+                               runs={os.path.basename(path): str(label)})
         self._write(force=True)
 
     def progress(self, done, total=None, stage=None):
@@ -187,12 +244,15 @@ def start(parser, data_folder=None, plot=None):
         print(json.dumps(describe(parser, data_folder, plot)))
         sys.exit(0)
     args = parser.parse_args()
-    _run = Run(args, args.canvas_run)
+    folder = os.path.join(EXPERIMENTS, data_folder) if data_folder else None
+    if folder and plot:
+        update_folder_file(folder, plot=plot_spec(plot))
+    _run = Run(args, args.canvas_run, folder)
     return _run
 
 
-def dataset(path):
-    _run.dataset(path)
+def dataset(path, label=None):
+    _run.dataset(path, label)
 
 
 def progress(done, total=None, stage=None):
