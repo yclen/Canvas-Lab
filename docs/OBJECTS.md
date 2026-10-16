@@ -40,6 +40,24 @@
   **Readout**, an LED display — seven-segment digits with unlit "ghost" segments, a unit
   beside them (free text: mW, ms, V, …), decimals, digit slots, color, size, and the object's
   name printed on the bezel. Dashes when unlinked
+- **Graph** (E menu ▸ Displays): one column of a data file against another. Settings ▸ **Data
+  folder** (relative to the app's folder or a full path; default `experiments/detector_sweep`):
+  its CSV files are the datasets, newest first (the panel's *Datasets* list, and a Dataset
+  stepper). **Latest** (the default) follows new runs: a new file shows as soon as it appears,
+  and a file being rewritten — a script saving after every point — redraws as it grows (the
+  world checks the folder once a second). Or pick any earlier run. X / Y steppers pick the
+  columns (number columns only: `#` lines are comments, text or blank cells are gaps); log x /
+  log y (non-positive values left out), draw both / lines / points, color. **Auto-scale y** (on
+  by default) fits the y axis to the data; switching it off freezes the axis where it is, into
+  **Y from / Y to** (data units, also on a log axis), and typing either switches it off — so the
+  axis holds while new runs come in (the `YScale` add-on, shared with the Spectrometer). The **world** reads
+  the file — on the PC that has it — and sends players the two columns packed as float32 in
+  `shown` (plain attributes reach players by themselves; its bookkeeping, `_watch`, isn't plain,
+  so it stays put); nothing is saved with the canvas. Drawing uses the shared plotter
+  (`plotting.py`, also the Spectrometer's): a cached image, one column per pixel, so zoom
+  decides the detail — each column's range for dense sorted data, every point joined (gaps at
+  blanks) once they're apart; tick labels 1-2-5 on linear axes, decades (plus 2s and 5s when
+  there's room) on log axes; blank when too small.
 
 ---
 
@@ -446,4 +464,6 @@ Each one is a Device object for one driver in `drivers/`; how devices connect is
   draw their lowest-to-highest value, so a narrow line never drops out; once points are > 1.5 px
   apart they're joined, with dots from 8 px; a plot under 48 px wide is a blank screen. Under the
   curve, a fill in each column's wavelength color, over a rainbow strip on the axis; a marker
-  and label at the peak, SATURATED in the corner. Off-screen parts (zoomed far in) skip their text.
+  and label at the peak, SATURATED in the corner. **Auto-scale y** on (default): the axis fits
+  each scan (0 to a little over its top); off: it freezes there (Y from / Y to, editable), so
+  a growing or fading signal can be watched on a steady scale. Off-screen parts (zoomed far in) skip their text.

@@ -53,9 +53,11 @@ import pygame
 
 import expressions
 import instruments
-from canvas import (OBJECT_TYPES, SAVES_DIR, WARN_COLOR, Btn, Field, Give, Prop, Row, Section,
-                    Take, Thing, alpha_layer, clip_text, draw_arc, draw_rect, font_px, format_value, get_font,
+import plotting
+from canvas import (OBJECT_TYPES, SAVES_DIR, WARN_COLOR, Btn, Field, Give, Prop, Row, ScrollList, Section,
+                    Stepper, Take, Thing, alpha_layer, clip_text, draw_arc, draw_rect, font_px, format_value, get_font,
                     panel_button, run_action, short_name)
+from plotting import nice_step
 from world_link import world_time
 
 
@@ -752,6 +754,432 @@ class Readout(Output):
             if layer is not None:
                 layer.fill((255, 255, 255, 14))
                 surface.blit(layer, area)
+
+
+# ---- Graph: one column of a data file against another ------------------------
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+GRAPH_BODY = (32, 34, 42)
+GRAPH_SCREEN = (8, 10, 14)
+GRAPH_GRID = (28, 34, 46)
+GRAPH_INK = (140, 146, 160)
+GRAPH_CHECK_SECONDS = 1.0        # how often it looks for new / rewritten files
+GRAPH_MAX_ROWS = 200_000         # rows read from one file
+
+
+def resolve_folder(folder):
+    """A data folder as typed: absolute, or relative to the app's folder."""
+    folder = os.path.expanduser(str(folder or "").strip())
+    return os.path.normpath(folder if os.path.isabs(folder) else os.path.join(APP_DIR, folder))
+
+
+def list_datasets(folder):
+    """[(file name, path, modified time)] of the CSV files in folder, newest first."""
+    out = []
+    for name in os.listdir(folder):
+        path = os.path.join(folder, name)
+        if name.lower().endswith(".csv") and os.path.isfile(path):
+            out.append((name, path, os.path.getmtime(path)))
+    return sorted(out, key=lambda f: f[2], reverse=True)
+
+
+def read_csv_columns(path):
+    """(headers, {header: numpy array}) for a CSV's number columns: the first
+    row is the headers, lines starting with # are comments, a blank or text
+    cell is NaN, and a column with no numbers at all is left out."""
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(line for line in f if not line.lstrip().startswith("#")))
+    if not rows:
+        return [], {}
+    headers = [h.strip() or f"column {i + 1}" for i, h in enumerate(rows[0])]
+    body = rows[1:GRAPH_MAX_ROWS + 1]
+    columns = {}
+    for i, header in enumerate(headers):
+        values = []
+        for row in body:
+            cell = row[i].strip() if i < len(row) else ""
+            try:
+                values.append(float(cell) if cell else math.nan)
+            except ValueError:
+                values.append(math.nan)
+        array = np.array(values, dtype=float)
+        if np.isfinite(array).any():
+            columns[header] = array
+    return [h for h in headers if h in columns], columns
+
+
+class YScale:
+    """Auto-scale on / off for an object that plots (the Graph, the
+    Spectrometer's screen). On, the y axis fits the data; turning it off
+    freezes the axis where it is (into Y from / Y to), and typing either of
+    those turns it off too. The range is in the data's own units, also on a
+    log axis. A class using it provides auto_y_range() — (low, high) fitted
+    to the current data, or None — and calls y_scale_changed(key) from
+    on_prop_changed."""
+
+    PROPS = [Prop("autoscale", "Auto-scale y", "bool", True),
+             Prop("y_min", "Y from", "float", 0.0,
+                  prompt="Bottom of the y axis (sets auto-scale off):"),
+             Prop("y_max", "Y to", "float", 1.0,
+                  prompt="Top of the y axis (sets auto-scale off):")]
+
+    def auto_y_range(self):
+        return None
+
+    def y_range(self, auto):
+        """The y range to draw, given the one fitted to the data: that one
+        while auto-scaling, else the fixed one (in order, never empty)."""
+        if self.autoscale or auto is None and not self.y_max > self.y_min:
+            return auto
+        lo, hi = float(self.y_min), float(self.y_max)
+        if hi < lo:
+            lo, hi = hi, lo
+        if hi == lo:
+            hi = lo + (abs(lo) * 0.1 or 1.0)
+        return lo, hi
+
+    def y_scale_changed(self, key):
+        if key == "autoscale" and not self.autoscale:          # freeze where it is now
+            now = self.auto_y_range()
+            if now is not None:
+                self.y_min, self.y_max = (float(f"{v:.4g}") for v in now)
+        elif key in ("y_min", "y_max"):
+            self.autoscale = False                             # a typed range means: hold this
+
+
+class _GraphWatch:
+    """The world's bookkeeping for a Graph (not sent to players, not saved)."""
+
+    def __init__(self):
+        self.next_check = 0.0
+        self.loaded = None           # (path, modified time, x column, y column) on screen
+        self.seq = 0
+
+
+class Graph(YScale, Thing):
+    """A graph of one column of a data file against another. Point it at a
+    data folder (Settings ▸ Data folder — e.g. a script's experiments/… folder):
+    its CSV files are the datasets, newest first. "Latest" follows new runs —
+    a new file shows as soon as it appears, and a file being written (a script
+    rewrites its CSV after every point) redraws as it grows. Or pick any
+    earlier run. X / Y pick the columns (number columns only); log axes and
+    lines / points are Settings.
+
+    The world reads the file (on the PC with the data) and sends the two
+    columns to every window, packed as float32; nothing is saved with the
+    canvas — the file is read again when the world starts. Drawing uses the
+    shared plotter (plotting.py): one column per pixel, so zoom decides the
+    detail; too small to read, the screen stays blank."""
+
+    TYPE = "graph"
+    MENU_LABEL = "Add graph"
+    NAME = "Graph"
+    CATEGORY = "Displays"
+    SIZE = (440, 290)
+    DOT_COLOR = (120, 200, 255)
+    PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
+                  prompt="Size (1 = normal, 2 = twice as big):"),
+             Prop("folder", "Data folder", "str", "experiments/detector_sweep",
+                  prompt="Folder of CSV files (relative to the app's folder, or a full path):"),
+             Prop("dataset", kind="str", default="", hidden=True),     # a file name; "" = the latest
+             Prop("x_col", kind="str", default="", hidden=True),
+             Prop("y_col", kind="str", default="", hidden=True),
+             Prop("log_x", "Log x axis", "bool", False),
+             Prop("log_y", "Log y axis", "bool", False),
+             Prop("style", "Draw", "choice", "both", choices=["both", "lines", "points"]),
+             Prop("color", "Color", "color", (120, 200, 255))]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Sent to players (plain values): what's in the folder, and what's on screen.
+        self.datasets = []           # [[file name, "YYYY-MM-DD HH:MM"]], newest first
+        self.columns = []            # the shown file's number columns
+        self.shown = None            # {"name", "x_col", "y_col", "n", "x", "y", "seq"} — x / y packed
+        self.problem = ""            # why nothing is shown, if so
+        self._watch = _GraphWatch()  # the world's own (skipped when sending: not plain data)
+        self._curve = plotting.CurveImage()
+        self._decoded = None         # (key, xs, ys) of `shown`, decoded once
+
+    @classmethod
+    def icon_sample(cls):
+        sample = cls(0, 0)
+        x = np.linspace(0, 1, 40)
+        sample.shown = {"name": "", "x_col": "x", "y_col": "y", "n": 40, "seq": 0,
+                        "x": plotting.pack_floats(x), "y": plotting.pack_floats(np.exp(-3 * x) + 0.1 * x)}
+        return sample
+
+    # --- The world: watch the folder, read the file -------------------------------------
+    def on_prop_changed(self, key):
+        self.y_scale_changed(key)
+        self.recheck()
+
+    def auto_y_range(self):
+        """The y range fitted to what's shown, in the data's units."""
+        data = self.data()
+        if data is None:
+            return None
+        fitted = plotting.data_range(self._plot_ys(data[2]), self.log_y)
+        if fitted is None:
+            return None
+        return (10 ** fitted[0], 10 ** fitted[1]) if self.log_y else fitted
+
+    def _plot_ys(self, ys):
+        """y values on the plot's scale: log10 of the positive ones on a log axis."""
+        return np.where(ys > 0, np.log10(np.where(ys > 0, ys, 1.0)), np.nan) if self.log_y else ys
+
+    def recheck(self):
+        self._watch.next_check = 0.0
+        self._watch.loaded = None
+
+    def tick(self, dt):
+        w = self._watch
+        now = time.monotonic()
+        if now < w.next_check:
+            return
+        w.next_check = now + GRAPH_CHECK_SECONDS
+        folder = resolve_folder(self.folder)
+        try:
+            files = list_datasets(folder)
+        except OSError:
+            self._set_problem(f"no folder {folder}")
+            return
+        listing = [[name, datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")] for name, _p, mtime in files]
+        if listing != self.datasets:
+            self.datasets = listing
+        if not files:
+            self._set_problem("no CSV files in this folder yet")
+            return
+        names = [f[0] for f in files]
+        name, path, mtime = files[names.index(self.dataset)] if self.dataset in names else files[0]
+        if w.loaded is not None and w.loaded[:2] == (path, mtime) and w.loaded[2:] == (self.x_col, self.y_col):
+            return
+        try:
+            headers, columns = read_csv_columns(path)
+        except (OSError, UnicodeDecodeError, csv.Error) as e:
+            self._set_problem(f"can't read {name}: {e}")
+            return
+        if not columns:                       # empty, or caught mid-write: try again next check
+            if self.shown is None or self.shown.get("name") != name:
+                self._set_problem(f"no number columns in {name} (yet)")
+            return
+        if headers != self.columns:
+            self.columns = headers
+        x = self.x_col if self.x_col in columns else headers[0]
+        y = self.y_col if self.y_col in columns else headers[1 if len(headers) > 1 else 0]
+        w.seq += 1
+        w.loaded = (path, mtime, self.x_col, self.y_col)
+        self.shown = {"name": name, "x_col": x, "y_col": y, "n": int(len(columns[x])), "seq": w.seq,
+                      "x": plotting.pack_floats(columns[x]), "y": plotting.pack_floats(columns[y])}
+        self.problem = ""
+
+    def _set_problem(self, text):
+        self.problem, self.shown, self.columns = text, None, []
+        self._watch.loaded = None
+
+    # --- Choosing what to show (inspector) ----------------------------------------------
+    def choose_dataset(self, app, name):
+        self.dataset = name
+        self.recheck()
+        app.save()
+
+    def step_dataset(self, app, direction):
+        names = [""] + [d[0] for d in self.datasets]
+        i = names.index(self.dataset) if self.dataset in names else 0
+        self.choose_dataset(app, names[(i + direction) % len(names)])
+
+    def step_column(self, app, which, direction):
+        if not self.columns:
+            return
+        current = (self.shown or {}).get(which) or getattr(self, which)
+        i = self.columns.index(current) if current in self.columns else -1
+        setattr(self, which, self.columns[(i + direction) % len(self.columns)])
+        self.recheck()
+        app.save()
+
+    def edit_folder(self, app):
+        def submit(text):
+            if text.strip():
+                self.folder = text.strip()
+                self.dataset = ""                  # a new folder starts on its latest run
+                self.recheck()
+                app.save()
+        app.ask("Folder of CSV files (relative to the app's folder, or a full path):", submit, value=self.folder)
+
+    def state_rows(self, app):
+        shown = self.shown or {}
+        latest = self.datasets[0][0] if self.datasets else "—"
+        dataset = f"Latest ({latest})" if not self.dataset else self.dataset
+        rows = [Row("Folder", self.folder, on_click=self.edit_folder),
+                Stepper("Dataset", dataset, lambda app: self.step_dataset(app, -1),
+                        lambda app: self.step_dataset(app, +1), down_enabled=bool(self.datasets),
+                        up_enabled=bool(self.datasets))]
+        if self.columns:
+            rows += [Stepper("X", shown.get("x_col", "—"), lambda app: self.step_column(app, "x_col", -1),
+                             lambda app: self.step_column(app, "x_col", +1)),
+                     Stepper("Y", shown.get("y_col", "—"), lambda app: self.step_column(app, "y_col", -1),
+                             lambda app: self.step_column(app, "y_col", +1))]
+        if shown:
+            rows.append(Row("Points", str(shown.get("n", 0))))
+        if self.problem:
+            rows.append(Field("Nothing to show", self.problem, color=WARN_COLOR))
+        return rows
+
+    def more_sections(self, app):
+        items = [("Latest — follows new runs", "✓" if not self.dataset else "",
+                  lambda app: self.choose_dataset(app, ""))]
+        items += [(name, ("✓ " if name == self.dataset else "") + when,
+                   lambda app, n=name: self.choose_dataset(app, n)) for name, when in self.datasets]
+        return [Section("Datasets", [ScrollList("In this folder, newest first", items,
+                                                empty="— (no CSV files)", key=self)])]
+
+    def panel_status(self, app):
+        if self.problem:
+            return self.problem, WARN_COLOR
+        if self.shown:
+            return f"{self.shown['n']} points", (120, 200, 150)
+        return "loading…", (150, 152, 166)
+
+    # --- Drawing ------------------------------------------------------------------------
+    def data(self):
+        """(key, xs, ys) of what's shown, decoded once per new load; or None."""
+        shown = self.shown
+        if not shown:
+            return None
+        key = (shown.get("name"), shown.get("seq"), shown.get("x_col"), shown.get("y_col"))
+        if self._decoded is None or self._decoded[0] != key:
+            try:
+                xs, ys = plotting.unpack_floats(shown["x"]), plotting.unpack_floats(shown["y"])
+            except (ValueError, KeyError, TypeError):
+                return None
+            self._decoded = (key, xs, ys)
+        return self._decoded
+
+    def draw_shape(self, surface, rect, camera):
+        s = min(rect.width, rect.height)
+        radius = max(2, s // 14)
+        draw_rect(surface, (12, 12, 16), rect.move(0, max(1, s // 40)), border_radius=radius)
+        draw_rect(surface, GRAPH_BODY, rect, border_radius=radius)
+        draw_rect(surface, shade(GRAPH_BODY, 1.5), rect, width=max(1, s // 90), border_radius=radius)
+        if s < 24:
+            return
+        pad = max(2, round(s * 0.045))
+        header_h = round(s * 0.1)
+        seen = surface.get_clip()
+        size = round(header_h * 0.8)
+        if size >= 8 and seen.colliderect((rect.x, rect.y, rect.width, pad + header_h)):
+            font = get_font(size, "bahnschrift")
+            title = self.text or "Graph"
+            ts = font.render(clip_text(title, font, rect.width // 2), True, (200, 204, 218))
+            surface.blit(ts, (rect.x + pad, rect.y + pad + (header_h - ts.get_height()) // 2))
+            if self.shown:                       # which run it is, on the right
+                small = get_font(max(8, round(size * 0.75)), "bahnschrift")
+                name = ("latest · " if not self.dataset else "") + os.path.splitext(self.shown["name"])[0]
+                ns = small.render(clip_text(name, small, rect.width - ts.get_width() - 4 * pad), True, (110, 116, 130))
+                surface.blit(ns, ns.get_rect(midright=(rect.right - pad, rect.y + pad + header_h // 2)))
+        screen = pygame.Rect(rect.x + pad, rect.y + pad + header_h, rect.width - 2 * pad,
+                             rect.height - 2 * pad - header_h)
+        draw_rect(surface, GRAPH_SCREEN, screen, border_radius=max(2, radius - 3))
+        prev_clip = surface.get_clip()
+        surface.set_clip(screen.clip(prev_clip))
+        try:
+            self._draw_plot(surface, screen)
+        finally:
+            surface.set_clip(prev_clip)
+
+    def _draw_plot(self, surface, screen):
+        inner = screen.inflate(-max(4, screen.width // 30), -max(4, screen.height // 22))
+        font_size = round(inner.height * 0.06)
+        labels = font_size >= 8
+        data = self.data()
+        if data is None:
+            size = round(inner.height * 0.08)
+            if size >= 8:
+                font = get_font(size, "bahnschrift")
+                text = self.problem or "loading…"
+                ts = font.render(clip_text(text, font, inner.width), True, (90, 96, 110))
+                surface.blit(ts, ts.get_rect(center=inner.center))
+            return
+        _key, xs, ys = data
+        shown = self.shown
+        # Log axes: plot log10 of the positive values (the rest can't be shown).
+        px = np.where(xs > 0, np.log10(np.where(xs > 0, xs, 1.0)), np.nan) if self.log_x else xs
+        py = self._plot_ys(ys)
+        x_range = plotting.data_range(px, self.log_x)
+        y_range = self.y_range(self.auto_y_range())             # fitted, or the fixed one
+        if y_range is not None and self.log_y:                  # the plot's scale is log10
+            fitted = plotting.data_range(py, True)
+            y_range = (math.log10(y_range[0]) if y_range[0] > 0 else (fitted or (0, 1))[0],
+                       math.log10(y_range[1]) if y_range[1] > 0 else (fitted or (0, 1))[1])
+            if y_range[1] <= y_range[0]:
+                y_range = (y_range[0], y_range[0] + 1.0)
+        font = get_font(font_size, "bahnschrift") if labels else None
+
+        # Margins for the labels: y tick labels on the left, x ticks + the x column's name below.
+        if labels:
+            left = font.size("-0.0000")[0] + font_size
+            bottom = round(font_size * 2.6)
+        else:
+            left = bottom = 0
+        plot = pygame.Rect(inner.x + left, inner.y + round(font_size * 0.6 if labels else 0),
+                           inner.width - left - (font_size if labels else 0),
+                           inner.height - bottom - round(font_size * 0.6 if labels else 0))
+        if plot.width < plotting.MIN_PLOT_PX or plot.height < 16:
+            return                                            # too small to read: a blank screen
+        if x_range is None or y_range is None:
+            if labels:
+                ts = font.render(f"no {'positive ' if self.log_x or self.log_y else ''}values to show",
+                                 True, (90, 96, 110))
+                surface.blit(ts, ts.get_rect(center=plot.center))
+            return
+        vis = plot.clip(surface.get_clip())
+        (xlo, xhi), (ylo, yhi) = x_range, y_range
+        to_x = lambda v: plot.x + (v - xlo) / (xhi - xlo) * (plot.width - 1)      # noqa: E731
+        to_y = lambda v: plot.y + (yhi - v) / (yhi - ylo) * (plot.height - 1)     # noqa: E731
+        ticks = plotting.log_ticks if self.log_x else plotting.linear_ticks
+        x_ticks = ticks(xlo, xhi, max(2, plot.width // 70))
+        ticks = plotting.log_ticks if self.log_y else plotting.linear_ticks
+        y_ticks = ticks(ylo, yhi, max(2, plot.height // 45))
+
+        pygame.draw.rect(surface, (40, 46, 60), plot, 1)
+        for pos, _v in x_ticks:
+            x = round(to_x(pos))
+            if plot.left < x < plot.right - 1:
+                pygame.draw.line(surface, GRAPH_GRID, (x, plot.y + 1), (x, plot.bottom - 2))
+        for pos, _v in y_ticks:
+            y = round(to_y(pos))
+            if plot.top < y < plot.bottom - 1:
+                pygame.draw.line(surface, GRAPH_GRID, (plot.x + 1, y), (plot.right - 2, y))
+
+        if vis.width > 0 and vis.height > 0:
+            sorted_x = len(px) > 1 and bool(np.all(np.diff(px[np.isfinite(px)]) >= 0))
+            surf = self._curve.get((_key, self.log_x, self.log_y), plot, vis, px, py, x_range, y_range,
+                                   color=tuple(self.color), style=self.style, sorted_x=sorted_x)
+            surface.blit(surf, vis.topleft)
+
+        if not labels:
+            return
+        seen = surface.get_clip()
+        if seen.colliderect((inner.x, plot.bottom, inner.width, bottom)):
+            for pos, value in x_ticks:
+                x = round(to_x(pos))
+                pygame.draw.line(surface, (90, 96, 110), (x, plot.bottom), (x, plot.bottom + font_size // 3))
+                ts = font.render(plotting.format_tick(value), True, GRAPH_INK)
+                r = ts.get_rect(midtop=(x, plot.bottom + font_size // 3))
+                r.clamp_ip(pygame.Rect(inner.x, r.y, inner.width, r.height))
+                surface.blit(ts, r)
+            ts = font.render(clip_text(shown["x_col"] + ("  (log)" if self.log_x else ""), font, plot.width),
+                             True, (110, 116, 130))
+            surface.blit(ts, ts.get_rect(midbottom=(plot.centerx, inner.bottom)))
+        if seen.colliderect((inner.x, plot.y, left, plot.height)):
+            for pos, value in y_ticks:
+                y = round(to_y(pos))
+                pygame.draw.line(surface, (90, 96, 110), (plot.x - font_size // 3, y), (plot.x, y))
+                ts = font.render(plotting.format_tick(value), True, GRAPH_INK)
+                r = ts.get_rect(midright=(plot.x - font_size // 2, y))
+                r.clamp_ip(pygame.Rect(r.x, inner.y, r.width, inner.height))
+                surface.blit(ts, r)
+        name = font.render(clip_text(shown["y_col"] + ("  (log)" if self.log_y else ""), font, plot.width - 8),
+                           True, (110, 116, 130))
+        surface.blit(name, (plot.x + 4, plot.y + 2))           # the y column's name, top-left inside
 
 
 # ============================================================================
@@ -4030,22 +4458,13 @@ def decode_spectrum(spec):
     return np.polyval(spec["axis"], t), y
 
 
-def nice_step(span, max_ticks):
-    """A round tick step (1, 2 or 5 × 10^k) giving at most max_ticks ticks over span."""
-    raw = span / max(1, max_ticks)
-    if raw <= 0:
-        return 1.0
-    k = 10 ** math.floor(math.log10(raw))
-    return next(m * k for m in (1, 2, 5, 10) if m * k >= raw)
-
-
 def format_ms(ms):
     if ms >= 1000:
         return f"{ms / 1000:g} s"
     return f"{ms:.3g} ms" if ms < 1 else f"{ms:g} ms"
 
 
-class Spectrometer(Device):
+class Spectrometer(YScale, Device):
     """A Thorlabs CCS200 spectrometer (driver: ccs200_spectrometer), drawn as
     the instrument: an orange fiber into its SMA port, and a screen with the
     live spectrum over a wavelength axis with a rainbow strip.
@@ -4076,8 +4495,6 @@ class Spectrometer(Device):
              Prop("max_nm", "Window to", "float", 1000.0, min=190, max=1020, unit="nm",
                   prompt="End of the wavelength window (nm):"),
              Prop("correction", "Amplitude correction", "bool", True),
-             Prop("y_max", "Plot top", "float", 0.0, min=0,
-                  prompt="Top of the plot's y axis (0 = fit each scan):"),
              Prop("address", "Address", "str", "auto",
                   prompt="The spectrometer's VISA address (auto finds it; sim:// to simulate):")]
     SETTINGS = ("integration_ms", "min_nm", "max_nm", "correction")    # props sent as the device's params
@@ -4088,7 +4505,7 @@ class Spectrometer(Device):
         self._pending = None         # (asked-for live, when) after a click, until the device confirms
         self._button_hover = False
         self._decoded = None         # (key, wavelengths, intensities) of the scan last decoded
-        self._plot_cache = (None, None)      # (key, surface): the curve, redrawn only when it changes
+        self._curve = plotting.CurveImage()  # the curve's image, redrawn only when it changes
         self._strip_cache = (None, None)
 
     # --- The device ---------------------------------------------------------------------
@@ -4109,6 +4526,20 @@ class Spectrometer(Device):
 
     def takes(self):
         return []                    # its settings are Settings (kept, and re-sent), not inputs
+
+    def on_prop_changed(self, key):
+        super().on_prop_changed(key)
+        self.y_scale_changed(key)
+
+    def auto_y_range(self):
+        """Fitted to the latest scan: from 0 (or below, for negative dark
+        pixels) to a little over its top."""
+        data = self.spectrum()
+        if data is None:
+            return None
+        y = data[2]
+        low = min(0.0, float(np.min(y)))
+        return low, max(float(np.max(y)) * 1.08, low + 1e-9)
 
     def running(self):
         return self.connect and self.status() == "ok"
@@ -4354,12 +4785,12 @@ class Spectrometer(Device):
             return
 
         _key, nm, y = data
-        ymax = float(self.y_max) if self.y_max and self.y_max > 0 else max(float(np.max(y)) * 1.08, 1e-9)
-        ymin = min(0.0, float(np.min(y)))
-        if ymax <= ymin:
-            ymax = ymin + 1e-9
+        ymin, ymax = self.y_range(self.auto_y_range())       # fitted to the scan, or the fixed one
         live = self.is_live()
-        surf = self._plot_surface(plot, vis, data, lo, hi, ymin, ymax, live)
+        surf = self._curve.get(data[0], plot, vis, nm, y, (lo, hi), (ymin, ymax),
+                               color=SPEC_CURVE if live else shade(SPEC_CURVE, 0.7), sorted_x=True,
+                               fill_colors=self._column_colors(lo, hi, plot.width, vis.x - plot.x, vis.width),
+                               fill_alpha=70 if live else 45)
         surface.blit(surf, vis.topleft)
 
         # Peak marker + label; SATURATED / the plot's top value in the corner.
@@ -4388,59 +4819,6 @@ class Spectrometer(Device):
             else:
                 ts = font.render(f"{ymax:.3g}", True, (80, 88, 104))
             surface.blit(ts, (plot.x + 3, plot.y + 2))
-
-    def _plot_surface(self, plot, vis, data, lo, hi, ymin, ymax, live):
-        """The curve over the visible part of the plot, drawn once per new scan
-        (or new size / pan): one column per pixel. Columns that hold several
-        points draw their lowest-to-highest value (so a narrow peak never
-        drops out); once the points are spread apart they're joined by lines,
-        with dots when there's room. Under the curve, a fill in the color of
-        each column's wavelength."""
-        key = (data[0], plot.size, vis.x - plot.x, vis.y - plot.y, vis.size, lo, hi, ymin, ymax, live)
-        if self._plot_cache[0] == key:
-            return self._plot_cache[1]
-        _k, nm, y = data
-        w, h = plot.width, plot.height
-        ox, oy = vis.x - plot.x, vis.y - plot.y                # the surface's offset in the plot
-        px = (nm - lo) / (hi - lo) * (w - 1)                   # each point's plot column
-        to_y = lambda v: (ymax - v) / (ymax - ymin) * (h - 1) - oy
-        cols = np.arange(ox, ox + vis.width)
-        at = np.interp(cols, px, y)                           # the curve at each column (linear between points)
-        spacing = (w - 1) / max(1, len(y) - 1)                # pixels between points
-        if spacing < 1.5:                                     # several points a column: each one's range
-            top, bot = at.copy(), at.copy()
-            c = np.floor(px).astype(int) - ox
-            inside = (c >= 0) & (c < vis.width)
-            np.maximum.at(top, c[inside], y[inside])
-            np.minimum.at(bot, c[inside], y[inside])
-        else:
-            top = bot = at
-        curve = SPEC_CURVE if live else shade(SPEC_CURVE, 0.7)
-
-        # Fill (and, packed, the columns' ranges) as one image: a row × column mask.
-        rows = np.arange(vis.height)[:, None]
-        y_top, y_bot = np.round(to_y(top))[None, :], np.round(to_y(bot))[None, :]
-        img = np.zeros((vis.height, vis.width, 4), dtype=np.uint8)
-        fill = (rows >= y_top) & (rows <= round(to_y(max(ymin, 0.0))))
-        img[..., :3] = np.where(fill[..., None], self._column_colors(lo, hi, w, ox, vis.width)[None, :, :], 0)
-        img[..., 3] = np.where(fill, 70 if live else 45, 0)
-        if spacing < 1.5:
-            img[(rows >= y_top) & (rows <= y_bot)] = (*curve, 255)
-        surf = pygame.image.frombuffer(img.tobytes(), vis.size, "RGBA").copy()
-        if spacing >= 1.5:                                    # every point, joined
-            first = max(0, int(np.searchsorted(px, ox)) - 1)
-            last = min(len(y), int(np.searchsorted(px, ox + vis.width)) + 1)
-            pts = [(float(px[k] - ox), float(to_y(y[k]))) for k in range(first, last)]
-            if len(pts) >= 2:
-                pygame.draw.aalines(surf, curve, False, pts)
-                if spacing >= 3:
-                    pygame.draw.lines(surf, curve, False, pts, 2)
-            if spacing >= 8:
-                dot = max(2, min(5, round(spacing / 8)))
-                for p in pts:
-                    pygame.draw.circle(surf, curve, (round(p[0]), round(p[1])), dot)
-        self._plot_cache = (key, surf)
-        return surf
 
     def _column_colors(self, lo, hi, w, ox, count):
         """The fill color (each column's wavelength, a little dimmed) of the
