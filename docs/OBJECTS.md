@@ -158,6 +158,23 @@
     holding (the screen then says HELD and the number dims); a ring (amber / grey) once linked,
     with an amber wire to it. Clicking the icon then the tag itself goes back to always streaming
     (or the x on its panel row). The stream lookup uses the same loop guard as the value
+- **Script** (E menu ▸ Data, `things.py`): an experiment script on the canvas. Its *Script* stepper
+  offers the scripts in `scripts/` that use `canvas_run` (see ARCHITECTURE.md, *Experiment scripts
+  and the canvas*). The world asks the chosen script for its inputs (`--canvas-describe`, in a
+  background thread, again whenever the file changes); the panel's **Inputs** section lists them
+  — click to type a value (blank = the script's default, shown greyed "(default)"), a choice
+  cycles, an on/off toggles; a required one shows "required" in amber and RUN stays off until
+  it's filled. Values are saved with the object (`values`), and only the ones you set go on the
+  command line. **RUN** (drawn on the object — click it — or the panel) starts it in its own
+  console window, on the PC running the world (the lab PC: pressing RUN on another PC still runs
+  it there), with `--canvas-run saves/runs/<id>.json`; the world reads that file twice a second:
+  the object shows the stage, a progress bar with done/total, then COMPLETE (green) / STOPPED
+  (amber) / FAILED (red) with the script's message, and the dataset it wrote. **STOP** writes the
+  `.stop` file: the script stops after its current point and its own cleanup runs (files saved,
+  laser off, mirror back) — closing its console window instead kills it without that cleanup.
+  A run survives a canvas restart (the status file and the script's pid); a script that dies
+  without reporting shows "ended unexpectedly". Outputs `running` (1/0), `progress` (0–1). The
+  pulsing badge runs on the world clock, so nothing changes per frame for the world to resend.
 
 ---
 

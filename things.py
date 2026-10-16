@@ -43,8 +43,12 @@ See "Adding an object type" in docs/ARCHITECTURE.md.
 
 import base64
 import csv
+import json
 import math
 import os
+import subprocess
+import sys
+import threading
 import time
 from datetime import datetime
 
@@ -1180,6 +1184,514 @@ class Graph(YScale, Thing):
         name = font.render(clip_text(shown["y_col"] + ("  (log)" if self.log_y else ""), font, plot.width - 8),
                            True, (110, 116, 130))
         surface.blit(name, (plot.x + 4, plot.y + 2))           # the y column's name, top-left inside
+
+
+# ---- Script: run an experiment script from the canvas ------------------------
+SCRIPTS_DIR = os.path.join(APP_DIR, "scripts")
+RUNS_DIR = os.path.join(SAVES_DIR, "runs")           # each Script object's status file: <id>.json
+SCRIPT_CHECK_SECONDS = 0.5                          # how often a run's status file is read
+SCRIPT_RESCAN_SECONDS = 5.0                         # how often the scripts folder / the script are re-read
+SCRIPT_DESCRIBE_TIMEOUT = 30.0
+SCRIPT_STATE_COLORS = {"idle": (120, 124, 140), "starting": (240, 190, 60), "running": (90, 170, 255),
+                       "complete": (90, 220, 120), "stopped": (240, 190, 60), "failed": (235, 80, 80)}
+SCRIPT_BODY = (30, 32, 40)
+SCRIPT_SCREEN = (10, 12, 16)
+
+
+def canvas_scripts():
+    """The scripts in scripts/ that a Script object can run: the ones using canvas_run."""
+    out = []
+    try:
+        names = sorted(os.listdir(SCRIPTS_DIR))
+    except OSError:
+        return out
+    for name in names:
+        if not name.endswith(".py") or name == "canvas_run.py":
+            continue
+        try:
+            with open(os.path.join(SCRIPTS_DIR, name), encoding="utf-8", errors="replace") as f:
+                if "canvas_run.start(" in f.read():
+                    out.append(name)
+        except OSError:
+            pass
+    return out
+
+
+def console_python():
+    """python.exe (with a console) even if the canvas runs under pythonw.exe."""
+    exe = sys.executable
+    console = os.path.join(os.path.dirname(exe), "python.exe")
+    return console if os.path.exists(console) else exe
+
+
+def pid_alive(pid):
+    """Is process `pid` still running? (Asks Windows; never signals it.)"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if os.name == "nt":
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        handle = kernel.OpenProcess(0x1000, False, pid)       # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        ok = kernel.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel.CloseHandle(handle)
+        return bool(ok) and code.value == 259                  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+class _ScriptWatch:
+    """The world's bookkeeping for a Script object (not sent to players, not saved)."""
+
+    def __init__(self):
+        self.next_check = 0.0
+        self.next_rescan = 0.0
+        self.status_mtime = None
+        self.described = None        # (script, file modified time) the inputs were read for
+        self.describing = None       # the thread asking the script, while it runs
+        self.result = None           # what it found: ("ok", spec) / ("error", text)
+        self.proc = None             # the Popen of a run started this session
+
+
+class Script(Thing):
+    """An experiment script, on the canvas. Pick one of the scripts in scripts/
+    that use canvas_run (Script ▸ the stepper); its inputs — its command-line
+    arguments, read from the script itself — become rows in the panel: click
+    one to type a value (blank = the script's default), a choice cycles, an
+    on/off toggles. RUN (on the object, or the panel) starts it in its own
+    console window on the PC running the world (the lab PC, with the
+    hardware); the object shows its stage and progress, and how it ended:
+    complete, stopped or failed (with the reason). STOP asks it to stop after
+    the current point — its own cleanup still runs (files saved, laser off).
+
+    Each object's run is followed through saves/runs/<id>.json, so a run
+    survives a canvas restart. Its runs are the datasets of the script's
+    experiments/ folder (for a Graph). Outputs: running (1/0), progress (0-1)."""
+
+    TYPE = "script"
+    MENU_LABEL = "Add script"
+    NAME = "Script"
+    CATEGORY = "Data"
+    SIZE = (360, 210)
+    DOT_COLOR = (90, 170, 255)
+    PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
+                  prompt="Size (1 = normal, 2 = twice as big):"),
+             Prop("script", kind="str", default="", hidden=True),      # a file in scripts/
+             Prop("values", kind="data", default={}, hidden=True)]     # input name -> value typed
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Sent to players (plain values).
+        self.scripts = []            # the runnable scripts in scripts/
+        self.spec = None             # the script's --canvas-describe: {description, inputs, data_folder, plot}
+        self.status = {"state": "idle"}    # the run's status file, as last read
+        self.problem = ""            # why it can't run / describe, if so
+        self._watch = _ScriptWatch()
+        self._button_hover = False
+
+    def status_path(self):
+        return os.path.join(RUNS_DIR, f"{self.id}.json")
+
+    def state(self):
+        return self.status.get("state", "idle")
+
+    def running(self):
+        return self.state() in ("starting", "running")
+
+    # --- The world: the scripts folder, the script's inputs, the run ----------------------
+    def tick(self, dt):
+        w = self._watch
+        now = time.monotonic()
+        if w.result is not None:                       # the script answered --canvas-describe
+            kind, found = w.result
+            w.result = None
+            if kind == "ok":
+                self.spec, self.problem = found, ""
+            else:
+                self.spec, self.problem = None, found
+        if now >= w.next_rescan:
+            w.next_rescan = now + SCRIPT_RESCAN_SECONDS
+            scripts = canvas_scripts()
+            if scripts != self.scripts:
+                self.scripts = scripts
+            if not self.script and scripts:
+                self.script = scripts[0]
+            self._describe_if_changed()
+        if now >= w.next_check:
+            w.next_check = now + SCRIPT_CHECK_SECONDS
+            self._read_status()
+
+    def _describe_if_changed(self):
+        """Ask the script for its inputs (in the background) when it's new or edited."""
+        w = self._watch
+        path = os.path.join(SCRIPTS_DIR, self.script) if self.script else ""
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            if self.script:
+                self.spec, self.problem = None, f"no script {self.script} in scripts/"
+            return
+        if w.described == (self.script, mtime) or w.describing is not None:
+            return
+        w.described = (self.script, mtime)
+
+        def ask():
+            try:
+                done = subprocess.run([console_python(), path, "--canvas-describe"], cwd=APP_DIR,
+                                      capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                      timeout=SCRIPT_DESCRIBE_TIMEOUT,
+                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                lines = [ln for ln in done.stdout.splitlines() if ln.startswith("{")]
+                if done.returncode == 0 and lines:
+                    w.result = ("ok", json.loads(lines[-1]))
+                else:
+                    last = (done.stderr or done.stdout).strip().splitlines()[-1:] or ["no answer"]
+                    w.result = ("error", f"couldn't read its inputs: {last[0]}")
+            except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+                w.result = ("error", f"couldn't read its inputs: {e}")
+            finally:
+                w.describing = None
+        w.describing = threading.Thread(target=ask, name=f"describe {self.script}", daemon=True)
+        w.describing.start()
+
+    def _read_status(self):
+        w = self._watch
+        path = self.status_path()
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = None
+        if mtime is not None and mtime != w.status_mtime:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    status = json.load(f)
+                w.status_mtime = mtime
+                if status != self.status:
+                    self.status = status
+            except (OSError, ValueError):
+                pass                                   # caught mid-write: next check
+        if self.state() == "running":                  # still there? (a crash / a closed console)
+            exited = w.proc.poll() if w.proc is not None else None
+            if exited is not None or (w.proc is None and not pid_alive(self.status.get("pid"))):
+                time.sleep(0.05)                       # its last word may have just landed
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        self.status = json.load(f)
+                except (OSError, ValueError):
+                    pass
+                if self.state() == "running":
+                    self.status = dict(self.status, state="failed",
+                                       message="ended unexpectedly" + (f" (exit code {exited})"
+                                                                       if exited is not None else ""))
+        elif self.state() == "starting" and w.proc is not None and w.proc.poll() is not None:
+            self.status = {"state": "failed", "message": f"didn't start (exit code {w.proc.returncode})"}
+
+    # --- Inputs ------------------------------------------------------------------------
+    def inputs(self):
+        return (self.spec or {}).get("inputs", [])
+
+    def value_of(self, item):
+        """(value, set by you?) — your value, else the script's default."""
+        if item["name"] in self.values:
+            return self.values[item["name"]], True
+        return item.get("default"), False
+
+    def missing(self):
+        return [i["flag"] or i["name"] for i in self.inputs()
+                if i.get("required") and self.value_of(i)[0] in (None, "")]
+
+    def edit_input(self, app, item):
+        name, kind = item["name"], item["kind"]
+        if kind == "bool":
+            self.values = dict(self.values, **{name: not bool(self.value_of(item)[0])})
+            app.save()
+            return
+        if item.get("choices"):
+            choices = item["choices"]
+            current = self.value_of(item)[0]
+            i = choices.index(current) if current in choices else -1
+            self.values = dict(self.values, **{name: choices[(i + 1) % len(choices)]})
+            app.save()
+            return
+
+        def submit(text):
+            text = text.strip()
+            values = dict(self.values)
+            if not text:
+                values.pop(name, None)                 # blank: back to the script's default
+            else:
+                try:
+                    values[name] = int(text) if kind == "int" else float(text) if kind == "float" else text
+                except ValueError:
+                    return
+            self.values = values
+            app.save()
+        default = item.get("default")
+        hint = f" — blank = default ({default})" if default not in (None, "") else ""
+        value = self.values.get(name, "")
+        app.ask(f"{item['flag'] or name}: {item.get('help') or ''}{hint}", submit,
+                value="" if value is None else str(value))
+
+    def command(self):
+        """The script's command line: your values (only those you set) + --canvas-run."""
+        args = [console_python(), os.path.join(SCRIPTS_DIR, self.script)]
+        for item in self.inputs():
+            if item["name"] not in self.values:
+                continue
+            value = self.values[item["name"]]
+            if item["kind"] == "bool":
+                if value:
+                    args.append(item["flag"])
+            elif item["flag"]:
+                args += [item["flag"], str(value)]
+            else:
+                args.append(str(value))
+        return args + ["--canvas-run", self.status_path()]
+
+    # --- Run / stop ----------------------------------------------------------------------
+    def run_script(self, app):
+        if self.running():
+            return
+        if not self.spec:
+            self.problem = self.problem or "the script's inputs aren't read yet"
+            return
+        missing = self.missing()
+        if missing:
+            self.problem = f"fill in {', '.join(missing)} first"
+            return
+        os.makedirs(RUNS_DIR, exist_ok=True)
+        for leftover in (self.status_path(), self.status_path() + ".stop"):
+            try:
+                os.remove(leftover)
+            except OSError:
+                pass
+        try:
+            self._watch.proc = subprocess.Popen(self.command(), cwd=APP_DIR,
+                                                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+        except OSError as e:
+            self.problem = f"couldn't start it: {e}"
+            return
+        self.problem = ""
+        self._watch.status_mtime = None
+        self.status = {"state": "starting", "pid": self._watch.proc.pid}
+        if app is not None:
+            app.save()
+
+    def stop_script(self, app):
+        if self.running():
+            try:
+                os.makedirs(RUNS_DIR, exist_ok=True)
+                open(self.status_path() + ".stop", "w").close()
+            except OSError as e:
+                self.problem = f"couldn't ask it to stop: {e}"
+                return
+            self.status = dict(self.status, stage=(self.status.get("stage") or "") + " — stopping…")
+
+    def toggle(self, app):
+        (self.stop_script if self.running() else self.run_script)(app)
+
+    def step_script(self, app, direction):
+        if self.running() or not self.scripts:
+            return
+        i = self.scripts.index(self.script) if self.script in self.scripts else -1
+        self.script = self.scripts[(i + direction) % len(self.scripts)]
+        self.values, self.spec, self.problem = {}, None, ""
+        self._watch.described = None
+        self._watch.next_rescan = 0.0
+        app.save()
+
+    # --- Outputs and the panel ------------------------------------------------------------
+    def progress_fraction(self):
+        p = self.status.get("progress")
+        if p and p[1]:
+            return max(0.0, min(1.0, p[0] / p[1]))
+        return 1.0 if self.state() == "complete" else 0.0
+
+    def gives(self):
+        return [Give("running"), Give("progress")]
+
+    def outputs(self):
+        return {"running": 1.0 if self.running() else 0.0, "progress": self.progress_fraction()}
+
+    def panel_status(self, app):
+        state = self.state()
+        text = {"idle": "ready", "starting": "starting…"}.get(state, state)
+        return text, SCRIPT_STATE_COLORS.get(state, (150, 152, 166))
+
+    def state_rows(self, app):
+        rows = [Stepper("Script", self.script or "— (none in scripts/)",
+                        lambda app: self.step_script(app, -1), lambda app: self.step_script(app, +1),
+                        down_enabled=len(self.scripts) > 1 and not self.running(),
+                        up_enabled=len(self.scripts) > 1 and not self.running())]
+        st = self.status
+        if st.get("progress"):
+            done, total = st["progress"]
+            rows.append(Row("Progress", f"{done}/{total}" + (f"  {st['stage']}" if st.get("stage") else "")))
+        elif st.get("stage"):
+            rows.append(Row("Stage", st["stage"]))
+        if st.get("message"):
+            rows.append(Field("Result" if not self.running() else "Message", st["message"],
+                              color=WARN_COLOR if self.state() == "failed" else None))
+        if st.get("dataset"):
+            rows.append(Row("Dataset", os.path.basename(st["dataset"])))
+        if self.problem:
+            rows.append(Field("Can't run", self.problem, color=WARN_COLOR))
+        return rows
+
+    def more_sections(self, app):
+        if not self.spec:
+            return [Section("Inputs", [Row("—", "reading the script…" if self.script and not self.problem
+                                           else "pick a script")])]
+        rows = []
+        for item in self.inputs():
+            value, mine = self.value_of(item)
+            if item["kind"] == "bool":
+                shown = "on" if value else "off"
+            else:
+                shown = "—" if value in (None, "") else str(value)
+            needed = item.get("required") and value in (None, "")
+            label = (item["flag"] or item["name"]).lstrip("-")
+            rows.append(Row(label, ("required" if needed else shown) + ("" if mine or needed else "  (default)"),
+                            color=WARN_COLOR if needed else None if mine else (130, 134, 148),
+                            on_click=None if self.running() else (lambda app, it=item: self.edit_input(app, it))))
+        folder = self.spec.get("data_folder")
+        rows.append(Row("Data folder", f"experiments/{folder}" if folder else "—"))
+        return [Section("Inputs", rows)]
+
+    def actions(self, app):
+        if self.running():
+            return [Btn("Stop", self.stop_script, style="stop")]
+        return [Btn("Run", self.run_script, style="go", enabled=bool(self.spec) and not self.missing())]
+
+    # --- On the canvas -------------------------------------------------------------------
+    def _layout(self, rect):
+        s = min(rect.width, rect.height)
+        pad = max(2, round(s * 0.06))
+        header_h = round(s * 0.13)
+        btn_h = max(4, round(s * 0.17))
+        button = pygame.Rect(rect.right - pad - round(btn_h * 3.0), rect.bottom - pad - btn_h, round(btn_h * 3.0), btn_h)
+        screen = pygame.Rect(rect.x + pad, rect.y + pad + header_h, rect.width - 2 * pad,
+                             button.y - pad - (rect.y + pad + header_h))
+        return {"s": s, "pad": pad, "header_h": header_h, "button": button, "screen": screen}
+
+    def hover(self, mouse_pos, mouse_pressed, camera):
+        super().hover(mouse_pos, mouse_pressed, camera)
+        self._button_hover = (self.is_hovered and
+                              self._layout(self.screen_rect(camera))["button"].collidepoint(mouse_pos))
+
+    def on_click(self, pos, app):
+        """A click on RUN / STOP runs or stops the script (and doesn't select)."""
+        if self._layout(self.screen_rect(app.camera))["button"].inflate(6, 6).collidepoint(pos):
+            self.toggle(app)
+            return True
+        return False
+
+    def draw_shape(self, surface, rect, camera):
+        lay = self._layout(rect)
+        s, pad = lay["s"], lay["pad"]
+        state = self.state()
+        color = SCRIPT_STATE_COLORS.get(state, (150, 152, 166))
+        radius = max(2, s // 10)
+        draw_rect(surface, (12, 12, 16), rect.move(0, max(1, s // 40)), border_radius=radius)
+        draw_rect(surface, SCRIPT_BODY, rect, border_radius=radius)
+        draw_rect(surface, shade(color, 0.8) if self.running() else shade(SCRIPT_BODY, 1.6), rect,
+                  width=max(1, s // 70), border_radius=radius)
+        if s < 24:
+            pygame.draw.circle(surface, color, rect.center, max(1, s // 4))
+            return
+        seen = surface.get_clip()
+
+        # Header: "▶ script name" and the state badge.
+        size = round(lay["header_h"] * 0.78)
+        if size >= 8 and seen.colliderect((rect.x, rect.y, rect.width, pad + lay["header_h"])):
+            font = get_font(size, "bahnschrift")
+            badge_text = {"idle": "READY", "starting": "STARTING"}.get(state, state.upper())
+            bf = get_font(max(8, round(size * 0.72)), "bahnschrift", True)
+            bs = bf.render(badge_text, True, (16, 16, 20))
+            badge = pygame.Rect(0, 0, bs.get_width() + size, round(size * 1.05))
+            badge.midright = (rect.right - pad, rect.y + pad + lay["header_h"] // 2)
+            if self.running():
+                glow = 0.75 + 0.25 * math.sin(world_time() * 5)   # the world's clock: no per-frame state
+                draw_rect(surface, shade(color, glow), badge, border_radius=badge.height // 2)
+            else:
+                draw_rect(surface, color, badge, border_radius=badge.height // 2)
+            surface.blit(bs, bs.get_rect(center=badge.center))
+            title = self.text or os.path.splitext(self.script)[0] or "Script"
+            ts = font.render(clip_text(title, font, badge.x - rect.x - 2 * pad), True, (204, 208, 222))
+            surface.blit(ts, ts.get_rect(midleft=(rect.x + pad, badge.centery)))
+
+        # Screen: what it's doing / how it ended, and a progress bar.
+        screen = lay["screen"]
+        draw_rect(surface, SCRIPT_SCREEN, screen, border_radius=max(2, radius - 3))
+        line = round(screen.height * 0.17)
+        if line >= 8 and screen.height > 20 and seen.colliderect(screen):
+            font = get_font(line, "consolas")
+            inner = screen.inflate(-2 * pad, -pad)
+            st = self.status
+            if self.running():
+                lines = [(st.get("stage") or "starting…", (180, 200, 230))]
+            elif state == "idle":
+                missing = self.missing() if self.spec else []
+                lines = [(self.problem or (f"needs {', '.join(missing)}" if missing else
+                                           "ready — press RUN" if self.spec else "reading the script…"),
+                          WARN_COLOR if self.problem or missing else (130, 136, 150))]
+            else:
+                lines = [(st.get("message") or state, shade(color, 1.1))]
+            if st.get("dataset") and not self.running():
+                lines.append((os.path.basename(st["dataset"]), (110, 116, 130)))
+            elif self.spec and state == "idle":
+                summary = [f"{(i['flag'] or i['name']).lstrip('-')}={self.values[i['name']]}"
+                           for i in self.inputs() if i["name"] in self.values]
+                if summary:
+                    lines.append((" ".join(summary), (110, 116, 130)))
+            y = inner.y
+            for text, ink in lines:
+                if y + line > inner.bottom - line:
+                    break
+                surface.blit(font.render(clip_text(text, font, inner.width), True, ink), (inner.x, y))
+                y += round(line * 1.25)
+            bar = pygame.Rect(inner.x, inner.bottom - max(3, line // 2), inner.width, max(3, line // 2))
+            draw_rect(surface, (34, 38, 48), bar, border_radius=bar.height // 2)
+            frac = self.progress_fraction()
+            if frac > 0:
+                draw_rect(surface, color, (bar.x, bar.y, max(bar.height, round(bar.width * frac)), bar.height),
+                          border_radius=bar.height // 2)
+            p = st.get("progress")
+            if p and p[1]:
+                ps = font.render(f"{p[0]}/{p[1]}", True, (150, 156, 170))
+                surface.blit(ps, ps.get_rect(bottomright=(inner.right, bar.y - 2)))
+
+        # RUN / STOP.
+        button = lay["button"]
+        if seen.colliderect(button):
+            running = self.running()
+            can_run = bool(self.spec) and not self.missing()
+            fill = (200, 60, 55) if running else (40, 150, 85) if can_run else (52, 56, 66)
+            if self._button_hover and (running or can_run):
+                fill = shade(fill, 1.2)
+            draw_rect(surface, fill, button, border_radius=button.height // 3)
+            draw_rect(surface, (8, 8, 10), button, width=max(1, s // 90), border_radius=button.height // 3)
+            size = round(button.height * 0.55)
+            if size >= 8:
+                font = get_font(size, "bahnschrift", True)
+                ink = (250, 250, 250) if running or can_run else (110, 112, 124)
+                ts = font.render("STOP" if running else "RUN", True, ink)
+                icon = round(size * 0.62)                  # a drawn ■ / ▶ (the font has neither)
+                gap = round(size * 0.35)
+                x = button.centerx - (icon + gap + ts.get_width()) // 2
+                cy = button.centery
+                if running:
+                    draw_rect(surface, ink, (x, cy - icon // 2, icon, icon), border_radius=max(1, icon // 6))
+                else:
+                    pygame.draw.polygon(surface, ink, [(x, cy - icon // 2), (x, cy + icon // 2), (x + icon, cy)])
+                surface.blit(ts, ts.get_rect(midleft=(x + icon + gap, cy)))
 
 
 # ============================================================================
@@ -4501,7 +5013,6 @@ class Spectrometer(YScale, Device):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._phase = 0.0
         self._pending = None         # (asked-for live, when) after a click, until the device confirms
         self._button_hover = False
         self._decoded = None         # (key, wavelengths, intensities) of the scan last decoded
@@ -4555,7 +5066,6 @@ class Spectrometer(YScale, Device):
 
     def tick(self, dt):
         super().tick(dt)
-        self._phase += dt
         if self.running():
             for key, value in self.settings().items():      # the client skips repeats
                 instruments.client.set(self.device, key, value)
@@ -4734,7 +5244,7 @@ class Spectrometer(YScale, Device):
         total = ts.get_width() + (3 * dot_r if live else 0)
         x = button.centerx - total // 2
         if live:
-            glow = 0.6 + 0.4 * math.sin(self._phase * 6)
+            glow = 0.6 + 0.4 * math.sin(world_time() * 6)   # the world's clock: no per-frame state
             pygame.draw.circle(surface, shade((255, 240, 240), glow), (x + dot_r, button.centery), dot_r)
             x += 3 * dot_r
         surface.blit(ts, ts.get_rect(midleft=(x, button.centery)))
