@@ -7,3 +7,6 @@ saves/
 
 # calibration runs (calibrate_nd_filter.py / fit_nd_filter.py: CSVs, plots, fits)
 calibration/nd_filter/
+
+# experiment runs (scripts/detector_power_sweep.py: spreadsheets, CSVs, plots)
+experiments/

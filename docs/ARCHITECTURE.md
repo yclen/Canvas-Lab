@@ -567,6 +567,16 @@ Real hardware runs outside the canvas. Each device type's canvas object is descr
   restarting it. A Device's outputs list readings first, so a Readout links to e.g. `position`.
 - pyserial is required (`pip install pyserial`); the unrelated `serial` package (a JSON/YAML
   library, same import name) was removed from this PC's miniconda for that reason.
+- **Experiment scripts and the canvas** (`scripts/canvas_run.py`): a script keeps its argparse
+  parser and stays a terminal script, but hands the parser to `canvas_run.start()` (instead of
+  `parse_args()`) and reports as it goes — `dataset(csv)`, `progress(i, n, stage)`,
+  `check_stop()` between points (raises `Stopped`, so the script's own cleanup runs: files
+  saved, laser off). `--canvas-describe` prints its inputs (from the parser) as JSON and exits;
+  `--canvas-run STATUS.json` makes it write state / progress / dataset there and treat
+  `STATUS.json.stop` as Stop. From a terminal it all does nothing. Each script's runs go to
+  `experiments/<name>/`, one CSV per run — a Graph's datasets. `detector_power_sweep.py` is the
+  first (plot defaults: power_mW vs count_rate). Next: a Script object that shows the inputs as
+  fields, runs it in its own console, shows its progress, and links to Graphs.
 
 ---
 

@@ -13,6 +13,7 @@ pyserial>=3.5          # NOT the unrelated "serial" package (same import name): 
 # --- Scripts in scripts/ (calibration runs, fits, plots) --------------------
 numpy>=2.0
 matplotlib>=3.8
+openpyxl>=3.1         # .xlsx output (detector_power_sweep.py)
 
 # --- Lab hardware (instrument server, on the lab PC only) -------------------
 # The drivers in drivers/ load the modules in "../../hardware drivers", which need:
