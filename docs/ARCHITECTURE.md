@@ -579,9 +579,12 @@ Real hardware runs outside the canvas. Each device type's canvas object is descr
   saved, laser off). `--canvas-describe` prints its inputs (from the parser) as JSON and exits;
   `--canvas-run STATUS.json` makes it write state / progress / dataset there and treat
   `STATUS.json.stop` as Stop. From a terminal it all does nothing. Each script's runs go to
-  `experiments/<name>/`, one CSV per run — a Graph's datasets. `detector_power_sweep.py` is the
-  first (it declares x = power, y = count rate or voltage, and labels each run with its wavelength and --name; both go to the folder's `canvas.json` for Graphs). The **Script** object (OBJECTS.md, *Data*) runs
-  them from the canvas: inputs as panel rows, RUN / STOP, progress; its `runs` data output links
+  `experiments/<name>/`, one CSV per run — a Graph's datasets. `start(show=[…], units={…})` names the
+  inputs the Script object draws on itself (linkable / typed there) and the units shown beside values.
+  `detector_spectral_response.py` (was `detector_power_sweep.py`; saves follow the rename through
+  `SCRIPT_RENAMES`, and it still writes to `experiments/detector_sweep/`) is the first (it shows its
+  wavelength on the object, declares x = power, y = count rate or voltage, and labels each run with its wavelength and --name; both go to the folder's `canvas.json` for Graphs). The **Script** object (OBJECTS.md, *Data*) runs
+  them from the canvas: number inputs linkable, inputs as panel rows, RUN / STOP, progress; its `runs` data output links
   to Graphs (the latest run, followed live while it runs).
 
 ---

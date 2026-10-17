@@ -49,8 +49,15 @@
   again to take it off; up to 8 at once. **Latest** (on by default, toggled from the same list)
   shows the newest run too — while a linked Script runs, the run it's writing, growing point by
   point — so a pinned 500 nm run and a live 600 nm run can be watched together. *Only latest*
-  (a button) goes back. Saved: `latest` and `pinned` (file names); older saves' single `dataset`
-  converts (`migrate`).
+  (a button) goes back. **Groups:** subfolders of the data folder (e.g. `archive/`, a series of
+  runs — made and filled in Explorer) are groups; the **Group** stepper cycles *(main folder)* and
+  each subfolder (by name, `archive` last, with how many runs each holds). The Datasets list then
+  holds only that group's runs, Latest is its newest, and each group keeps its own selection —
+  pins are stored as `group/file` paths (a main-folder pin is just the file name). Labels and
+  column choices still come from the main folder's `canvas.json` (a group's own, if it has one,
+  goes on top), so moving runs into a group keeps them. Scripts write to the main folder: a live
+  run shows on *(main folder)*. A group that disappears falls back to the main folder, with a
+  note. Saved: `latest`, `pinned`, `group`; older saves' single `dataset` converts (`migrate`).
   **Columns:** a script declares what to plot (`plot={"x": [...], "y": [...], "labels": {...}}`
   in `canvas_run.start`), and the helper writes it to the folder's `canvas.json` (with each run's
   legend label from `dataset(path, label=…)`, e.g. "550 nm · sampleA") — so it covers old runs and
@@ -108,6 +115,51 @@
   + / - / Reset buttons (and Value / Minimum / Maximum under State). The value is saved (a `value` Prop, saved on each change) and is the
   output `value`. Drawn Function-style: chips, a screen with the number (brightens on a change,
   dims at a limit), an output nub, and the step / limits beside the name
+- **Timer** (E menu ▸ Math, `things.py`): counts down its **Duration**, then says it's done — for
+  starting other things a set time later. Two *press* chips, linked like a Counter's: **start**
+  starts it, **reset** stops it and clears done. Clicking the timer starts it (or resets it while it
+  runs); the panel has Start / Reset. **Start while running** (a choice): *restarts* (default) or *is
+  ignored*. Duration is typed as `90`, `1:30`, `1:02:03`, `5m`, `1h 30m` or `250 ms` (`parse_duration`)
+  and shown as `45 s` / `1:30` / `2:00:00`. Outputs: **`done`** (1 from the end until the next start
+  or reset — latched, not a blip, so a press input fires once and an on/off input stays on),
+  `running`, `remaining` / `elapsed` (s), `progress` (0–1). Chain timers by linking one's `done` to
+  the next one's `start`. A run keeps the world-clock moment it started (`_started`, drawn with
+  `world_time()`, so nothing changes per frame for the world to resend) and the wall-clock end
+  (hidden `ends_at`, saved), so it keeps going across a restart; one that ran out while the world was
+  closed loads as done, and doesn't fire what it's linked to (already on when first read). Looks:
+  Counter-style, names "Timer 1", "Timer 2", …, the duration beside the name; the screen shows the
+  duration (grey) while idle, an amber countdown with a progress bar while running, and a green DONE
+  that flares when it finishes. Link `done` to a Script's **RUN** to start a run a set time later
+- **Sequence** (E menu ▸ Math, `things.py`): a list of numbers stepped through like the `i` of a for
+  loop. Its output `value` is the selected number. Two *press* chips, linked like a Counter's:
+  **next** moves to the next number, **reset** back to the first. It starts on the first, so the
+  first press moves to the second. **At the end it** (a choice): *stops* (default — stays on the last,
+  so you can't overshoot) or *wraps around*. The list is typed (click the screen, the panel's List
+  row or *Edit list…*) as numbers separated by commas / spaces / semicolons, and ranges
+  `start:stop:step` with the stop included (`450:500:10` = 450, 460 … 500; `start:stop` steps by 1;
+  `parse_sequence`, at most 10000 numbers); a new one starts with 450, 470, 490, 500. Click a number
+  on the screen to select it. **One output, `value`** (`None` while the list is empty) — where it
+  is shows on the object and in the panel, not as outputs. Saved: the list (`items`) and where it is (`index`). Looks: Counter-style, names
+  "Sequence 1", …, "2 / 4" beside the name ("last" on the last); the screen shows a window of the
+  numbers around the selected one (lit, flaring on a step; the ones before it dimmer; "…" when more
+  are off an end). Typical use: Sequence `value` → a Script input (its wavelength), and something
+  that presses `next` between runs (a push button, the Script's `complete`)
+
+---
+
+## Logic
+
+- **Logic gates** (E menu ▸ Logic, `things.py`): a `LogicGate` base — two *on/off* inputs, pins **a**
+  and **b** on the left (on while the source isn't 0: a push button's `pressed`, a switch, a Timer's
+  `done`, a Script's `running` / `complete`, …; unlinked or no value counts as off), and one output
+  **`out`** (1 / 0) from the right-hand pin. Click a pin, then the source (or drag a wire onto it);
+  drag from the output pin to lay a wire. Computed each frame in `tick` (`ins`, `on`), so a gate in a
+  loop runs a frame behind. A new gate is a subclass with `TYPE`, `NAME`, `LABEL` and `rule(ins)`
+  (and `body_points` for its outline). Looks: the schematic symbol with its name inside; input leads
+  amber while on, grey while off (a hollow pin end until linked); the body and output lead turn
+  green while the output is on. 150 × 90 at Size 1
+  - **AND** (`and_gate`): `out` is on only while both a and b are on. E.g. RUN a Script only while a
+    "ready" switch is on: AND(switch, button) → RUN
 
 ---
 
@@ -174,10 +226,18 @@
 - **Script** (E menu ▸ Data, `things.py`): an experiment script on the canvas. Its *Script* stepper
   offers the scripts in `scripts/` that use `canvas_run` (see ARCHITECTURE.md, *Experiment scripts
   and the canvas*). The world asks the chosen script for its inputs (`--canvas-describe`, in a
-  background thread, again whenever the file changes); the panel's **Inputs** section lists them
-  — click to type a value (blank = the script's default, shown greyed "(default)"), a choice
-  cycles, an on/off toggles; a required one shows "required" in amber and RUN stays off until
-  it's filled. Values are saved with the object (`values`), and only the ones you set go on the
+  background thread, again whenever the file changes). Every **number** input (int / float) is an
+  input on the canvas, under *Inputs / takes*: type a value while unlinked (blank = the script's
+  default), or **link** it to a slider, a Function, a Counter, … — a linked one wins, and RUN takes
+  its value right then (an int input rounds it; a source with no value keeps RUN off). The other
+  inputs are under **Options**: click to type (blank = default, shown greyed "(default)"), a choice
+  cycles, an on/off toggles. A required one shows "required" in amber and RUN stays off until it's
+  filled. The inputs the script names in `canvas_run.start(show=[…])` (with `units={…}`) are drawn
+  on the object, left of RUN, as fields: a chip (hollow until linked — click it to link, and the
+  wire ends there), the name and the value with its unit (click to type; white when set, grey for
+  the default, amber "required" / "—" when there's nothing to run with). While it runs, a field
+  shows the value the run was started with (hidden `ran_with`), not the source's live one. Typed
+  values are saved with the object (`values`), and only the ones you set or linked go on the
   command line. **RUN** (drawn on the object — click it — or the panel) starts it in its own
   console window, on the PC running the world (the lab PC: pressing RUN on another PC still runs
   it there), with `--canvas-run saves/runs/<id>.json`; the world reads that file twice a second:
@@ -186,7 +246,13 @@
   `.stop` file: the script stops after its current point and its own cleanup runs (files saved,
   laser off, mirror back) — closing its console window instead kills it without that cleanup.
   A run survives a canvas restart (the status file and the script's pid); a script that dies
-  without reporting shows "ended unexpectedly". Outputs `running` (1/0), `progress` (0–1). The
+  without reporting shows "ended unexpectedly". Outputs `running` (1/0), `complete` (1 from a
+  run's successful end until the next run starts — stopped / failed runs don't count), `progress` (0–1).
+  **RUN** and **STOP** are *press* inputs too (keys `_run` / `_stop`, so no script argument clashes):
+  link RUN to a push button, a Timer's `done`, … and each 0 → 1 runs it (a
+  press while it's running, or while it can't run — the reason then shows under *Can't run* — does
+  nothing); a press on STOP asks it to stop, as the button does. Their wires end on top of the
+  RUN / STOP button. The
   pulsing badge runs on the world clock, so nothing changes per frame for the world to resend.
   **`runs`** (a data output): the script's data folder, this object's current / last dataset,
   whether it's running and the columns the script declares (`plot` in `canvas_run.start`) —

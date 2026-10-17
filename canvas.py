@@ -3726,7 +3726,7 @@ class InspectorPanel:
     def _draw_list(self, surface, lst, x, y, max_w, mouse, path):
         """A titled list, up to SCROLL_LIST_ROWS rows tall; the wheel scrolls it."""
         font = get_font(20)
-        surface.blit(font.render(lst.title, True, INSPECTOR_LABEL), (x, y))
+        surface.blit(font.render(clip_text(lst.title, font, max_w), True, INSPECTOR_LABEL), (x, y))
         y += 24
         if not lst.items:
             surface.blit(font.render(lst.empty, True, INSPECTOR_VALUE), (x, y))
@@ -3735,7 +3735,7 @@ class InspectorPanel:
         visible = min(len(lst.items), SCROLL_LIST_ROWS)
         area = pygame.Rect(x, y, max_w, visible * row_h)
         self._list_rect = area.copy()
-        if lst.key is not self._list_key:
+        if lst.key != self._list_key:                  # (equal, not the same: a key may be rebuilt each frame)
             self._list_key, self._list_scroll = lst.key, 0
         self._list_max = max(0, len(lst.items) - visible)
         self._list_scroll = min(self._list_scroll, self._list_max)

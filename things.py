@@ -879,6 +879,42 @@ def plot_choices(plot):
     return {"x": [], "y": [], "labels": {}}
 
 
+ARCHIVE = "archive"              # the group listed last (old runs out of the way)
+
+
+def list_groups(folder):
+    """[(subfolder, number of CSV files)] in a data folder: its groups, by
+    name, with "archive" last. Hidden / underscore folders are skipped."""
+    out = []
+    try:
+        entries = sorted(os.scandir(folder), key=lambda e: (e.name.lower() == ARCHIVE, e.name.lower()))
+    except OSError:
+        return out
+    for entry in entries:
+        if entry.is_dir() and not entry.name.startswith((".", "_")):
+            try:
+                count = sum(1 for f in os.scandir(entry.path) if f.is_file() and f.name.lower().endswith(".csv"))
+            except OSError:
+                count = 0
+            out.append((entry.name, count))
+    return out
+
+
+def merged_hints(root, folder):
+    """A group's graphing hints: the data folder's canvas.json (where scripts
+    write it), with the group's own, if it has one, on top."""
+    hints = read_folder_file(root)
+    if folder != root:
+        own = read_folder_file(folder)
+        if own.get("plot"):
+            hints["plot"] = own["plot"]
+        runs = dict(hints["runs"]) if isinstance(hints.get("runs"), dict) else {}
+        if isinstance(own.get("runs"), dict):
+            runs.update(own["runs"])
+        hints["runs"] = runs
+    return hints
+
+
 def run_label(name, labels):
     """A run's legend name: the label its script gave it, else its file name
     without the extension and the trailing date_time stamp."""
@@ -904,6 +940,11 @@ class Graph(YScale, Thing):
     is one of them: on (the default), the newest run is shown too, and while a
     linked Script runs, the run it's writing, growing point by point.
 
+    Groups: subfolders of the data folder (e.g. archive/, a series of
+    runs) — the Group stepper picks one; the Datasets list then holds only
+    its runs, Latest is its newest, and each group keeps its own selection.
+    Scripts write to the data folder itself, "(main folder)".
+
     X / Y cycle the columns the folder's script declared (its canvas.json —
     e.g. power against count rate or voltage for the detector sweep), with
     their axis names; Settings ▸ All columns offers every number column.
@@ -927,7 +968,8 @@ class Graph(YScale, Thing):
              Prop("folder", "Data folder", "str", "experiments/detector_sweep",
                   prompt="Folder of CSV files (relative to the app's folder, or a full path):"),
              Prop("latest", kind="bool", default=True, hidden=True),   # show the newest run
-             Prop("pinned", kind="data", default=[], hidden=True),     # runs added by hand (file names)
+             Prop("group", kind="str", default="", hidden=True),       # a subfolder; "" = the folder itself
+             Prop("pinned", kind="data", default=[], hidden=True),     # runs added by hand: "group/file" paths
              Prop("x_col", kind="str", default="", hidden=True),
              Prop("y_col", kind="str", default="", hidden=True),
              Prop("all_columns", "All columns", "bool", False),
@@ -948,6 +990,7 @@ class Graph(YScale, Thing):
         super().__init__(*args, **kwargs)
         # Sent to players (plain values): what's in the folder, and what's on screen.
         self.datasets = []           # [[file name, "YYYY-MM-DD HH:MM", legend label]], newest first
+        self.groups = []             # [[subfolder, number of runs]]
         self.x_choices = []          # the columns X / Y cycle through
         self.y_choices = []
         self.shown = None            # {"x_col", "y_col", "x_label", "y_label", "series": [{"name", "label",
@@ -1003,25 +1046,34 @@ class Graph(YScale, Thing):
             return
         w.next_check = now + GRAPH_CHECK_SECONDS
         runs = self.source_runs()                      # linked to a Script: its folder, its run
-        folder = resolve_folder(runs["folder"] if runs else self.folder)
+        root = resolve_folder(runs["folder"] if runs else self.folder)
+        groups = [[name, count] for name, count in list_groups(root)]
+        if groups != self.groups:
+            self.groups = groups
+        group = self.group if self.group in [g[0] for g in groups] else ""
+        folder = os.path.join(root, group) if group else root
         try:
             files = list_datasets(folder)
         except OSError:
             self._set_problem(f"no folder {folder}")
             return
-        hints = read_folder_file(folder)
+        hints = merged_hints(root, folder)
         labels = hints.get("runs") if isinstance(hints.get("runs"), dict) else {}
         listing = [[name, datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M"), run_label(name, labels)]
                    for name, _p, mtime in files]
         if listing != self.datasets:
             self.datasets = listing
+        if self.group and not group:
+            note = f"no group {self.group} any more — showing the main folder"
+        else:
+            note = ""
         if not files:
-            self._set_problem("no CSV files in this folder yet")
+            self._set_problem(note or ("no CSV files in this group yet" if group else "no CSV files in this folder yet"))
             return
 
-        # Which runs: the pinned ones (in the order added), then Latest.
+        # Which runs: this group's pinned ones (in the order added), then Latest.
         by_name = {f[0]: f for f in files}
-        chosen = [[by_name[n], False] for n in self.pinned if n in by_name]
+        chosen = [[by_name[n], False] for n in (self._pin_name(p, group) for p in self.pinned) if n in by_name]
         if self.latest:
             live = os.path.basename(runs.get("latest") or "") if runs and runs.get("live") else ""
             newest = by_name[live] if live in by_name else files[0]
@@ -1079,6 +1131,8 @@ class Graph(YScale, Thing):
                 problems.append(f"{name} has no {x if x not in columns else y}")
         if dropped:
             problems.append(f"showing {GRAPH_MAX_SERIES} runs at most")
+        if note:
+            problems.insert(0, note)
         w.key = key
         self.x_choices, self.y_choices = list(x_choices), list(y_choices)
         self.shown = {"x_col": x, "y_col": y, "x_label": plot["labels"].get(x, x),
@@ -1090,12 +1144,21 @@ class Graph(YScale, Thing):
         self._watch.key = None
 
     # --- Choosing what to show (inspector) ----------------------------------------------
+    @staticmethod
+    def _pin_name(pin, group):
+        """A pin ("group/file", or "file" in the main folder) -> the file name, if it's in `group`."""
+        g, _, name = pin.rpartition("/")
+        return name if g == group else None
+
+    def _pin(self, name):
+        return f"{self.group}/{name}" if self.group else name
+
     def toggle_run(self, app, name):
-        pinned = list(self.pinned)
-        if name in pinned:
-            pinned.remove(name)
+        pinned, pin = list(self.pinned), self._pin(name)
+        if pin in pinned:
+            pinned.remove(pin)
         else:
-            pinned.append(name)
+            pinned.append(pin)
         self.pinned = pinned
         self.recheck()
         app.save()
@@ -1106,7 +1169,9 @@ class Graph(YScale, Thing):
         app.save()
 
     def only_latest(self, app):
-        self.pinned, self.latest = [], True
+        """This group back to just its latest run (other groups keep theirs)."""
+        self.pinned = [p for p in self.pinned if self._pin_name(p, self.group) is None]
+        self.latest = True
         self.recheck()
         app.save()
 
@@ -1120,11 +1185,18 @@ class Graph(YScale, Thing):
         self.recheck()
         app.save()
 
+    def step_group(self, app, direction):
+        names = [""] + [g[0] for g in self.groups]
+        i = names.index(self.group) if self.group in names else 0
+        self.group = names[(i + direction) % len(names)]
+        self.recheck()
+        app.save()
+
     def edit_folder(self, app):
         def submit(text):
             if text.strip():
                 self.folder = text.strip()
-                self.pinned, self.latest = [], True     # a new folder starts on its latest run
+                self.pinned, self.latest, self.group = [], True, ""   # a new folder starts on its latest run
                 self.recheck()
                 app.save()
         app.ask("Folder of CSV files (relative to the app's folder, or a full path):", submit, value=self.folder)
@@ -1136,6 +1208,12 @@ class Graph(YScale, Thing):
         shown = self.shown or {}
         runs = self.source_runs()
         rows = [Row("Folder", runs["label"] if runs else self.folder, on_click=None if runs else self.edit_folder)]
+        if self.groups:
+            counts = dict((g, n) for g, n in self.groups)
+            here = (f"{self.group} ({counts[self.group]})" if self.group in counts else
+                    f"(main folder) ({len(self.datasets)})" if not self.group else self.group)
+            rows.append(Stepper("Group", here, lambda app: self.step_group(app, -1),
+                                lambda app: self.step_group(app, +1)))
         series = self.series()
         if series:
             names = ", ".join(s["label"] + (" (latest)" if s["latest"] else "") for s in series)
@@ -1154,16 +1232,17 @@ class Graph(YScale, Thing):
         return rows
 
     def more_sections(self, app):
-        shown = {s["name"] for s in self.series()}
         items = [("Latest — follows new runs", "on" if self.latest else "off", self.toggle_latest)]
-        items += [(label or name, "shown" if name in self.pinned else when,
+        items += [(label or name, "shown" if self._pin(name) in self.pinned else when,
                    lambda app, n=name: self.toggle_run(app, n)) for name, when, label in self.datasets]
-        hint = "click a run to add / remove it" if shown else "click a run to show it"
-        return [Section("Datasets", [ScrollList(f"Newest first — {hint}", items,
-                                                empty="— (no CSV files)", key=self)])]
+        where = self.group or ("main folder" if self.groups else "")
+        title = f"{where} — click to add / remove" if where else "Click a run to add / remove it"
+        return [Section("Datasets", [ScrollList(title, items, empty="— (no CSV files)",
+                                                key=(self.id, self.group))])]
 
     def actions(self, app):
-        return [Btn("Only latest", self.only_latest)] if self.pinned or not self.latest else []
+        mine = any(self._pin_name(p, self.group) for p in self.pinned)
+        return [Btn("Only latest", self.only_latest)] if mine or not self.latest else []
 
     def panel_status(self, app):
         series = self.series()
@@ -1404,6 +1483,9 @@ SCRIPT_STATE_COLORS = {"idle": (120, 124, 140), "starting": (240, 190, 60), "run
                        "complete": (90, 220, 120), "stopped": (240, 190, 60), "failed": (235, 80, 80)}
 SCRIPT_BODY = (30, 32, 40)
 SCRIPT_SCREEN = (10, 12, 16)
+SCRIPT_FIELD_COLOR = (255, 170, 80)                 # an input drawn on the object (its chip, its value)
+SCRIPT_RENAMES = {"detector_power_sweep.py": "detector_spectral_response.py"}   # old file -> new: saves follow
+SCRIPT_PRESSES = {"_run": "RUN", "_stop": "STOP"}  # its press inputs (keys no argparse dest uses) -> labels
 
 
 def canvas_scripts():
@@ -1481,7 +1563,18 @@ class Script(Thing):
 
     Each object's run is followed through saves/runs/<id>.json, so a run
     survives a canvas restart. Its runs are the datasets of the script's
-    experiments/ folder (for a Graph). Outputs: running (1/0), progress (0-1)."""
+    experiments/ folder (for a Graph). Outputs: running (1/0), progress (0-1),
+    complete (1 from a run's successful end until the next run starts).
+
+    Every number input is also an input on the canvas: link it (to a slider, a
+    Function, a Counter, …) and a run uses that value — taken when RUN is
+    pressed — instead of the typed one. The inputs the script names in
+    canvas_run.start(show=[…]) are drawn on the object as fields: click the
+    chip to link it, the value to type one.
+
+    RUN and STOP are press inputs too: link RUN to a push button, a Timer's
+    `done`, … and each 0 → 1 runs it (while
+    it isn't running already); STOP's press asks it to stop."""
 
     TYPE = "script"
     MENU_LABEL = "Add script"
@@ -1492,7 +1585,15 @@ class Script(Thing):
     PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
                   prompt="Size (1 = normal, 2 = twice as big):"),
              Prop("script", kind="str", default="", hidden=True),      # a file in scripts/
-             Prop("values", kind="data", default={}, hidden=True)]     # input name -> value typed
+             Prop("values", kind="data", default={}, hidden=True),     # input name -> value typed
+             Prop("ran_with", kind="data", default={}, hidden=True)]   # the number inputs the last run used
+
+    @classmethod
+    def migrate(cls, d):
+        d = super().migrate(d)
+        if d.get("script") in SCRIPT_RENAMES:
+            d = dict(d, script=SCRIPT_RENAMES[d["script"]])
+        return d
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1503,6 +1604,7 @@ class Script(Thing):
         self.problem = ""            # why it can't run / describe, if so
         self._watch = _ScriptWatch()
         self._button_hover = False
+        self._field_hover = None     # (input name, "chip" / "value") under the mouse
 
     def status_path(self):
         return os.path.join(RUNS_DIR, f"{self.id}.json")
@@ -1611,9 +1713,63 @@ class Script(Thing):
             return self.values[item["name"]], True
         return item.get("default"), False
 
+    def number_inputs(self):
+        """The inputs a link can set (int / float): each is a Take, keyed by name."""
+        return [i for i in self.inputs() if i["kind"] in ("int", "float")]
+
+    def shown_inputs(self):
+        """The number inputs drawn on the object (the script's show=[…])."""
+        return [i for i in self.number_inputs() if i.get("show")]
+
+    def label_of(self, item):
+        return (item["flag"] or item["name"]).lstrip("-")
+
+    def is_linked(self, item):
+        return item["kind"] in ("int", "float") and self.take_source(item["name"]) is not None
+
+    def run_value(self, item):
+        """What a run would use for item now: the linked source's value (None
+        while it has none), else value_of. An int input rounds a linked value."""
+        if not self.is_linked(item):
+            return self.value_of(item)[0]
+        value = self.take(item["name"])
+        if value is None:
+            return None
+        return int(round(value)) if item["kind"] == "int" else float(value)
+
+    def takes(self):
+        """One number input per int / float argument (typed while unlinked, or
+        linked), plus any linked one the script no longer has, so it can be unlinked."""
+        items = self.number_inputs()
+        names = {i["name"] for i in items}
+
+        def current(item):
+            value = self.value_of(item)[0]
+            return "required" if value in (None, "") and item.get("required") else value
+
+        out = [Take(key, label, kind="press") for key, label in SCRIPT_PRESSES.items()]
+        out += [Take(i["name"], self.label_of(i), unit=i.get("unit", ""), verb="sets",
+                     current=lambda i=i: current(i),
+                     set_by_hand=None if self.running() else (lambda app, i=i: self.edit_input(app, i)))
+                for i in items]
+        return out + [Take(port) for port in self.links if port not in names and port not in SCRIPT_PRESSES]
+
+    def on_press(self, port):
+        """RUN / STOP pressed through a link (in the world)."""
+        if port == "_run" and not self.running():
+            self.run_script(None)
+        elif port == "_stop":
+            self.stop_script(None)
+
     def missing(self):
-        return [i["flag"] or i["name"] for i in self.inputs()
-                if i.get("required") and self.value_of(i)[0] in (None, "")]
+        out = []
+        for i in self.inputs():
+            if self.is_linked(i):
+                if self.run_value(i) is None:
+                    out.append(f"{self.label_of(i)} (its source has no value)")
+            elif i.get("required") and self.value_of(i)[0] in (None, ""):
+                out.append(i["flag"] or i["name"])
+        return out
 
     def edit_input(self, app, item):
         name, kind = item["name"], item["kind"]
@@ -1651,9 +1807,10 @@ class Script(Thing):
         """The script's command line: your values (only those you set) + --canvas-run."""
         args = [console_python(), os.path.join(SCRIPTS_DIR, self.script)]
         for item in self.inputs():
-            if item["name"] not in self.values:
+            linked = self.is_linked(item)
+            if not linked and item["name"] not in self.values:
                 continue
-            value = self.values[item["name"]]
+            value = self.run_value(item) if linked else self.values[item["name"]]
             if item["kind"] == "bool":
                 if value:
                     args.append(item["flag"])
@@ -1689,8 +1846,8 @@ class Script(Thing):
         self.problem = ""
         self._watch.status_mtime = None
         self.status = {"state": "starting", "pid": self._watch.proc.pid}
-        if app is not None:
-            app.save()
+        self.ran_with = {i["name"]: self.run_value(i) for i in self.number_inputs()}
+        self._save(app)
 
     def stop_script(self, app):
         if self.running():
@@ -1710,7 +1867,7 @@ class Script(Thing):
             return
         i = self.scripts.index(self.script) if self.script in self.scripts else -1
         self.script = self.scripts[(i + direction) % len(self.scripts)]
-        self.values, self.spec, self.problem = {}, None, ""
+        self.values, self.spec, self.problem, self.ran_with = {}, None, "", {}
         self._watch.described = None
         self._watch.next_rescan = 0.0
         app.save()
@@ -1723,11 +1880,12 @@ class Script(Thing):
         return 1.0 if self.state() == "complete" else 0.0
 
     def gives(self):
-        return [Give("running"), Give("progress"), Give("runs", kind="data")]
+        return [Give("running"), Give("complete"), Give("progress"), Give("runs", kind="data")]
 
     def outputs(self):
-        return {"running": 1.0 if self.running() else 0.0, "progress": self.progress_fraction(),
-                "runs": self.runs()}
+        return {"running": 1.0 if self.running() else 0.0,
+                "complete": 1.0 if self.state() == "complete" else 0.0,
+                "progress": self.progress_fraction(), "runs": self.runs()}
 
     def runs(self):
         """What a Graph linked to `runs` follows: the script's data folder, the
@@ -1769,23 +1927,25 @@ class Script(Thing):
 
     def more_sections(self, app):
         if not self.spec:
-            return [Section("Inputs", [Row("—", "reading the script…" if self.script and not self.problem
-                                           else "pick a script")])]
+            return [Section("Options", [Row("—", "reading the script…" if self.script and not self.problem
+                                            else "pick a script")])]
         rows = []
         for item in self.inputs():
+            if item["kind"] in ("int", "float"):
+                continue                               # a number input: under Inputs / takes
             value, mine = self.value_of(item)
             if item["kind"] == "bool":
                 shown = "on" if value else "off"
             else:
                 shown = "—" if value in (None, "") else str(value)
             needed = item.get("required") and value in (None, "")
-            label = (item["flag"] or item["name"]).lstrip("-")
+            label = self.label_of(item)
             rows.append(Row(label, ("required" if needed else shown) + ("" if mine or needed else "  (default)"),
                             color=WARN_COLOR if needed else None if mine else (130, 134, 148),
                             on_click=None if self.running() else (lambda app, it=item: self.edit_input(app, it))))
         folder = self.spec.get("data_folder")
         rows.append(Row("Data folder", f"experiments/{folder}" if folder else "—"))
-        return [Section("Inputs", rows)]
+        return [Section("Options", rows)]
 
     def actions(self, app):
         if self.running():
@@ -1801,19 +1961,90 @@ class Script(Thing):
         button = pygame.Rect(rect.right - pad - round(btn_h * 3.0), rect.bottom - pad - btn_h, round(btn_h * 3.0), btn_h)
         screen = pygame.Rect(rect.x + pad, rect.y + pad + header_h, rect.width - 2 * pad,
                              button.y - pad - (rect.y + pad + header_h))
-        return {"s": s, "pad": pad, "header_h": header_h, "button": button, "screen": screen}
+        # The shown inputs, side by side left of the button: a chip (link) and the value (type).
+        fields = []
+        shown = self.shown_inputs()[:3]
+        if shown:
+            gap = max(1, pad // 2)
+            room = button.x - pad - (rect.x + pad)
+            w = (room - gap * (len(shown) - 1)) // len(shown)
+            for n, item in enumerate(shown):
+                box = pygame.Rect(rect.x + pad + n * (w + gap), button.y, w, btn_h)
+                chip = pygame.Rect(box.x, box.y, min(box.width, btn_h), btn_h)
+                fields.append((item, box, chip))
+        return {"s": s, "pad": pad, "header_h": header_h, "button": button, "screen": screen,
+                "fields": fields}
+
+    def _world_point(self, rect_point, k):
+        """A point of a _layout made on a rect k × the world size, back in world units."""
+        c = self.world_center
+        return (c.x - self.world_width / 2 + rect_point[0] / k, c.y - self.world_height / 2 + rect_point[1] / k)
+
+    def input_point(self, port):
+        """RUN / STOP's wires end on top of the button; a shown input's at its
+        chip; the others at the left edge."""
+        k = 4
+        lay = self._layout(pygame.Rect(0, 0, round(self.world_width * k), round(self.world_height * k)))
+        button = lay["button"]
+        if port in SCRIPT_PRESSES:
+            third = button.width / 3 * (1 if port == "_run" else 2)
+            return self._world_point((button.x + third, button.y), k)
+        for item, _box, chip in lay["fields"]:
+            if item["name"] == port:
+                return self._world_point(chip.center, k)
+        c = self.world_center
+        return (c.x - self.world_width / 2, c.y)
+
+    def field_at(self, pos, camera):
+        """(input, "chip" / "value") of the shown input under screen pos, or None."""
+        for item, box, chip in self._layout(self.screen_rect(camera))["fields"]:
+            if box.inflate(4, 4).collidepoint(pos):
+                return item, "chip" if pos[0] < chip.right else "value"
+        return None
+
+    def take_at(self, pos, camera):
+        found = self.field_at(pos, camera)
+        return found[0]["name"] if found else None
 
     def hover(self, mouse_pos, mouse_pressed, camera):
         super().hover(mouse_pos, mouse_pressed, camera)
         self._button_hover = (self.is_hovered and
                               self._layout(self.screen_rect(camera))["button"].collidepoint(mouse_pos))
+        found = self.field_at(mouse_pos, camera) if self.is_hovered else None
+        self._field_hover = (found[0]["name"], found[1]) if found else None
 
     def on_click(self, pos, app):
-        """A click on RUN / STOP runs or stops the script (and doesn't select)."""
+        """A click on RUN / STOP runs or stops the script; on a shown input's
+        chip links it (a linked one's value too), on its value types one. None
+        of these select it."""
         if self._layout(self.screen_rect(app.camera))["button"].inflate(6, 6).collidepoint(pos):
             self.toggle(app)
             return True
+        found = self.field_at(pos, app.camera)
+        if found:
+            item, part = found
+            if part == "chip" or self.is_linked(item):
+                self.pick(app, item["name"])
+            elif not self.running():
+                self.edit_input(app, item)
+            return True
         return False
+
+    def field_text(self, item):
+        """(value text, color) a shown input's field reads: the value the running
+        run used, else the linked source's live value, else the typed / default one."""
+        if self.running() and item["name"] in self.ran_with:
+            value = self.ran_with[item["name"]]
+        else:
+            value = self.run_value(item)
+        if value in (None, ""):
+            if self.is_linked(item):
+                return "—", WARN_COLOR
+            return ("required", WARN_COLOR) if item.get("required") else ("—", (130, 136, 150))
+        text = f"{value:.6g}" if isinstance(value, (int, float)) else str(value)
+        unit = item.get("unit", "")
+        mine = self.is_linked(item) or item["name"] in self.values
+        return text + (f" {unit}" if unit else ""), (236, 238, 244) if mine else (150, 156, 170)
 
     def draw_shape(self, surface, rect, camera):
         lay = self._layout(rect)
@@ -1845,7 +2076,7 @@ class Script(Thing):
             else:
                 draw_rect(surface, color, badge, border_radius=badge.height // 2)
             surface.blit(bs, bs.get_rect(center=badge.center))
-            title = self.text or os.path.splitext(self.script)[0] or "Script"
+            title = self.text or os.path.splitext(self.script)[0].replace("_", " ") or "Script"
             ts = font.render(clip_text(title, font, badge.x - rect.x - 2 * pad), True, (204, 208, 222))
             surface.blit(ts, ts.get_rect(midleft=(rect.x + pad, badge.centery)))
 
@@ -1869,8 +2100,8 @@ class Script(Thing):
             if st.get("dataset") and not self.running():
                 lines.append((os.path.basename(st["dataset"]), (110, 116, 130)))
             elif self.spec and state == "idle":
-                summary = [f"{(i['flag'] or i['name']).lstrip('-')}={self.values[i['name']]}"
-                           for i in self.inputs() if i["name"] in self.values]
+                summary = [f"{self.label_of(i)}={self.values[i['name']]}" for i in self.inputs()
+                           if i["name"] in self.values and not i.get("show") and not self.is_linked(i)]
                 if summary:
                     lines.append((" ".join(summary), (110, 116, 130)))
             y = inner.y
@@ -1914,6 +2145,35 @@ class Script(Thing):
                 else:
                     pygame.draw.polygon(surface, ink, [(x, cy - icon // 2), (x, cy + icon // 2), (x + icon, cy)])
                 surface.blit(ts, ts.get_rect(midleft=(x + icon + gap, cy)))
+
+        # The shown inputs: chip (hollow until linked), name, value.
+        for item, box, chip in lay["fields"]:
+            if not seen.colliderect(box):
+                continue
+            hot = self._field_hover[1] if self._field_hover and self._field_hover[0] == item["name"] else None
+            linked = self.is_linked(item)
+            draw_rect(surface, SCRIPT_SCREEN, box, border_radius=box.height // 3)
+            edge = shade(SCRIPT_FIELD_COLOR, 0.55) if hot == "value" and not linked else shade(SCRIPT_BODY, 1.6)
+            draw_rect(surface, edge, box, width=max(1, s // 90), border_radius=box.height // 3)
+            dot = shade(SCRIPT_FIELD_COLOR, 1.2) if hot else SCRIPT_FIELD_COLOR
+            r = max(2, round(chip.height * 0.2))
+            if linked:
+                pygame.draw.circle(surface, dot, chip.center, r)
+            else:
+                pygame.draw.circle(surface, dot, chip.center, r, max(1, r // 2))
+            text, ink = self.field_text(item)
+            inner_x, right = chip.right, box.right - max(2, chip.height // 4)
+            size = round(box.height * 0.44)
+            while size > 7 and get_font(size, "consolas", True).size(text)[0] > (right - inner_x) * 0.62:
+                size = max(7, int(size * 0.9))
+            if size >= 7:
+                vs = get_font(size, "consolas", True).render(text, True, ink)
+                surface.blit(vs, vs.get_rect(midright=(right, box.centery)))
+                lf = get_font(max(7, round(box.height * 0.34)), "bahnschrift")
+                room = right - vs.get_width() - max(2, chip.height // 5) - inner_x
+                if room > lf.size("ab")[0]:
+                    ls = lf.render(clip_text(self.label_of(item), lf, room), True, (150, 156, 170))
+                    surface.blit(ls, ls.get_rect(midleft=(inner_x, box.centery)))
 
 
 # ============================================================================
@@ -2400,6 +2660,780 @@ class Counter(Thing):
         if size >= 7:
             ts = get_font(size, "consolas", True).render(text, True, color)
             surface.blit(ts, ts.get_rect(midright=(screen.right - pad, screen.centery)))
+
+
+# ---- Timer: counts down, then says it's done ------------------------------------------
+TM_W = 260                      # Timer layout, in world units at Size 1 (Counter's chips / title)
+TM_INPUTS = ("start", "reset")
+TM_DONE_COLOR = (110, 220, 130)
+TM_IDLE_COLOR = (150, 152, 166)
+TM_FLASH = 0.6                  # seconds the screen flares when it finishes
+TM_RETRIGGER = ("restarts", "is ignored")
+TM_UNITS = {"ms": 0.001, "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+            "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+            "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600}
+TM_PART = re.compile(r"(\d+(?:\.\d*)?|\.\d+)\s*([a-z]*)")
+
+
+def parse_duration(text):
+    """Typed text -> seconds: '90', '90 s', '1:30', '1:02:03', '5m', '1.5 min',
+    '1h 30m', '250 ms'. Raises ValueError."""
+    text = text.strip().lower()
+    if ":" in text:
+        parts = [float(p) for p in text.split(":")]
+        if len(parts) > 3 or any(not math.isfinite(p) or p < 0 for p in parts):
+            raise ValueError("expected m:ss or h:mm:ss")
+        seconds = 0.0
+        for p in parts:
+            seconds = seconds * 60 + p
+        return seconds
+    found = TM_PART.findall(text)
+    if not found or TM_PART.sub("", text).strip() or any(u and u not in TM_UNITS for _n, u in found):
+        raise ValueError("expected e.g. 90, 1:30, 5m or 1h 30m")
+    return sum(float(n) * TM_UNITS[u or "s"] for n, u in found)
+
+
+def format_duration(seconds, tenths=False):
+    """Seconds -> '45 s', '1:30', '1:02:03' (a setting); tenths=True (a countdown):
+    '45.3', '1:30.0'. Rounds down to tenths, so a countdown reads 0.0 only at the end."""
+    seconds = max(0.0, math.floor(seconds * 10 + 1e-6) / 10)
+    if seconds < 60:
+        return f"{seconds:.1f}" if tenths else f"{seconds:g} s"
+    h, rest = divmod(seconds, 3600)
+    m, s = divmod(rest, 60)
+    s = f"{s:04.1f}" if tenths or s != int(s) else f"{int(s):02d}"
+    return f"{int(h)}:{int(m):02d}:{s}" if h else f"{int(m)}:{s}"
+
+
+class DurationProp(Prop):
+    """A float Prop in seconds that's typed and shown as a duration (1:30, 5m)."""
+
+    def parse(self, text):
+        value = parse_duration(text)
+        return max(self.min, value) if self.min is not None else value
+
+    def format(self, value, unit=True):
+        return format_duration(value)
+
+
+class Timer(Thing):
+    """Counts down its Duration, then says it's done. A press on its `start` chip
+    (a push button, another timer's `done`, … — a 0 → 1 change counts once)
+    starts it; `reset` stops it and clears done. Outputs `done` (1 from the end
+    until the next start / reset, so whatever it's linked to fires once),
+    `running`, `remaining`, `elapsed`, `progress`. Click a chip, then the
+    source; click the timer to start it (or reset it while it runs). Ctrl+click
+    selects it.
+
+    A run keeps the world-clock moment it started (`_started`, drawn with
+    world_time() on every PC, so nothing changes per frame for the world to
+    resend) and the wall-clock moment it ends (`ends_at`, saved), so it keeps
+    going across a restart — and one that ran out while the world was closed
+    loads as done, without firing anything (already on when first read)."""
+
+    TYPE = "timer"
+    MENU_LABEL = "Add timer"
+    NAME = "Timer"
+    CATEGORY = "Math"
+    DOT_COLOR = (255, 190, 90)
+    PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
+                  prompt="Size (1 = normal, 2 = twice as big):"),
+             Prop("color", "Color", "color", (255, 190, 90)),
+             DurationProp("duration", "Duration", "float", 10.0, min=0.0,
+                          prompt="Duration (e.g. 90, 1:30, 5m, 1h 30m):"),
+             Prop("retrigger", "Start while running", "choice", TM_RETRIGGER[0], choices=TM_RETRIGGER),
+             Prop("ends_at", kind="data", default=None, hidden=True),   # time.time() it ends at, while running
+             Prop("run_s", kind="data", default=None, hidden=True),     # the duration this run started with
+             Prop("done", kind="bool", default=False, hidden=True)]
+    TAKES = tuple(Take(name, kind="press") for name in TM_INPUTS)
+
+    @classmethod
+    def create(cls, app):
+        def make(x, y):
+            used = {o.text for o in app.scene.objects if isinstance(o, Timer)}
+            return cls(x, y, next(f"Timer {i}" for i in range(1, 1000) if f"Timer {i}" not in used))
+        app.start_placing(make)
+
+    @classmethod
+    def icon_sample(cls):
+        sample = cls(0, 0)
+        sample.duration = 90.0
+        return sample
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._started = None        # world_time() the run started (None: not running, or not yet known)
+        self._done_at = 0.0         # world_time() it finished: the flare
+
+    @property
+    def title(self):
+        return self.text or "Timer"
+
+    # --- Running ----------------------------------------------------------------------
+    def running(self):
+        return self.ends_at is not None
+
+    def elapsed(self):
+        if not self.running():
+            return (self.run_s or 0.0) if self.done else 0.0
+        if self._started is None:               # loaded mid-run, not ticked yet
+            return max(0.0, self.run_s - (self.ends_at - time.time()))
+        return min(self.run_s, max(0.0, world_time() - self._started))
+
+    def remaining(self):
+        if self.running():
+            return max(0.0, self.run_s - self.elapsed())
+        return 0.0 if self.done else self.duration
+
+    def progress(self):
+        if self.running():
+            return min(1.0, self.elapsed() / self.run_s) if self.run_s > 0 else 1.0
+        return 1.0 if self.done else 0.0
+
+    def start(self, app=None):
+        if self.running() and self.retrigger == "is ignored":
+            return
+        self.run_s = float(self.duration)
+        self._started = world_time()
+        self.ends_at = time.time() + self.run_s
+        self.done = False
+        self._save(app)
+
+    def reset(self, app=None):
+        self.ends_at = self.run_s = self._started = None
+        self.done = False
+        self._save(app)
+
+    def finish(self):
+        self.ends_at = self._started = None
+        self.done = True
+        self._done_at = world_time()
+        self._save(None)
+
+    def on_press(self, port):
+        getattr(self, port)()          # start / reset, once per 0 → 1
+
+    def tick(self, dt):
+        if not self.running():
+            return
+        if self.run_s is None:                  # a hand-edited save: run the current duration
+            self.run_s = float(self.duration)
+        if self._started is None:               # loaded mid-run: pick up where the wall clock says
+            self._started = world_time() - max(0.0, self.run_s - (self.ends_at - time.time()))
+        if world_time() - self._started >= self.run_s:
+            self.finish()
+
+    def gives(self):
+        return [Give("done"), Give("running"), Give("remaining", unit="s"), Give("elapsed", unit="s"),
+                Give("progress")]
+
+    def outputs(self):
+        return {"done": 1.0 if self.done else 0.0, "running": 1.0 if self.running() else 0.0,
+                "remaining": self.remaining(), "elapsed": self.elapsed(), "progress": self.progress()}
+
+    # --- Panel and clicks ---------------------------------------------------------------
+    def on_click(self, pos, app):
+        name = self.chip_at(pos, app.camera)
+        if name is not None:
+            self.pick(app, name)
+        elif self.running():
+            self.reset(app)
+        else:
+            self.start(app)
+        return True
+
+    def panel_status(self, app):
+        if self.running():
+            return f"running — {format_duration(self.remaining(), True)} left", self.color
+        return ("done", TM_DONE_COLOR) if self.done else ("ready", TM_IDLE_COLOR)
+
+    def state_rows(self, app):
+        return [Row("Remaining", format_duration(self.remaining(), True)),
+                Row("Elapsed", format_duration(self.elapsed(), True))]
+
+    def actions(self, app):
+        ignored = self.running() and self.retrigger == "is ignored"
+        return [Btn("Restart" if self.running() else "Start", self.start, style="go", enabled=not ignored),
+                Btn("Reset", self.reset)]
+
+    # --- Layout (world units at Size 1 from the top-left; shared by drawing, clicks, wires) --
+    @property
+    def world_width(self):
+        return TM_W * self.scale
+
+    @property
+    def world_height(self):
+        return (FN_PAD + CT_TITLE + 2 * FN_CHIP_H + FN_CHIP_GAP + FN_PAD) * self.scale
+
+    def _to_world(self, x, y):
+        c = self.world_center
+        return (c.x - self.world_width / 2 + x * self.scale, c.y - self.world_height / 2 + y * self.scale)
+
+    def _chip_boxes(self):
+        top = FN_PAD + CT_TITLE
+        return [(name, FN_PAD, top + i * (FN_CHIP_H + FN_CHIP_GAP), CT_CHIP_W, FN_CHIP_H)
+                for i, name in enumerate(TM_INPUTS)]
+
+    def _screen_box(self):
+        x = FN_PAD + CT_CHIP_W + 10
+        y = FN_PAD + CT_TITLE
+        return x, y, TM_W - FN_PAD - x, self.world_height / self.scale - FN_PAD - y
+
+    def input_point(self, port):
+        for n, x, y, _w, h in self._chip_boxes():
+            if n == port:
+                return self._to_world(x, y + h / 2)
+        return self.center
+
+    def output_point(self):
+        x, y, w, h = self._screen_box()
+        return self._to_world(x + w + FN_PAD, y + h / 2)
+
+    def _chip_rects(self, rect):
+        k = rect.width / TM_W
+        return [(name, pygame.Rect(rect.x + round(x * k), rect.y + round(y * k),
+                                   max(1, round(w * k)), max(1, round(h * k))))
+                for name, x, y, w, h in self._chip_boxes()], k
+
+    def chip_at(self, pos, camera):
+        chips, _k = self._chip_rects(self.screen_rect(camera))
+        return next((name for name, r in chips if r.inflate(6, 6).collidepoint(pos)), None)
+
+    def take_at(self, pos, camera):
+        return self.chip_at(pos, camera)
+
+    # --- Drawing ----------------------------------------------------------------------
+    def draw_shape(self, surface, rect, camera):
+        s = min(rect.width, rect.height)
+        radius = max(2, s // 8)
+        draw_rect(surface, (14, 14, 18), rect.move(0, max(1, s // 22)), border_radius=radius)
+        draw_rect(surface, INPUT_HOUSING, rect, border_radius=radius)
+        draw_rect(surface, shade(INPUT_HOUSING, 1.35), rect, width=max(1, s // 40), border_radius=radius)
+        running = self.running()
+        state_color = self.color if running else TM_DONE_COLOR if self.done else TM_IDLE_COLOR
+        if s < 16:
+            draw_rect(surface, shade(state_color, 0.5), rect.inflate(-max(1, s // 3), -max(1, s // 3)))
+            return
+        chips, k = self._chip_rects(rect)
+
+        # The name, and the duration beside it.
+        size = round(16 * k)
+        if size >= 7:
+            font = get_font(size, "bahnschrift")
+            title = font.render(clip_text(self.title, font, rect.width * 0.55), True, (226, 228, 236))
+            surface.blit(title, (rect.x + round(FN_PAD * k), rect.y + round(FN_PAD * k)))
+            info = get_font(max(7, round(13 * k)), "consolas", True).render(
+                format_duration(self.duration), True, shade(self.color, 0.85))
+            room = rect.right - round(FN_PAD * k) - (rect.x + round(FN_PAD * k) + title.get_width() + round(8 * k))
+            if info.get_width() <= room:
+                surface.blit(info, info.get_rect(midright=(rect.right - round(FN_PAD * k),
+                                                           rect.y + round(FN_PAD * k) + title.get_height() // 2)))
+
+        # Input chips: hollow until linked, filled once linked, brighter under the mouse.
+        mouse = pygame.mouse.get_pos() if self.is_hovered else None
+        csize = round(FN_CHIP_TEXT * k)
+        for name, r in chips:
+            linked = self.take_source(name) is not None
+            hot = mouse is not None and r.inflate(6, 6).collidepoint(mouse)
+            color = shade(self.color, 1.2) if hot else self.color
+            cr = max(2, r.height // 2)
+            if linked:
+                draw_rect(surface, color, r, border_radius=cr)
+            else:
+                draw_rect(surface, INPUT_WELL, r, border_radius=cr)
+                draw_rect(surface, color, r, width=max(1, round(2 * k)), border_radius=cr)
+            if csize >= 7:
+                ts = get_font(csize, "consolas", True).render(name, True, INPUT_WELL if linked else color)
+                surface.blit(ts, ts.get_rect(center=r.center))
+
+        # The screen: the countdown (DONE at the end, the duration while idle), a progress
+        # bar along its bottom, and the output nub on the right edge.
+        x, y, w, h = self._screen_box()
+        screen = pygame.Rect(rect.x + round(x * k), rect.y + round(y * k), round(w * k), round(h * k))
+        corner = max(2, round(6 * k))
+        flare = max(0.0, 1 - (world_time() - self._done_at) / TM_FLASH) if self.done else 0.0
+        draw_rect(surface, shade(state_color, 0.07 + 0.25 * flare), screen, border_radius=corner)
+        draw_rect(surface, (8, 8, 10), screen, width=max(1, s // 45), border_radius=corner)
+        pygame.draw.circle(surface, state_color, (rect.right, screen.centery), max(2, round(5 * k)))
+        pad = round(8 * k)
+        bar_h = max(2, round(5 * k))
+        bar = pygame.Rect(screen.x + pad, screen.bottom - pad - bar_h, screen.width - 2 * pad, bar_h)
+        if running or self.done:
+            draw_rect(surface, shade(state_color, 0.25), bar, border_radius=bar_h // 2)
+            filled = bar.copy()
+            filled.width = round(bar.width * self.progress())
+            if filled.width > 0:
+                draw_rect(surface, state_color, filled, border_radius=bar_h // 2)
+        if self.done:
+            text, color = "DONE", shade(TM_DONE_COLOR, 1.1 + 0.4 * flare)
+        elif running:
+            text, color = format_duration(self.remaining(), True), shade(self.color, 1.2)
+        else:
+            text, color = format_duration(self.duration, True), shade(TM_IDLE_COLOR, 0.9)
+        text_mid = (screen.centerx, (screen.top + bar.top) // 2)
+        size = round(h * 0.4 * k)
+        while size > 7 and get_font(size, "consolas", True).size(text)[0] > screen.width - 2 * pad:
+            size = max(7, int(size * 0.9))
+        if size >= 7:
+            ts = get_font(size, "consolas", True).render(text, True, color)
+            surface.blit(ts, ts.get_rect(center=text_mid))
+
+
+# ---- Sequence: a list of numbers, stepped through like a for loop's i --------------------
+SQ_W = 330                      # Sequence layout, in world units at Size 1 (Counter's chips / title)
+SQ_INPUTS = ("next", "reset")
+SQ_CELL_W = 54                  # one number on the screen
+SQ_AT_END = ("stops", "wraps around")
+SQ_MAX_ITEMS = 10000
+
+
+def parse_sequence(text):
+    """Typed text -> a list of numbers: '450, 470, 490, 500' (commas, spaces or
+    semicolons), and ranges 'start:stop:step' with the stop included
+    ('450:500:10' = 450, 460 … 500; 'start:stop' steps by 1). Raises ValueError."""
+    out = []
+    for part in re.split(r"[,;\s]+", text.strip()):
+        if not part:
+            continue
+        if ":" in part:
+            bits = [float(b) for b in part.split(":")]
+            if len(bits) not in (2, 3):
+                raise ValueError("a range is start:stop or start:stop:step")
+            start, stop = bits[0], bits[1]
+            step = bits[2] if len(bits) == 3 else (1.0 if stop >= start else -1.0)
+            if step == 0 or (stop - start) * step < 0 or not all(map(math.isfinite, bits)):
+                raise ValueError("the step must go from start toward stop")
+            n = int(math.floor((stop - start) / step + 1e-9)) + 1
+            if len(out) + n > SQ_MAX_ITEMS:
+                raise ValueError(f"at most {SQ_MAX_ITEMS} numbers")
+            out += [round(start + i * step, 12) for i in range(n)]
+        else:
+            value = float(part)
+            if not math.isfinite(value):
+                raise ValueError("numbers must be finite")
+            out.append(value)
+    if len(out) > SQ_MAX_ITEMS:
+        raise ValueError(f"at most {SQ_MAX_ITEMS} numbers")
+    return out
+
+
+class Sequence(Thing):
+    """A list of numbers, stepped through like the i of a for loop. Its `value`
+    is the selected number; each press on its `next` chip (a push button, a
+    Script's `complete`, … — a 0 → 1 change counts once) moves to the next one,
+    `reset` goes back to the first. At the end it stops (or wraps around).
+    Its one output is `value`. Click a number to select it; anywhere else on
+    the screen to type the list. Ctrl+click selects it."""
+
+    TYPE = "sequence"
+    MENU_LABEL = "Add sequence"
+    NAME = "Sequence"
+    CATEGORY = "Math"
+    DOT_COLOR = (150, 200, 255)
+    PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
+                  prompt="Size (1 = normal, 2 = twice as big):"),
+             Prop("color", "Color", "color", (150, 200, 255)),
+             Prop("at_end", "At the end it", "choice", SQ_AT_END[0], choices=SQ_AT_END),
+             Prop("items", kind="data", default=[], hidden=True),      # the numbers
+             Prop("index", kind="int", default=0, hidden=True)]        # the selected one (from 0)
+    TAKES = tuple(Take(name, kind="press") for name in SQ_INPUTS)
+
+    @classmethod
+    def create(cls, app):
+        def make(x, y):
+            used = {o.text for o in app.scene.objects if isinstance(o, Sequence)}
+            seq = cls(x, y, next(f"Sequence {i}" for i in range(1, 1000) if f"Sequence {i}" not in used))
+            seq.items = [450.0, 470.0, 490.0, 500.0]
+            return seq
+        app.start_placing(make)
+
+    @classmethod
+    def icon_sample(cls):
+        sample = cls(0, 0)
+        sample.items, sample.index = [1.0, 2.0, 3.0, 4.0], 1
+        return sample
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._stepped_at = -1e9         # world_time() of the last next: the screen's flare
+
+    @property
+    def title(self):
+        return self.text or "Sequence"
+
+    # --- Stepping ---------------------------------------------------------------------
+    def current(self):
+        return self.items[self.index] if 0 <= self.index < len(self.items) else None
+
+    def is_last(self):
+        return bool(self.items) and self.index >= len(self.items) - 1
+
+    def select(self, index, app=None):
+        index = max(0, min(len(self.items) - 1, index)) if self.items else 0
+        if index != self.index:
+            self.index = index
+            self._save(app)
+
+    def next(self, app=None):
+        if not self.items:
+            return
+        if self.is_last():
+            if self.at_end != "wraps around":
+                return                      # stays on the last: nothing to step to
+            self.select(0, app)
+        else:
+            self.select(self.index + 1, app)
+        self._stepped_at = world_time()
+
+    def reset(self, app=None):
+        self.select(0, app)
+
+    def on_press(self, port):
+        getattr(self, port)()          # next / reset, once per 0 → 1
+
+    def gives(self):
+        return [Give("value")]
+
+    def outputs(self):
+        return {"value": self.current()}
+
+    # --- Editing, clicks and the panel ----------------------------------------------------
+    def list_text(self):
+        return ", ".join(f"{v:g}" for v in self.items)
+
+    def type_list(self, app):
+        def submit(text):
+            try:
+                items = parse_sequence(text)
+            except ValueError:
+                return
+            self.items = items
+            self.index = max(0, min(self.index, len(items) - 1))
+            app.save()
+        app.ask("Numbers (e.g. 450, 470, 490 — or a range, 450:500:10):", submit, value=self.list_text())
+
+    def on_click(self, pos, app):
+        name = self.chip_at(pos, app.camera)
+        if name is not None:
+            self.pick(app, name)
+            return True
+        rect = self.screen_rect(app.camera)
+        cell = next((i for i, r in self._cell_rects(rect) if r.collidepoint(pos)), None)
+        if cell is not None:
+            self.select(cell, app)
+        else:
+            self.type_list(app)
+        return True
+
+    def panel_status(self, app):
+        if not self.items:
+            return "empty — type a list", WARN_COLOR
+        return f"{self.index + 1} of {len(self.items)}" + (" (last)" if self.is_last() else ""), self.color
+
+    def state_rows(self, app):
+        shown = self.list_text()
+        return [Row("Value", "—" if self.current() is None else f"{self.current():g}"),
+                Field("List", (shown[:200] + "…") if len(shown) > 200 else shown or "(empty)",
+                      on_click=self.type_list)]
+
+    def actions(self, app):
+        return [Btn("Next", self.next, style="go", enabled=bool(self.items) and
+                    (not self.is_last() or self.at_end == "wraps around")),
+                Btn("Reset", self.reset), Btn("Edit list…", self.type_list)]
+
+    # --- Layout (world units at Size 1 from the top-left; shared by drawing, clicks, wires) --
+    @property
+    def world_width(self):
+        return SQ_W * self.scale
+
+    @property
+    def world_height(self):
+        return (FN_PAD + CT_TITLE + 2 * FN_CHIP_H + FN_CHIP_GAP + FN_PAD) * self.scale
+
+    def _to_world(self, x, y):
+        c = self.world_center
+        return (c.x - self.world_width / 2 + x * self.scale, c.y - self.world_height / 2 + y * self.scale)
+
+    def _chip_boxes(self):
+        top = FN_PAD + CT_TITLE
+        return [(name, FN_PAD, top + i * (FN_CHIP_H + FN_CHIP_GAP), CT_CHIP_W, FN_CHIP_H)
+                for i, name in enumerate(SQ_INPUTS)]
+
+    def _screen_box(self):
+        x = FN_PAD + CT_CHIP_W + 10
+        y = FN_PAD + CT_TITLE
+        return x, y, SQ_W - FN_PAD - x, self.world_height / self.scale - FN_PAD - y
+
+    def input_point(self, port):
+        for n, x, y, _w, h in self._chip_boxes():
+            if n == port:
+                return self._to_world(x, y + h / 2)
+        return self.center
+
+    def output_point(self):
+        x, y, w, h = self._screen_box()
+        return self._to_world(x + w + FN_PAD, y + h / 2)
+
+    def _chip_rects(self, rect):
+        k = rect.width / SQ_W
+        return [(name, pygame.Rect(rect.x + round(x * k), rect.y + round(y * k),
+                                   max(1, round(w * k)), max(1, round(h * k))))
+                for name, x, y, w, h in self._chip_boxes()], k
+
+    def _screen_rect(self, rect):
+        k = rect.width / SQ_W
+        x, y, w, h = self._screen_box()
+        return pygame.Rect(rect.x + round(x * k), rect.y + round(y * k), round(w * k), round(h * k)), k
+
+    def _cell_rects(self, rect):
+        """(item index, on-screen rect) of the numbers that fit on the screen: a
+        window around the selected one."""
+        screen, k = self._screen_rect(rect)
+        pad = round(6 * k)
+        cell_w = SQ_CELL_W * k
+        fits = max(1, int((screen.width - 2 * pad) // max(1, cell_w)))
+        n = len(self.items)
+        first = max(0, min(self.index - fits // 2, n - fits))
+        cells = []
+        cell_h = round(screen.height * 0.62)
+        y = screen.y + (screen.height - cell_h) // 2
+        x0 = screen.x + pad + ((screen.width - 2 * pad) - min(fits, n) * cell_w) / 2
+        for j, i in enumerate(range(first, min(n, first + fits))):
+            cells.append((i, pygame.Rect(round(x0 + j * cell_w) + 1, y, max(1, round(cell_w) - 2), cell_h)))
+        return cells
+
+    def chip_at(self, pos, camera):
+        chips, _k = self._chip_rects(self.screen_rect(camera))
+        return next((name for name, r in chips if r.inflate(6, 6).collidepoint(pos)), None)
+
+    def take_at(self, pos, camera):
+        return self.chip_at(pos, camera)
+
+    # --- Drawing ----------------------------------------------------------------------
+    def draw_shape(self, surface, rect, camera):
+        s = min(rect.width, rect.height)
+        radius = max(2, s // 8)
+        draw_rect(surface, (14, 14, 18), rect.move(0, max(1, s // 22)), border_radius=radius)
+        draw_rect(surface, INPUT_HOUSING, rect, border_radius=radius)
+        draw_rect(surface, shade(INPUT_HOUSING, 1.35), rect, width=max(1, s // 40), border_radius=radius)
+        if s < 16:
+            draw_rect(surface, shade(self.color, 0.5), rect.inflate(-max(1, s // 3), -max(1, s // 3)))
+            return
+        chips, k = self._chip_rects(rect)
+
+        # The name, and "2 / 4" beside it.
+        size = round(16 * k)
+        if size >= 7:
+            font = get_font(size, "bahnschrift")
+            title = font.render(clip_text(self.title, font, rect.width * 0.6), True, (226, 228, 236))
+            surface.blit(title, (rect.x + round(FN_PAD * k), rect.y + round(FN_PAD * k)))
+            where = f"{self.index + 1} / {len(self.items)}" if self.items else "empty"
+            if self.items and self.is_last():
+                where = "last  " + where
+            info = get_font(max(7, round(13 * k)), "consolas", True).render(where, True, shade(self.color, 0.85))
+            room = rect.right - round(FN_PAD * k) - (rect.x + round(FN_PAD * k) + title.get_width() + round(8 * k))
+            if info.get_width() <= room:
+                surface.blit(info, info.get_rect(midright=(rect.right - round(FN_PAD * k),
+                                                           rect.y + round(FN_PAD * k) + title.get_height() // 2)))
+
+        # Input chips: hollow until linked, filled once linked, brighter under the mouse.
+        mouse = pygame.mouse.get_pos() if self.is_hovered else None
+        csize = round(FN_CHIP_TEXT * k)
+        for name, r in chips:
+            linked = self.take_source(name) is not None
+            hot = mouse is not None and r.inflate(6, 6).collidepoint(mouse)
+            color = shade(self.color, 1.2) if hot else self.color
+            cr = max(2, r.height // 2)
+            if linked:
+                draw_rect(surface, color, r, border_radius=cr)
+            else:
+                draw_rect(surface, INPUT_WELL, r, border_radius=cr)
+                draw_rect(surface, color, r, width=max(1, round(2 * k)), border_radius=cr)
+            if csize >= 7:
+                ts = get_font(csize, "consolas", True).render(name, True, INPUT_WELL if linked else color)
+                surface.blit(ts, ts.get_rect(center=r.center))
+
+        # The screen: the numbers, the selected one lit (the ones done dimmer), and the nub.
+        screen, _k = self._screen_rect(rect)
+        corner = max(2, round(6 * k))
+        draw_rect(surface, shade(self.color, 0.07), screen, border_radius=corner)
+        draw_rect(surface, (8, 8, 10), screen, width=max(1, s // 45), border_radius=corner)
+        pygame.draw.circle(surface, self.color, (rect.right, screen.centery), max(2, round(5 * k)))
+        cells = self._cell_rects(rect)
+        if not cells:
+            fs = round(14 * k)
+            if fs >= 7:
+                ts = get_font(fs, "consolas", True).render("click to type a list", True, shade(self.color, 0.6))
+                surface.blit(ts, ts.get_rect(center=screen.center))
+            return
+        flare = max(0.0, 1 - (world_time() - self._stepped_at) / 0.4)
+        for i, r in cells:
+            text = f"{self.items[i]:g}"
+            if i == self.index:
+                draw_rect(surface, shade(self.color, 1.0 + 0.3 * flare), r.inflate(0, round(4 * k)),
+                          border_radius=max(2, round(5 * k)))
+                ink = INPUT_WELL
+            else:
+                draw_rect(surface, shade(self.color, 0.16), r, border_radius=max(2, round(5 * k)))
+                ink = shade(self.color, 0.55 if i < self.index else 1.0)
+            size = round(r.height * 0.5)
+            while size > 7 and get_font(size, "consolas", True).size(text)[0] > r.width - round(4 * k):
+                size = max(7, int(size * 0.9))
+            if size >= 7:
+                ts = get_font(size, "consolas", True).render(text, True, ink)
+                surface.blit(ts, ts.get_rect(center=r.center))
+        # More numbers off either end: a small "…" there.
+        fs = max(7, round(12 * k))
+        if cells[0][0] > 0:
+            ts = get_font(fs, "consolas", True).render("…", True, shade(self.color, 0.7))
+            surface.blit(ts, ts.get_rect(midleft=(screen.x + round(2 * k), screen.centery)))
+        if cells[-1][0] < len(self.items) - 1:
+            ts = get_font(fs, "consolas", True).render("…", True, shade(self.color, 0.7))
+            surface.blit(ts, ts.get_rect(midright=(screen.right - round(2 * k), screen.centery)))
+
+
+# ============================================================================
+# LOGIC — gates that combine on/off values (E menu ▸ Logic)
+# ============================================================================
+GATE_PINS = ("a", "b")
+GATE_PIN_Y = (0.33, 0.67)       # the input pins, as a fraction of the height
+GATE_LEAD_IN, GATE_LEAD_OUT = 0.2, 0.16    # the pin leads, as a fraction of the width
+GATE_IN_ON = (240, 200, 90)     # an input pin while on (the on/off wires' amber)
+GATE_ON = (110, 220, 130)       # the output pin while on
+GATE_OFF = (96, 100, 114)
+
+
+class LogicGate(Thing):
+    """Base of the logic gates: on/off inputs `a` and `b` (on while the source
+    isn't 0 — a push button's pressed, a switch, a Timer's done, a Script's
+    running …; unlinked or no value counts as off) and one output `out`, 1 or
+    0, from rule(). Click a pin, then the source; drag from the output pin to
+    lay a wire. Computed each frame in tick, so a gate wired into a loop just
+    runs a frame behind. A gate type sets TYPE / NAME / LABEL and rule()."""
+
+    CATEGORY = "Logic"
+    SIZE = (150, 90)
+    DOT_COLOR = (170, 180, 255)
+    LABEL = "?"
+    PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
+                  prompt="Size (1 = normal, 2 = twice as big):"),
+             Prop("color", "Color", "color", (170, 180, 255))]
+    TAKES = tuple(Take(pin, kind="onoff") for pin in GATE_PINS)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ins = [False] * len(GATE_PINS)     # each input, as last read (drawn on every PC)
+        self.on = False                         # the output
+
+    def rule(self, ins):
+        raise NotImplementedError
+
+    def tick(self, dt):
+        ins = [bool(self.take_on(pin)) for pin in GATE_PINS]
+        on = bool(self.rule(ins))
+        if ins != self.ins:
+            self.ins = ins
+        if on != self.on:
+            self.on = on
+
+    def outputs(self):
+        return {"out": 1.0 if self.on else 0.0}
+
+    def panel_status(self, app):
+        return ("on", GATE_ON) if self.on else ("off", GATE_OFF)
+
+    # --- Pins (world points, and what's under the mouse) ------------------------------------
+    def _pin_world(self, i):
+        c = self.world_center
+        return (c.x - self.world_width / 2, c.y - self.world_height / 2 + GATE_PIN_Y[i] * self.world_height)
+
+    def input_point(self, port):
+        return self._pin_world(GATE_PINS.index(port)) if port in GATE_PINS else self.center
+
+    def output_point(self):
+        c = self.world_center
+        return (c.x + self.world_width / 2, c.y)
+
+    def take_at(self, pos, camera):
+        rect = self.screen_rect(camera)
+        reach = max(8, rect.height * 0.18)
+        for i, pin in enumerate(GATE_PINS):
+            x, y = rect.x, rect.y + GATE_PIN_Y[i] * rect.height
+            if abs(pos[0] - x) <= max(reach, rect.width * GATE_LEAD_IN) and abs(pos[1] - y) <= reach:
+                return pin
+        return None
+
+    def on_click(self, pos, app):
+        """A click on an input pin links it; anywhere else selects as usual."""
+        pin = self.take_at(pos, app.camera)
+        if pin is None:
+            return False
+        self.pick(app, pin)
+        return True
+
+    # --- Drawing ----------------------------------------------------------------------
+    def body_points(self, body):
+        """The outline of the gate's body inside rect `body` (the AND's D)."""
+        r = body.height / 2
+        flat = body.right - r
+        arc = [(flat + r * math.cos(t), body.centery + r * math.sin(t))
+               for t in np.linspace(-math.pi / 2, math.pi / 2, 24)]
+        return [(body.x, body.y)] + arc + [(body.x, body.bottom)]
+
+    def draw_shape(self, surface, rect, camera):
+        s = min(rect.width, rect.height)
+        lead_in, lead_out = round(rect.width * GATE_LEAD_IN), round(rect.width * GATE_LEAD_OUT)
+        inset = round(rect.height * 0.08)
+        body = pygame.Rect(rect.x + lead_in, rect.y + inset, rect.width - lead_in - lead_out, rect.height - 2 * inset)
+        if s < 14:
+            draw_rect(surface, GATE_ON if self.on else shade(self.color, 0.5), rect.inflate(-s // 3, -s // 3))
+            return
+        line = max(1, round(s * 0.045))
+        dot = max(2, round(s * 0.07))
+
+        # Leads: the inputs (amber while on), the output (green while on).
+        for i, pin in enumerate(GATE_PINS):
+            y = round(rect.y + GATE_PIN_Y[i] * rect.height)
+            ink = GATE_IN_ON if self.ins[i] else GATE_OFF
+            pygame.draw.line(surface, ink, (rect.x, y), (body.x, y), line)
+            if self.take_source(pin) is not None:
+                pygame.draw.circle(surface, ink, (rect.x, y), dot)
+            else:
+                pygame.draw.circle(surface, INPUT_WELL, (rect.x, y), dot)
+                pygame.draw.circle(surface, ink, (rect.x, y), dot, max(1, dot // 2))
+        out_ink = GATE_ON if self.on else GATE_OFF
+        pygame.draw.line(surface, out_ink, (body.right, rect.centery), (rect.right, rect.centery), line)
+        pygame.draw.circle(surface, out_ink, (rect.right, rect.centery), dot)
+
+        # The body: shadow, fill (lit while on), outline.
+        points = self.body_points(body)
+        pygame.draw.polygon(surface, (14, 14, 18), [(x, y + max(1, s // 22)) for x, y in points])
+        pygame.draw.polygon(surface, shade(GATE_ON, 0.22) if self.on else INPUT_HOUSING, points)
+        pygame.draw.polygon(surface, GATE_ON if self.on else self.color, points, max(1, round(s * 0.035)))
+
+        size = round(body.height * 0.27)
+        if size >= 7:
+            font = get_font(size, "bahnschrift", True)
+            ts = font.render(self.LABEL, True, (236, 248, 238) if self.on else shade(self.color, 1.1))
+            surface.blit(ts, ts.get_rect(center=(body.x + body.width * 0.54, body.centery)))
+        lsize = round(body.height * 0.2)
+        if lsize >= 7:
+            lf = get_font(lsize, "consolas", True)
+            for i, pin in enumerate(GATE_PINS):
+                ls = lf.render(pin, True, shade(self.color, 0.75))
+                surface.blit(ls, ls.get_rect(midleft=(body.x + max(2, s // 20), rect.y + GATE_PIN_Y[i] * rect.height)))
+
+
+class AndGate(LogicGate):
+    """AND: `out` is on only while both `a` and `b` are on."""
+
+    TYPE = "and_gate"
+    MENU_LABEL = "Add AND gate"
+    NAME = "AND"
+    LABEL = "AND"
+
+    def rule(self, ins):
+        return all(ins)
 
 
 # ============================================================================

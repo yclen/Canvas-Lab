@@ -10,7 +10,8 @@ the parser to start() instead of calling parse_args(), and reports as it goes:
     …
     run = canvas_run.start(p, data_folder="detector_sweep",
                            plot={"x": ["power_mW"], "y": ["count_rate", "voltage_V"],
-                                 "labels": {"power_mW": "power (mW)", "count_rate": "count rate (counts/s)"}})
+                                 "labels": {"power_mW": "power (mW)", "count_rate": "count rate (counts/s)"}},
+                           show=["wavelength"], units={"wavelength": "nm"})   # drawn on the object
     args = run.args
     out_dir = canvas_run.data_folder("detector_sweep")      # experiments/detector_sweep/
     …
@@ -112,9 +113,12 @@ def data_folder(name):
     return path
 
 
-def describe(parser, data_folder=None, plot=None):
-    """The script's inputs, from its parser: what a Script object shows as fields."""
+def describe(parser, data_folder=None, plot=None, show=(), units=None):
+    """The script's inputs, from its parser: what a Script object shows as fields.
+    show: the inputs drawn on the object itself (number inputs, linkable there);
+    units: {input: unit} for the canvas to show beside a value."""
     inputs = []
+    units = units or {}
     for action in parser._actions:
         if isinstance(action, argparse._HelpAction) or action.dest in ("canvas_run", "canvas_describe"):
             continue
@@ -129,7 +133,8 @@ def describe(parser, data_folder=None, plot=None):
         inputs.append({"name": action.dest, "flag": flag, "kind": kind, "default": default,
                        "required": bool(action.required) or not action.option_strings,
                        "choices": list(action.choices) if action.choices else None,
-                       "help": (action.help or "").replace("%%", "%")})
+                       "help": (action.help or "").replace("%%", "%"),
+                       "unit": units.get(action.dest, ""), "show": action.dest in show})
     return {"description": parser.description or "", "inputs": inputs,
             "data_folder": data_folder, "plot": plot_spec(plot)}
 
@@ -233,15 +238,17 @@ class Run:
 _run = Run(None)                                         # the current run (a stand-in until start())
 
 
-def start(parser, data_folder=None, plot=None):
+def start(parser, data_folder=None, plot=None, show=(), units=None):
     """Parse the arguments (or, with --canvas-describe, print the inputs and
     exit) and begin the run. data_folder: the script's experiments/ folder name;
-    plot: the (x, y) columns a Graph shows by default."""
+    plot: the (x, y) columns a Graph shows by default; show: the inputs (argparse
+    dest names) the Script object draws on itself, where they can be linked or
+    typed; units: {dest: unit} shown beside their values."""
     global _run
     parser.add_argument("--canvas-run", metavar="STATUS.json", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--canvas-describe", action="store_true", help=argparse.SUPPRESS)
     if "--canvas-describe" in sys.argv[1:]:
-        print(json.dumps(describe(parser, data_folder, plot)))
+        print(json.dumps(describe(parser, data_folder, plot, show, units)))
         sys.exit(0)
     args = parser.parse_args()
     folder = os.path.join(EXPERIMENTS, data_folder) if data_folder else None

@@ -1,8 +1,9 @@
-"""detector_power_sweep.py — PDA45 counts and voltage vs. excitation power, at one wavelength.
+"""detector_spectral_response.py — PDA45 counts and voltage vs. excitation power, at one wavelength
+(one point of the detector's spectral response: run it at each wavelength).
 
-    python scripts/detector_power_sweep.py --wavelength 550
-    python scripts/detector_power_sweep.py --wavelength 600 --width 10 --start 90 --stop 60 --points 20
-    python scripts/detector_power_sweep.py --wavelength 550 --spacing power    # evenly spaced in mW
+    python scripts/detector_spectral_response.py --wavelength 550
+    python scripts/detector_spectral_response.py --wavelength 600 --width 10 --start 90 --stop 60 --points 20
+    python scripts/detector_spectral_response.py --wavelength 550 --spacing power    # evenly spaced in mW
 
 1. Sets the excitation band to --wavelength (center) and --width (nm), and the
    power meter's correction wavelength to match.
@@ -39,7 +40,8 @@ goes OFF at the end — also when the run stops early (an error, Ctrl+C). --leav
 skips that; --laser "" leaves the laser alone altogether.
 
 A Script object on the canvas can run it too (scripts/canvas_run.py): its
-inputs are these arguments, it shows the progress, and Stop ends the run after
+inputs are these arguments (the wavelength is drawn on the object, where it can be
+linked to a slider or typed), it shows the progress, and Stop ends the run after
 the current point — with the usual cleanup (files saved, laser off, mirror back).
 Its runs are the datasets of experiments/detector_sweep/, for a Graph to show.
 
@@ -70,6 +72,9 @@ PLOT = {"x": ["power_mW"],                      # what a Graph offers: x / y cho
         "y": ["count_rate", "voltage_V"],
         "labels": {"power_mW": "power (mW)", "count_rate": "count rate (counts/s)",
                    "voltage_V": "voltage (V)"}}
+SHOW = ["wavelength"]                           # drawn on the Script object: link it to a slider, or type it
+UNITS = {"wavelength": "nm", "width": "nm", "start": "mm", "stop": "mm", "settle": "s",
+         "warmup": "s", "warmup_max": "s", "stable": "%"}
 OUT_DIR = os.path.join(canvas_run.EXPERIMENTS, DATA_FOLDER)
 BAND_TIMEOUT_S = 60.0
 BAND_TOL_NM = 1.0
@@ -353,7 +358,7 @@ def main():
                         "before (default 1)")
     p.add_argument("--leave-laser-on", action="store_true", help="don't turn emission off at the end")
     p.add_argument("--home", action="store_true", help="home the ND stage first")
-    job = canvas_run.start(p, data_folder=DATA_FOLDER, plot=PLOT)
+    job = canvas_run.start(p, data_folder=DATA_FOLDER, plot=PLOT, show=SHOW, units=UNITS)
     args = job.args
     if args.points < 2:
         p.error("--points must be at least 2")
