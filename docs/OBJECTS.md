@@ -260,6 +260,54 @@
 
 ---
 
+## Machines
+
+- **Machine** (`things.py`, placed from the E menu ▸ **Machines**): a circuit of objects packaged
+  behind one skin. Select the objects, right-click ▸ *Create machine…* and name it: they leave the
+  canvas and a Machine takes their place, running them inside, out of sight (an ordinary Scene of
+  its own, `MachineScene`, ticked by the machine; changes inside save the canvas). **Ports, by
+  where the objects sat** — inputs on the left, outputs on the right: every **switch, push button
+  and slider** inside becomes a machine input that *stands in* for it (it can't be clicked in
+  there), named after it or "Switch 1", "Switch 2", "Button 1", … top to bottom; every input of an
+  object in the left half of the selection that isn't wired from another part becomes a machine
+  input too; and every output of an object in the right half that no other part reads (not a
+  switch's) becomes a machine output. Wires that crossed the selection's edge always become ports, so nothing
+  comes unplugged: an outside source now feeds the machine's input, an outside reader reads the
+  machine's output. A label is the inner input's / output's name, with its object's name in front
+  when two are the same. Kinds carry through: a Counter's `up` is a press input on the skin, a
+  Script's `runs` a data output. **How a port works:** an input is a spec (`ports_in`: key,
+  label, kind, unit, inner object id, inner input); while it's linked outside, the inner input is
+  linked to a stand-in (`MachinePort`, id `port:<key>`, in the inner scene's `by_id` only) that
+  gives the outside value — unlinked, the inner input is left as it was (unlinked, or set by
+  hand). A stand-in input (`"source"`: a switch / button / slider) works the other way round:
+  while linked, everything inside that read that switch reads the machine input instead
+  (`_stand_in`); unlinked, it reads the switch again, which keeps its own last state. An output
+  reads the inner object's output each tick into `values` (what players draw).
+  Ctrl+Z after creating puts the objects back with their wires. The machine is saved with its
+  parts (`parts`), ports and `definition` (the uid of its saved machine); a copy gives its parts
+  fresh ids. A machine with lab hardware inside is placed once and can't be copied (two would
+  fight over one instrument). Looks: Counter-style — the name on top with "machine" beside it in
+  its color, input chips down the left (hollow until linked), and a screen per output sharing the
+  height beside them (its name small in the corner, the value big) with **its own nub on the right
+  edge**, so each output's wire leaves from its screen.
+  **Editing ports (the panel):** click a port's name under *Inputs* / *Outputs* for its menu —
+  *Rename…* (wires stay: they follow the port's key, not its name), *Move up* / *Move down* (its
+  place on the skin), *Remove from the machine* (a wire on it goes too; Ctrl+Z puts both back).
+  **+ add input** / **+ add output** list what else could be a port — a switch / button / slider
+  not standing in yet, every inner input not wired from another part, every inner output — as
+  "object · name"; the new port goes at the bottom.
+  Edits also update the saved machine in the E menu (its parts are in the same order, so ids are
+  matched by position), so the next one placed has the same ports; copies already placed keep
+  their own.
+  **Unfold machine** (panel button): the parts go back on the canvas, centered where the machine
+  is, selected, with every wire kept — an outside source on a machine input now feeds what that
+  input fed inside (a stand-in's: what the switch fed; an unlinked stand-in's readers go back to
+  their switch), and outside readers of an output read the inner output. The machine goes without
+  `on_removed`, so devices inside stay connected. Ctrl+Z folds it back up. To change a machine,
+  unfold it, edit the parts, and *Create machine…* again (that saves a new one in the E menu).
+
+---
+
 ## Annotations
 
 - **Label** (E menu ▸ Annotations): a world-space title for a region — scales with zoom like a

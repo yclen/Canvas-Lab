@@ -681,13 +681,16 @@ class Take:
 class Give:
     """One output of an object: a named live value (a number, or None while it
     has none). The value itself comes from obj.outputs()[key]. kind="data": the
-    value is a dict (with a "label" for the panel) that only a data input takes."""
+    value is a dict (with a "label" for the panel) that only a data input takes.
+    on_label(app) runs when its name is clicked in the panel (e.g. a machine
+    output's menu); the rest of the row still links it."""
 
-    def __init__(self, key, label=None, unit="", kind="number"):
+    def __init__(self, key, label=None, unit="", kind="number", *, on_label=None):
         self.key = key
         self.label = label or key
         self.unit = unit
         self.kind = kind
+        self.on_label = on_label
 
 
 def kinds_match(take_kind, give_kind):
@@ -713,9 +716,13 @@ def format_value(value, unit=""):
     return f"{value:.6g}" + (f" {unit}" if unit else "")
 
 
-def output_point(obj):
-    """World point a wire from obj's outputs starts at: its output_point() if
-    it has one (a Function's output nub), else its center."""
+def output_point(obj, key=None):
+    """World point a wire from obj's output `key` starts at: that output's own
+    nub if obj has one per output (output_point_of, a machine), else its
+    output_point() if it has one (a Function's output nub), else its center."""
+    point_of = getattr(obj, "output_point_of", None)
+    if point_of is not None and key is not None:
+        return point_of(key)
     point = getattr(obj, "output_point", None)
     return point() if point is not None else obj.center
 
@@ -928,7 +935,7 @@ class CanvasObject:
             src = self.take_source(take.key)
             if src is None or src.center is None:
                 continue
-            start, end = output_point(src), self.input_point(take.key)
+            start, end = output_point(src, self.links[take.key].get("key")), self.input_point(take.key)
             if take.kind == "number":
                 draw_wire(surface, camera, start, end, LINK_COLOR)
             elif take.kind == "data":
@@ -1098,6 +1105,10 @@ class CanvasObject:
         """Extra rows at the end of Inputs / takes (e.g. "+ add column")."""
         return []
 
+    def output_rows(self, app):
+        """Extra rows at the end of Outputs / gives (e.g. a machine's "+ add output")."""
+        return []
+
     def more_sections(self, app):
         """Extra Sections, shown before Settings (e.g. a neuron's W's)."""
         return []
@@ -1122,9 +1133,10 @@ class CanvasObject:
         if inputs:
             out.append(Section("Inputs / takes", inputs))
         gives = self.gives()
-        if gives:
-            values = self.outputs()
-            out.append(Section("Outputs / gives", [GiveRow(self, g, values.get(g.key)) for g in gives]))
+        values = self.outputs() if gives else {}
+        outputs = [GiveRow(self, g, values.get(g.key)) for g in gives] + self.output_rows(app)
+        if outputs:
+            out.append(Section("Outputs / gives", outputs))
         out += self.more_sections(app)
         settings = self.prop_rows()
         if settings:
@@ -2535,9 +2547,7 @@ class Scene:
         if by is not None:
             batch = self._deleted_batch([o for o in objs if o in self.objects])
             if batch["objects"]:
-                stack = self.deleted.setdefault(by, [])
-                stack.append(batch)
-                del stack[:-UNDO_DELETES]
+                self.push_undo(by, batch)
         removed = False
         for obj in objs:
             if obj in self.objects:
@@ -2562,13 +2572,37 @@ class Scene:
         return {"objects": [(self.objects.index(o), o.to_dict()) for o in objs],
                 "weights": {i: ws for i, ws in weights.items() if ws}}
 
+    def push_undo(self, by, batch):
+        """Remember a change `by` can undo: a _deleted_batch, plus optionally
+        "added" (ids of objects it made, taken away again without on_removed —
+        their parts live on in the restored objects), "links" ({id: links} to
+        put back on objects it rewired) and "props" ({id: {attr: value}} to put
+        back). Creating a machine uses the first three; removing a machine's
+        port, links and props."""
+        stack = self.deleted.setdefault(by, [])
+        stack.append(batch)
+        del stack[:-UNDO_DELETES]
+
     def undo_delete(self, by):
-        """Bring back `by`'s most recent delete. Returns the restored objects
-        ([] if there's nothing to undo)."""
+        """Undo `by`'s most recent delete (or other push_undo change). Returns
+        the restored objects ([] if there's nothing to undo)."""
         stack = self.deleted.get(by)
         if not stack:
             return []
         batch = stack.pop()
+        for i in batch.get("added", ()):
+            obj = self.by_id.pop(i, None)
+            if obj is not None:
+                self.objects.remove(obj)
+                for ids in self.selections.values():
+                    ids.discard(i)
+        for i, links in batch.get("links", {}).items():
+            if i in self.by_id:
+                self.by_id[i].links = copy.deepcopy(links)
+        for i, props in batch.get("props", {}).items():
+            if i in self.by_id:
+                for key, value in props.items():
+                    setattr(self.by_id[i], key, copy.deepcopy(value))
         restored = []
         for index, d in sorted(batch["objects"], key=lambda item: item[0]):
             if d.get("id") in self.by_id:
@@ -2582,9 +2616,8 @@ class Scene:
             n = self.by_id.get(nid)
             if isinstance(n, Neuron):
                 n.weights.update({k: w for k, w in ws.items() if k in self.by_id})
-        if restored:
-            self.sync_weights()
-            self.save()
+        self.sync_weights()
+        self.save()
         return restored
 
     def tick(self, dt):
@@ -2808,11 +2841,11 @@ def copy_object(obj, at=None):
 
 
 # ---- Machines: a saved group of objects, placed again as a whole ------------
-# Select objects, right-click ▸ Create machine…: their saved data goes into
-# saves/machines.json (next to Nodes.json). The E menu's Machines tab lists them;
-# placing one builds fresh objects — new ids, with links between its own
-# objects rewired to the new copies (links to anything outside stay as they
-# were). Once placed they're ordinary objects, selected together.
+# Select objects, right-click ▸ Create machine…: they're packaged as one Machine
+# object (things.py), and saved to saves/machines.json (next to Nodes.json) with
+# its ports. The E menu's Machines tab lists them; placing one builds a fresh
+# Machine — new ids, with links between its own objects rewired to the new
+# copies. Older machines (no ports) place as their loose objects, the old way.
 MACHINES_FILE = os.path.join(SAVES_DIR, "machines.json")
 _machines = None        # loaded on first use, then kept in step with the file
 
@@ -2859,9 +2892,10 @@ def machine_parts(objs):
     return kept, [o for o in objs if o not in kept]
 
 
-def save_machine(name, objs):
+def save_machine(name, objs, **extra):
     """Save the copyable objects among objs as a new machine (a taken name gets
-    " (2)", …). Returns the machine dict, or None if none of them can go in one."""
+    " (2)", …), with any `extra` keys (a packaged machine's uid and ports).
+    Returns the machine dict, or None if none of them can go in one."""
     kept, _skipped = machine_parts(objs)
     if not kept:
         return None
@@ -2878,7 +2912,7 @@ def save_machine(name, objs):
             d.pop(key, None)
         saved.append(d)
     machine = {"name": name, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-               "center": [(left + right) / 2, (top + bottom) / 2], "objects": saved}
+               "center": [(left + right) / 2, (top + bottom) / 2], "objects": saved, **extra}
     machines().append(machine)
     _save_machines()
     return machine
@@ -2951,9 +2985,17 @@ class MachineGroup:
         return f"machine '{self.machine['name']}'"
 
 
+def is_packaged(machine):
+    """Does this saved machine place as one Machine object (made since machines
+    got ports), rather than as its loose objects (the older kind)?"""
+    return "ports_in" in machine
+
+
 def draw_machine_preview(machine, surface):
-    """Draw the machine's objects scaled to fit `surface` (its E menu icon)."""
-    objs = build_machine(machine, (0, 0))
+    """Draw the machine scaled to fit `surface` (its E menu icon): its skin, or
+    for the older kind a miniature of its objects."""
+    objs = ([OBJECT_TYPES["machine"].from_definition(machine, (0, 0))] if is_packaged(machine)
+            else build_machine(machine, (0, 0)))
     left, top, right, bottom = group_bounds(objs)
     w, h = max(1.0, right - left), max(1.0, bottom - top)
     size = surface.get_size()
@@ -3377,6 +3419,8 @@ def row_callback(row, part=None, item=None):
                 "choose_give": lambda app: app.choose_give(obj, take.key, obj.take_source(take.key)),
                 "on_label": take.on_label, "set_by_hand": take.set_by_hand}.get(part)
     if isinstance(row, GiveRow):
+        if part == "on_label":
+            return row.give.on_label
         return lambda app: app.pick_target(row.obj, row.give.key)
     if isinstance(row, Stepper):
         return {"down": row.on_down if row.down_enabled else None,
@@ -3616,8 +3660,13 @@ class InspectorPanel:
         path = ("row", self._index.get(id(row), -1), row_label(row))
         if isinstance(row, GiveRow):
             g = row.give
-            self._clickable(surface, pygame.Rect(x - 4, y - 2, max_w + 8, 24),
-                            row_callback(row), mouse, path=path)
+            whole = pygame.Rect(x - 4, y - 2, max_w + 8, 24)
+            if g.on_label is not None:                  # its name opens its menu; the rest links it
+                name_w = min(label.size(g.label)[0] + 8, max_w // 2)
+                self._clickable(surface, pygame.Rect(whole.x, whole.y, name_w, whole.height),
+                                g.on_label, mouse, path=path + ("on_label",))
+                whole = pygame.Rect(whole.x + name_w, whole.y, whole.width - name_w, whole.height)
+            self._clickable(surface, whole, row_callback(row), mouse, path=path)
             return self._label_value(surface, x, y, max_w, g.label, format_value(row.value, g.unit),
                                      label, body, INSPECTOR_VALUE)
         if isinstance(row, Gap):
@@ -3890,9 +3939,11 @@ class PickMode:
     """Waiting for a click on an object — e.g. choosing what a readout reads.
     accept(obj) says which objects count; a valid click calls on_pick(obj),
     anything else (or Esc) cancels — except that, given on_empty, a click on
-    empty canvas calls on_empty(world point) (a relay places another there).
-    Draws a hint, a rubber-band line from `origin` to the cursor, and a ring
-    around a pickable object under it (or a small ring on empty canvas)."""
+    empty canvas calls on_empty(world point) (a relay places another there),
+    and, given on_give, a click on an output's dot (scene.give_at) calls
+    on_give(obj, output) — that output, no menu. Draws a hint, a rubber-band
+    line from `origin` to the cursor (snapped to a dot under it, named), and
+    a ring around a pickable object under it (or a small ring on empty canvas)."""
 
     def __init__(self):
         self.prompt = ""
@@ -3900,14 +3951,15 @@ class PickMode:
         self.accept = None
         self.origin = None       # world point the rubber band starts from, or None
         self.on_empty = None     # on_empty(world point) for a click on empty canvas, or None
+        self.on_give = None      # on_give(obj, output) for a click on an output's dot, or None
 
     @property
     def active(self):
         return self.on_pick is not None
 
-    def begin(self, prompt, on_pick, accept, origin=None, on_empty=None):
+    def begin(self, prompt, on_pick, accept, origin=None, on_empty=None, on_give=None):
         self.prompt, self.on_pick, self.accept, self.origin = prompt, on_pick, accept, origin
-        self.on_empty = on_empty
+        self.on_empty, self.on_give = on_empty, on_give
 
     def cancel(self):
         self.__init__()
@@ -3916,13 +3968,23 @@ class PickMode:
         obj = scene.hit_test(pos, camera)
         return obj if obj is not None and self.accept(obj) else None
 
+    def give_target(self, scene, pos, camera):
+        """(obj, output) whose dot is under pos, if this pick takes outputs and obj counts."""
+        if self.on_give is None:
+            return None
+        hit = scene.give_at(pos, camera)
+        return hit if hit is not None and self.accept(hit[0]) else None
+
     def click(self, scene, pos, camera):
         """Pick what's under pos (if allowed), then end the mode either way."""
+        dot = self.give_target(scene, pos, camera)
         obj = self.target(scene, pos, camera)
-        on_pick, on_empty = self.on_pick, self.on_empty
+        on_pick, on_empty, on_give = self.on_pick, self.on_empty, self.on_give
         empty = on_empty is not None and scene.hit_test(pos, camera) is None
         self.cancel()
-        if obj is not None:
+        if dot is not None:
+            on_give(*dot)
+        elif obj is not None:
             on_pick(obj)
         elif empty:
             on_empty(camera.screen_to_world(pos))
@@ -3931,6 +3993,17 @@ class PickMode:
         if not self.active:
             return
         obj = self.target(scene, mouse, camera)
+        dot = self.give_target(scene, mouse, camera)
+        if dot is not None:                                  # snapped to that output's dot, named
+            at = camera.world_to_screen(output_point(*dot))
+            if self.origin is not None:
+                pygame.draw.line(surface, (120, 220, 150), camera.world_to_screen(self.origin), at, 2)
+            pygame.draw.circle(surface, (120, 220, 150), at, 9, 2)
+            give = next((g for g in dot[0].gives() if g.key == dot[1]), None)
+            ts = get_font(18).render(give.label if give is not None else str(dot[1]), True, (120, 220, 150))
+            surface.blit(ts, ts.get_rect(midleft=(at[0] + 14, at[1])))
+            draw_hint(surface, f"{self.prompt}     Esc: cancel")
+            return
         if self.origin is not None:
             start = camera.world_to_screen(self.origin)
             end = camera.world_to_screen(obj.center) if obj is not None and obj.center is not None else mouse
@@ -3976,7 +4049,7 @@ class LinkDrag:
     def draw(self, surface, camera, scene, mouse):
         if not self.active:
             return
-        start = camera.world_to_screen(output_point(self.src))
+        start = camera.world_to_screen(output_point(self.src, self.key))
         pygame.draw.line(surface, LINK_COLOR, start, mouse, 2)
         pygame.draw.circle(surface, LINK_COLOR, mouse, 4)
         target = self.target(scene, mouse, camera)
@@ -4252,7 +4325,12 @@ class MachineTile:
 
     def create(self, app):
         machine = self.machine
-        app.start_placing(lambda x, y: MachineGroup(machine, (x, y)))
+        if is_packaged(machine):
+            cls = OBJECT_TYPES["machine"]
+            if cls.can_place(machine, app):
+                app.start_placing(lambda x, y: cls.from_definition(machine, (x, y)))
+        else:
+            app.start_placing(lambda x, y: MachineGroup(machine, (x, y)))
 
 
 class InventoryPanel:
@@ -4461,13 +4539,15 @@ class App:
         self.picker.cancel()
         self.link_drag.cancel()
 
-    def start_picking(self, prompt, on_pick, accept=lambda obj: True, origin=None, on_empty=None):
+    def start_picking(self, prompt, on_pick, accept=lambda obj: True, origin=None, on_empty=None,
+                      on_give=None):
         """Wait for a click on an object that accept(obj) allows, then call
         on_pick(obj). Esc or a click elsewhere cancels — or, with on_empty, a
-        click on empty canvas calls on_empty(world point). `origin` (a world
+        click on empty canvas calls on_empty(world point); with on_give, a click
+        on one of its output dots calls on_give(obj, output). `origin` (a world
         point) draws a line from there to the cursor while picking."""
         self.cancel_modes()
-        self.picker.begin(prompt, on_pick, accept, origin, on_empty)
+        self.picker.begin(prompt, on_pick, accept, origin, on_empty, on_give)
 
     def open_inventory(self):
         """Show the E menu (dropping whatever mode was active)."""
@@ -4522,11 +4602,20 @@ class App:
                 obj.unlink(port, self)
             else:
                 self.choose_give(obj, port, src)
+
+        def picked_dot(src, key):                    # clicked right on an output's dot: that one
+            if src is obj:
+                return
+            give = next((g for g in src.gives() if g.key == key), None)
+            if give is not None and kinds_match(kind, give.kind):
+                obj.link(port, src, key, self)
+            else:
+                self.choose_give(obj, port, src)
         kind = take.kind if take is not None else "number"
-        self.start_picking(f"Click what '{label}' takes from{hint}{note}", picked,
+        self.start_picking(f"Click what '{label}' takes from (or one of its output dots){hint}{note}", picked,
                            accept=lambda o: (o is obj and linked) or (o is not obj and any(
                                kinds_match(kind, g.kind) for g in o.gives())),
-                           origin=obj.input_point(port), on_empty=on_empty)
+                           origin=obj.input_point(port), on_empty=on_empty, on_give=picked_dot)
 
     def choose_give(self, obj, port, src):
         """Link obj's input `port` to one of src's outputs: right away if it has
@@ -4707,7 +4796,8 @@ class App:
             self.camera.look_at(obj.center, GOTO_ZOOM, self.screen_size)
 
     def create_machine(self, objs):
-        """Name the objects as a machine and save it (E menu ▸ Machines)."""
+        """Name the objects, then package them as one Machine where they sat
+        (Machine.package in things.py; it's also saved to the E menu ▸ Machines)."""
         kept, skipped = machine_parts(objs)
         if not kept:
             self.confirm("Can't make a machine from these",
@@ -4716,12 +4806,12 @@ class App:
             return
 
         def named(text):
-            machine = save_machine(text, kept)
-            note = f"{len(kept)} object{'' if len(kept) == 1 else 's'} — place it from the E menu ▸ Machines."
+            OBJECT_TYPES["machine"].package(self, kept, text)
             if skipped:
                 kinds = sorted({o.type_name().lower() for o in skipped})
-                note += f" Left out {len(skipped)}: {', '.join(kinds)} can't go in a machine."
-            self.confirm(f"Saved machine '{machine['name']}'", note, lambda: None, ok_label="OK")
+                self.confirm(f"Left out {len(skipped)} object{'' if len(skipped) == 1 else 's'}",
+                             f"{', '.join(kinds).capitalize()} can't go in a machine; they stay on the canvas.",
+                             lambda: None, ok_label="OK")
         self.ask(f"Name for this machine ({len(kept)} object{'' if len(kept) == 1 else 's'}):", named)
 
     def machine_menu(self, machine, pos):
@@ -5159,8 +5249,9 @@ class JoinedApp(App):
             ids = set(msg.get("accept", []))
             on_empty = (lambda point: answer(point=list(point))) if msg.get("empty") else None
             origin = tuple(msg["origin"]) if msg.get("origin") else None
+            on_give = (lambda obj, key: answer(id=obj.id, key=key)) if msg.get("gives") else None
             self.start_picking(msg["prompt"], lambda obj: answer(id=obj.id), accept=lambda o: o.id in ids,
-                               origin=origin, on_empty=on_empty)
+                               origin=origin, on_empty=on_empty, on_give=on_give)
         elif kind == "place":
             sample = msg["sample"]
 

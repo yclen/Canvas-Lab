@@ -83,22 +83,24 @@
   (below), then *Delete N objects* (red), which deletes at once like the Delete key (Ctrl+Z undoes). `App.context_menu(pos, [(label, callback, style)])` opens
   one; it's a modal, so a click elsewhere or Esc closes it. Not while a mode (placing, picking,
   building) is active
-- **Machines** (`canvas.py`, "Machines" section): a saved group of objects, placed again as a
-  whole. Select objects, right-click ▸ *Create machine…*, name it: the selection's saved data
-  (`to_dict`, minus each type's `COPY_SKIP` — a data collector's `rows`, a neuron's weights) goes
-  into `saves/machines.json` next to Nodes.json (git-ignored, like it) with the group's center. Only
-  copyable, non-`SINGLETON` objects go in — trains are left out (the
-  confirmation says which). A taken name gets " (2)". The E menu's **Machines** tab (always shown;
-  empty, it says how to make one) has a tile per machine — its icon a miniature of its objects
-  (`draw_machine_preview`) — and right-click on one renames / deletes it (`App.machine_menu`,
-  back to the E menu after). Picking one puts a `MachineGroup` in hand: PlaceMode moves and ghosts
-  all its objects together and drops them all with one save (`Scene.add_many`), selected as a group
-  (Shift+click keeps placing more copies). `build_machine` gives every object a new id and rewires
-  links between the machine's own objects to the new copies by swapping every old-id string in the
-  saved data (`_remap_ids`) — so any link style works without each type listing its links; links
-  to objects *outside* the machine are kept (they reconnect if that object exists, else show as
-  unlinked). Once placed they're ordinary objects — there's no lasting "machine" object. Device
-  objects keep their server device name, so a placed copy drives the same hardware
+- **Machines** (`canvas.py`, "Machines" section; the object is `Machine` in `things.py`, see
+  OBJECTS.md *Machines*): objects packaged as one. Select objects, right-click ▸ *Create
+  machine…*, name it: `Machine.package` takes them off the canvas into a new Machine where they
+  sat (they keep running inside it, in its own `MachineScene` — no `on_removed`, so devices stay
+  connected), picks its ports, moves wires that crossed the edge onto it, and saves it to
+  `saves/machines.json` next to Nodes.json (git-ignored, like it): the parts' saved data (`to_dict`,
+  minus each type's `COPY_SKIP`), the center, its ports and a `uid`. Ctrl+Z undoes it (the
+  parts come back with their wires; `Scene.push_undo` batches with `added` / `links`). Only
+  copyable, non-`SINGLETON` objects go in — trains are left out (a note says which). A taken name
+  gets " (2)". The E menu's **Machines** tab (always shown; empty, it says how to make one) has a
+  tile per machine — its icon is its skin (`draw_machine_preview`) — and right-click on one renames
+  / deletes it (`App.machine_menu`, back to the E menu after). Picking one places a fresh Machine
+  (`Machine.from_definition`: every part gets a new id — `_remap_ids` swaps every old-id string, in
+  the parts and in the port specs). A machine with lab hardware inside (a device, or a machine
+  holding one) is placed only once and can't be copied (`Machine.can_place`, `copyable`).
+  **Older machines** (saved before ports, no `ports_in` key — `is_packaged`) still place the old
+  way: a `MachineGroup` in hand drops all their objects as ordinary objects (`build_machine`;
+  links to objects *outside* are kept and reconnect if that object exists)
 - **Remembers your view**: on close, the world point at screen center + zoom are written to
   `saves/player.json` (git-ignored — it's the player's, not the world's); on launch the camera is
   restored there. (It used to be `"view"` in `Nodes.json`; the first launch moves it over)
@@ -182,7 +184,7 @@ Every panel has the same parts, always in this order (a section with nothing in 
 | **Header** | type name; the object's name if it has one (click to rename); a status line (device status, an equation's problem, a relay loop); the **⋯** menu | `panel_name()`, `rename(app)`, `panel_status(app)` |
 | **State** | what it is / shows now, and the main thing you edit (equation, counter value, slot names) | `state_rows(app)` + Props with `state=True` |
 | **Inputs / takes** | every input: its name, then **link** (and the value set by hand, if any) or *source · output* in green with an x to unlink, and the live value under it | `takes()` (+ `input_rows(app)`, e.g. *+ add column*) |
-| **Outputs / gives** | a plain list of what it gives, with live values; click one to link it into another object's input | `gives()` / `outputs()` |
+| **Outputs / gives** | a plain list of what it gives, with live values; click one to link it into another object's input (its name runs `on_label`, if the Give has one) | `gives()` / `outputs()` (+ `output_rows(app)`, e.g. *+ add output*) |
 | (extra) | e.g. a neuron's W's, the instrument server's device / driver lists | `more_sections(app)` |
 | **Settings** | visible Props: size, color, unit, … | `PROPS` |
 | **Info** | ID, position, driver, port, file paths — folded by default | `info_rows(app)` |
@@ -242,13 +244,18 @@ or 1 (anything that isn't 0 counts as on). Text stays display-only. The one exce
 - **Linking, one way everywhere:** click **link** on an input's row (or its chip on the
   canvas), then click a source (`App.pick_link`, PickMode: rubber band + green ring; clicking
   the object itself unlinks); if the source has several outputs, a menu at the cursor lists
-  them with live values (for press / on-off inputs `pressed`, `on`, `value` come first). Click
+  them with live values (for press / on-off inputs `pressed`, `on`, `value` come first) — or
+  click right on one of its output dots (`give_at`: a Function's nub, each of a machine's) to
+  take that output with no menu: while picking, the rubber band snaps to a dot under the cursor
+  and names it (PickMode `on_give`; in a world the window's answer carries the output). Click
   the output's name on a linked row to choose a different one. The other way round: click an
   output in *Outputs / gives*, then the object to feed (`App.pick_target`, a menu of its
   inputs), or **drag from an output nub** (Function, Counter, Tag — `give_at`) and let go on an
   input chip (`take_at`) or anywhere on an object with inputs (`LinkDrag`).
-- **Wires** are drawn by the base class from `links`, from the source's `output_point()` to the
-  reader's `input_point(port)`: number = green flowing dots; on/off = amber, flowing while on;
+- **Wires** are drawn by the base class from `links`, from the source's output point to the
+  reader's `input_point(port)` — `canvas.output_point(obj, key)`: the output's own nub when the
+  source has one per output (`output_point_of(key)`, a Machine), else its `output_point()`, else
+  its center: number = green flowing dots; on/off = amber, flowing while on;
   press = dim amber that flashes when it fires.
 - **Devices:** every param is an input (set by hand while unlinked, or linked); number
   readings and param settings are outputs. Their names are saved (`catalog`), so an offline

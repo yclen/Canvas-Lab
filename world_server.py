@@ -157,15 +157,20 @@ class WorldApp(canvas.App):
         self.ui("menu", chosen, pos=list(pos),
                 items=[[it[0], it[1] is not None, it[2] if len(it) > 2 else None, *it[3:]] for it in items])
 
-    def start_picking(self, prompt, on_pick, accept=lambda obj: True, origin=None, on_empty=None):
+    def start_picking(self, prompt, on_pick, accept=lambda obj: True, origin=None, on_empty=None,
+                      on_give=None):
         def picked(m):
             obj = self.scene.by_id.get(m.get("id"))
             if obj is not None and accept(obj):
-                on_pick(obj)
+                if m.get("key") is not None and on_give is not None:
+                    on_give(obj, m["key"])               # clicked one of its output dots
+                else:
+                    on_pick(obj)
             elif m.get("point") is not None and on_empty is not None:
                 on_empty(tuple(m["point"]))
         self.ui("pick", picked, prompt=prompt, accept=[o.id for o in self.scene.objects if accept(o)],
-                origin=list(origin) if origin is not None else None, empty=on_empty is not None)
+                origin=list(origin) if origin is not None else None, empty=on_empty is not None,
+                gives=on_give is not None)
 
     def start_placing(self, factory):
         """Something to place with the mouse: the window holds a see-through copy

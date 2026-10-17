@@ -42,6 +42,7 @@ See "Adding an object type" in docs/ARCHITECTURE.md.
 """
 
 import base64
+import copy
 import csv
 import json
 import math
@@ -59,9 +60,10 @@ import pygame
 import expressions
 import instruments
 import plotting
-from canvas import (OBJECT_TYPES, SAVES_DIR, WARN_COLOR, Btn, Field, Give, Prop, Row, ScrollList, Section,
-                    Stepper, Take, Thing, alpha_layer, clip_text, draw_arc, draw_rect, font_px, format_value, get_font,
-                    panel_button, run_action, short_name)
+from canvas import (OBJECT_TYPES, SAVES_DIR, WARN_COLOR, Btn, CanvasObject, Field, Give, Prop, Row, Scene,
+                    ScrollList, Section, Stepper, Take, Thing, _remap_ids, alpha_layer, clip_text, draw_arc,
+                    draw_rect, font_px, format_value, get_font, group_bounds, machines, new_id, object_from_dict,
+                    panel_button, run_action, save_machine, short_name, _save_machines)
 from plotting import nice_step
 from world_link import world_time
 
@@ -7367,3 +7369,740 @@ class InstrumentServer(Thing):
         if size >= 8:
             ts = get_font(size, "bahnschrift").render("INSTRUMENT SERVER", True, (170, 172, 186))
             surface.blit(ts, (display.x, display.bottom + pad))
+
+
+# ============================================================================
+# MACHINES — a circuit of objects packaged behind one skin (E menu ▸ Machines)
+# ============================================================================
+# Select objects, right-click ▸ Create machine…: they leave the canvas and go
+# inside a Machine, which keeps running them. Its inputs (chips on the left)
+# feed inner inputs, its outputs (nubs on the right) read inner outputs. Which
+# ones: Machine.package picks them by where the objects sat (see there).
+MC_PAD = 12                     # Machine layout, in world units at Size 1 (Counter-style)
+MC_TITLE = 30                   # the name row
+MC_CHIP_H, MC_GAP = 24, 8       # an input chip; the gap between chips / screens
+MC_CHIP_MIN_W = 62
+MC_TEXT = 15                    # chip text
+MC_SCREEN_MIN_H = 56            # an output's screen
+MC_SCREEN_MIN_W = 150
+MC_MIN_W = 240
+MC_COLOR = (110, 200, 235)
+PORT_PREFIX = "port:"           # id of the stand-in an inner input links to (MachinePort)
+
+
+STAND_IN_KIND = {"push_button": "press", "switch": "onoff", "slider": "number"}
+STAND_IN_NAME = {"push_button": "Button"}
+
+
+def stand_in(o):
+    """(output, kind) if o is an input object (a push button, switch, slider):
+    inside a machine it can't be clicked, so it becomes a machine input that
+    stands in for it — else None."""
+    if not isinstance(o, Input):
+        return None
+    gives = o.gives()
+    return (gives[0].key, STAND_IN_KIND.get(o.TYPE, "number")) if gives else None
+
+
+def is_hardware(objs):
+    """Is there lab hardware among objs (a device, the instrument server — or a
+    machine with some inside)?"""
+    return any(isinstance(o, (Device, InstrumentServer)) or (isinstance(o, Machine) and o.has_hardware())
+               for o in objs)
+
+
+class MachineScene(Scene):
+    """A machine's inner circuit: an ordinary Scene (its objects tick, link
+    and press as on the canvas), never drawn and never saved on its own — a
+    change inside saves the canvas the machine is on."""
+
+    def __init__(self, objects, owner):
+        super().__init__(objects, path=None)
+        self.owner = owner
+
+    def save(self):
+        if self.owner.scene is not None:
+            self.owner.scene.save()
+
+
+class MachinePort(CanvasObject):
+    """Inside a machine, stands in for one of its inputs: while that input is
+    linked outside, the inner input it feeds is linked to this, and this gives
+    whatever the outside source gives. In the inner scene's by_id only (not
+    its objects), so it's never ticked or saved."""
+
+    def __init__(self, machine, key, kind):
+        super().__init__(id=PORT_PREFIX + key)
+        self.machine, self.key, self.kind = machine, key, kind
+
+    def outputs(self):
+        return {"value": self.machine.take(self.key)}
+
+    def gives(self):
+        return [Give("value", kind="data" if self.kind == "data" else "number")]
+
+    def draw(self, surface, camera):
+        pass
+
+
+class Machine(Thing):
+    """Objects packaged as one: their circuit runs inside it (a MachineScene),
+    off the canvas. Each port is a spec (a dict, saved in ports_in /
+    ports_out): {"key", "label", "kind", "unit", "obj": inner object id} plus
+    "port" (the inner input an input feeds), "source" (an input that stands
+    in for an inner switch / button / slider: everything inside that read
+    that output reads the machine input instead) or "out" (the inner output
+    an output reads). A machine input that's unlinked leaves the inside as it
+    was (an inner input unlinked or set by hand; a switch's own state). Placed from the E menu ▸
+    Machines; `definition` is the uid of the saved machine it came from."""
+
+    TYPE = "machine"
+    NAME = "Machine"
+    DOT_COLOR = MC_COLOR
+    PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
+                  prompt="Size (1 = normal, 2 = twice as big):"),
+             Prop("color", "Color", "color", MC_COLOR),
+             Prop("ports_in", kind="data", default=[], hidden=True),
+             Prop("ports_out", kind="data", default=[], hidden=True),
+             Prop("definition", kind="str", default="", hidden=True)]
+
+    def __init__(self, x, y, text="", *, parts=None, **kwargs):
+        super().__init__(x, y, text or "Machine", **kwargs)
+        self.values = {}            # output key -> its value as of the last tick (players draw these)
+        self._inner = MachineScene(list(parts or []), self)
+        self._size_key, self._widths = None, (MC_MIN_W, 0, 0)
+
+    # --- Saving, copying, placing -----------------------------------------------------
+    def to_dict(self):
+        d = super().to_dict()
+        d["parts"] = [o.to_dict() for o in self._inner.objects]
+        return d
+
+    @classmethod
+    def from_dict(cls, d):
+        obj = super().from_dict(d)
+        data = {"parts": d.get("parts", []), "ports_in": d.get("ports_in", []),
+                "ports_out": d.get("ports_out", [])}
+        if d.get("id") is None:          # a copy: its parts get fresh ids too (devices, scripts key on them)
+            data = _remap_ids(data, {p["id"]: new_id() for p in data["parts"] if p.get("id")})
+        obj._inner = MachineScene([object_from_dict(p) for p in data["parts"]], obj)
+        d["ports_in"], d["ports_out"] = data["ports_in"], data["ports_out"]   # load_props reads these next
+        return obj
+
+    @classmethod
+    def from_definition(cls, machine, at):
+        """A fresh machine from a saved one (E menu ▸ Machines), centered on `at`."""
+        data = {"parts": machine.get("objects", []), "ports_in": machine.get("ports_in", []),
+                "ports_out": machine.get("ports_out", [])}
+        data = _remap_ids(data, {p["id"]: new_id() for p in data["parts"] if p.get("id")})
+        obj = cls(at[0], at[1], machine.get("name", "Machine"),
+                  parts=[object_from_dict(p) for p in data["parts"]])
+        obj.ports_in, obj.ports_out = data["ports_in"], data["ports_out"]
+        obj.definition = machine.get("uid", "")
+        return obj
+
+    @classmethod
+    def can_place(cls, machine, app):
+        """A machine with lab hardware inside goes on the canvas once: two would
+        fight over one instrument."""
+        uid = machine.get("uid")
+        if machine.get("hardware") and any(isinstance(o, cls) and o.definition == uid
+                                           for o in app.scene.objects):
+            app.confirm(f"'{machine.get('name')}' is already on the canvas",
+                        "It has lab hardware in it, so it can only be placed once.",
+                        lambda: None, ok_label="OK")
+            return False
+        return True
+
+    @property
+    def parts(self):
+        return self._inner.objects
+
+    def has_hardware(self):
+        return is_hardware(self.parts)
+
+    @property
+    def copyable(self):
+        return not self.has_hardware()
+
+    def on_removed(self):
+        for o in self.parts:
+            o.on_removed()
+
+    def on_no_players(self):
+        for o in self.parts:
+            o.on_no_players()
+
+    # --- Ports ----------------------------------------------------------------------
+    def takes(self):
+        return [Take(s["key"], s["label"], kind=s.get("kind", "number"), unit=s.get("unit", ""),
+                     on_label=lambda app, key=s["key"]: self.port_menu(app, "in", key))
+                for s in self.ports_in]
+
+    def gives(self):
+        return [Give(s["key"], s["label"], unit=s.get("unit", ""), kind=s.get("kind", "number"),
+                     on_label=lambda app, key=s["key"]: self.port_menu(app, "out", key))
+                for s in self.ports_out]
+
+    # --- Editing the ports (the panel: click a port's name, or + add input / output) -----
+    def _ports(self, side):
+        return self.ports_in if side == "in" else self.ports_out
+
+    def _spec(self, side, key):
+        return next((s for s in self._ports(side) if s["key"] == key), None)
+
+    def input_rows(self, app):
+        return [Row("+ add input", "", on_click=lambda app: self.add_port_menu(app, "in"))]
+
+    def output_rows(self, app):
+        return [Row("+ add output", "", on_click=lambda app: self.add_port_menu(app, "out"))]
+
+    def port_menu(self, app, side, key):
+        """Clicking a port's name in the panel: rename, move it up / down the skin, or remove it."""
+        spec, ports = self._spec(side, key), self._ports(side)
+        if spec is None:
+            return
+        i = ports.index(spec)
+        part = self._inner.by_id.get(spec["obj"])
+        if part is None:
+            inner = "?"
+        elif "source" in spec:
+            inner = f"stands in for {short_name(part)}"
+        else:
+            inner = f"{short_name(part)} · {spec['port' if side == 'in' else 'out']}"
+        items = [(f"{'Input' if side == 'in' else 'Output'} '{spec['label']}' ({inner})", None, "title"),
+                 ("Rename…", lambda: self.rename_port(app, side, key), None)]
+        if i > 0:
+            items.append(("Move up", lambda: self.move_port(app, side, key, -1), None))
+        if i < len(ports) - 1:
+            items.append(("Move down", lambda: self.move_port(app, side, key, 1), None))
+        items.append(("Remove from the machine", lambda: self.remove_port(app, side, key), "danger"))
+        app.context_menu(pygame.mouse.get_pos(), items)
+
+    def rename_port(self, app, side, key):
+        def submit(text):
+            spec = self._spec(side, key)
+            if spec is not None and text.strip():
+                spec["label"] = text.strip()
+                self._ports_changed(app)
+        spec = self._spec(side, key)
+        app.ask(f"Name of this {'input' if side == 'in' else 'output'}:", submit, value=spec["label"] if spec else "")
+
+    def move_port(self, app, side, key, step):
+        ports = self._ports(side)
+        spec = self._spec(side, key)
+        i = ports.index(spec) if spec is not None else -1
+        if 0 <= i + step < len(ports) and i >= 0:
+            ports[i], ports[i + step] = ports[i + step], ports[i]
+            self._ports_changed(app)
+
+    def remove_port(self, app, side, key):
+        """Take a port off the skin. A wire on it goes too; Ctrl+Z puts both back."""
+        spec = self._spec(side, key)
+        scene = self.scene
+        if spec is None or scene is None:
+            return
+        rewired = [o for o in scene.objects if o is self or
+                   (side == "out" and any(l.get("id") == self.id and l.get("key") == key for l in o.links.values()))]
+        scene.push_undo(app.player.name, {
+            "objects": [], "weights": {},
+            "links": {o.id: copy.deepcopy(o.links) for o in rewired},
+            "props": {self.id: {"ports_in": copy.deepcopy(self.ports_in),
+                                "ports_out": copy.deepcopy(self.ports_out)}}})
+        if side == "in":
+            self.links = {k: v for k, v in self.links.items() if k != key}
+            target, pid = self._inner.by_id.get(spec["obj"]), PORT_PREFIX + key
+            if "source" in spec:
+                self._stand_in(spec, False)
+            elif target is not None and (target.links.get(spec["port"]) or {}).get("id") == pid:
+                target.links = {k: v for k, v in target.links.items() if k != spec["port"]}
+                target.on_links_changed()
+            self._inner.by_id.pop(pid, None)
+            self.ports_in = [s for s in self.ports_in if s["key"] != key]
+        else:
+            for o in rewired:
+                if o is not self:
+                    o.links = {k: v for k, v in o.links.items()
+                               if not (v.get("id") == self.id and v.get("key") == key)}
+                    o.on_links_changed()
+            self.ports_out = [s for s in self.ports_out if s["key"] != key]
+        self._ports_changed(app)
+
+    def port_candidates(self, side):
+        """[(label, object, inner input / output)] that could become a port: every
+        inner input that isn't wired from another part (inputs), every inner
+        output (outputs) — minus the ones that already are."""
+        taken = {(s["obj"], s.get("port", s.get("source")) if side == "in" else s["out"])
+                 for s in self._ports(side)}
+        found = []
+        for o in self.parts:
+            if side == "in":
+                si = stand_in(o)
+                if si is not None and (o.id, si[0]) not in taken:
+                    found.append(("(stand in for it)", o, None))
+                for take in o.takes():
+                    src = (o.links.get(take.key) or {}).get("id")
+                    if (o.id, take.key) not in taken and (src is None or src not in self._inner.by_id):
+                        found.append((take.label, o, take))
+            else:
+                for give in o.gives():
+                    if (o.id, give.key) not in taken:
+                        found.append((give.label, o, give))
+        return found
+
+    def add_port_menu(self, app, side):
+        found = self.port_candidates(side)
+        what = "input" if side == "in" else "output"
+        if not found:
+            app.confirm(f"No more {what}s to add", f"Every inner {what} is already on the machine"
+                        + (" (or wired inside it)." if side == "in" else "."), lambda: None, ok_label="OK")
+            return
+        items = [(f"Add an {what}", None, "title")]
+        items += [(f"{short_name(o)} · {label}", lambda o=o, p=p: self.add_port(app, side, o, p), None)
+                  for label, o, p in found]
+        app.context_menu(pygame.mouse.get_pos(), items)
+
+    def add_port(self, app, side, obj, port):
+        """Put an inner input (a Take) / output (a Give) of obj on the skin, at the bottom."""
+        ports = self._ports(side)
+        prefix = "i" if side == "in" else "o"
+        used = {s["key"] for s in ports}
+        key = next(f"{prefix}{n}" for n in range(1, 10000) if f"{prefix}{n}" not in used)
+        if port is None:                                  # a switch / button / slider: stand in for it
+            ports.append(self._stand_in_spec(key, obj, ports, [o for o in self.parts if stand_in(o)]))
+            self._ports_changed(app)
+            return
+        label = port.label if all(s["label"] != port.label for s in ports) else f"{short_name(obj)} {port.label}"
+        spec = {"key": key, "label": label, "kind": port.kind, "unit": port.unit, "obj": obj.id}
+        spec["port" if side == "in" else "out"] = port.key
+        ports.append(spec)
+        self._ports_changed(app)
+
+    def _ports_changed(self, app):
+        """The ports were edited: save, and keep the saved machine (E menu) in step, so
+        the next one placed has them too. Its parts are in the same order as this
+        machine's, so ids are matched by position."""
+        defn = next((m for m in machines() if m.get("uid") == self.definition and self.definition), None)
+        if defn is not None and len(defn.get("objects", [])) == len(self.parts):
+            to_defn = {o.id: d.get("id") for o, d in zip(self.parts, defn["objects"])}
+            defn["ports_in"] = _remap_ids(copy.deepcopy(self.ports_in), to_defn)
+            defn["ports_out"] = _remap_ids(copy.deepcopy(self.ports_out), to_defn)
+            _save_machines()
+        app.save()
+
+    def outputs(self):
+        return {s["key"]: self.values.get(s["key"]) for s in self.ports_out}
+
+    def on_press(self, port):
+        pass                        # nothing to do itself (the inner object acts); this makes its press wires flash
+
+    def tick(self, dt):
+        inner = self._inner
+        for spec in self.ports_in:
+            target = inner.by_id.get(spec["obj"])
+            if target is None:
+                continue
+            pid = PORT_PREFIX + spec["key"]
+            if not isinstance(inner.by_id.get(pid), MachinePort):
+                inner.by_id[pid] = MachinePort(self, spec["key"], spec.get("kind", "number"))
+            if "source" in spec:
+                self._stand_in(spec, self.take_source(spec["key"]) is not None)
+                continue
+            link = {"id": pid, "key": "value"}
+            current = target.links.get(spec["port"])
+            if self.take_source(spec["key"]) is not None:
+                if current != link:
+                    target.links = dict(target.links, **{spec["port"]: link})
+                    target._press_last.pop(spec["port"], None)
+                    target.on_links_changed()
+            elif current is not None and current.get("id") == pid:
+                target.links = {k: v for k, v in target.links.items() if k != spec["port"]}
+                target._press_last.pop(spec["port"], None)
+                target.on_links_changed()
+        inner.tick(dt)
+        values = {}
+        for spec in self.ports_out:
+            src = inner.by_id.get(spec["obj"])
+            values[spec["key"]] = src.outputs().get(spec["out"]) if src is not None else None
+        self.values = values
+
+    @staticmethod
+    def _stand_in_spec(key, o, ports, among):
+        """The input spec standing in for switch / button / slider o: named after
+        it, or "Switch 1", "Switch 2", … (numbered among the unnamed ones of its
+        type in `among`, top to bottom) when it has no name."""
+        source, kind = stand_in(o)
+        label = o.panel_name()
+        if not label:
+            same = [p for p in among if p.TYPE == o.TYPE and not p.panel_name()]
+            label = f"{STAND_IN_NAME.get(o.TYPE, o.type_name())} {same.index(o) + 1 if o in same else 1}"
+        taken = {s["label"] for s in ports}
+        base, n = label, 2
+        while label in taken:
+            label, n = f"{base} ({n})", n + 1
+        return {"key": key, "label": label, "kind": kind, "unit": "", "obj": o.id, "source": source}
+
+    def _stand_in(self, spec, on):
+        """Point everything inside that reads the switch / button / slider of a
+        "source" input at the machine input (on), or back at it (off)."""
+        pid = PORT_PREFIX + spec["key"]
+        own = {"id": spec["obj"], "key": spec["source"]}
+        old, new = (own, {"id": pid, "key": "value"}) if on else ({"id": pid, "key": "value"}, own)
+        for o in self.parts:
+            ports = [k for k, l in o.links.items() if l.get("id") == old["id"] and l.get("key") == old["key"]]
+            if ports:
+                o.links = dict(o.links, **{k: dict(new) for k in ports})
+                for k in ports:
+                    o._press_last.pop(k, None)
+                o.on_links_changed()
+
+    # --- Unfolding: the parts back on the canvas ------------------------------------------
+    @panel_button("Unfold machine")
+    def unfold(self, app):
+        """Put the parts back on the canvas, centered where the machine is, with
+        every wire kept: an outside source on a machine input now feeds what that
+        input fed inside (for a stand-in: what the switch fed), and outside readers
+        of an output read the inner output. Ctrl+Z folds it back up."""
+        scene = self.scene
+        if scene is None or self not in scene.objects:
+            return
+        parts = list(self.parts)
+        readers = [o for o in scene.objects
+                   if o is not self and any(l.get("id") == self.id for l in o.links.values())]
+        batch = scene._deleted_batch([self])
+        batch["links"] = {o.id: copy.deepcopy(o.links) for o in readers}
+
+        # Inside wires from the machine's inputs: to the outside source (or back as they were).
+        for spec in self.ports_in:
+            outer = self.links.get(spec["key"])
+            if outer is not None and outer.get("id") not in scene.by_id:
+                outer = None
+            pid = PORT_PREFIX + spec["key"]
+            if "source" in spec:
+                own = {"id": spec["obj"], "key": spec["source"]}
+                follows = (lambda l: l.get("id") == pid or l == own) if outer is not None else \
+                          (lambda l: l.get("id") == pid)
+                to = dict(outer) if outer is not None else own
+                for o in parts:
+                    if any(follows(l) for l in o.links.values()):
+                        o.links = {k: (dict(to) if follows(l) else l) for k, l in o.links.items()}
+                        o.on_links_changed()
+                continue
+            target = next((o for o in parts if o.id == spec["obj"]), None)
+            if target is None:
+                continue
+            current = target.links.get(spec["port"])
+            if outer is not None:
+                target.links = dict(target.links, **{spec["port"]: dict(outer)})
+            elif current is not None and current.get("id") == pid:
+                target.links = {k: v for k, v in target.links.items() if k != spec["port"]}
+            target.on_links_changed()
+        # Outside readers of its outputs: to the inner outputs.
+        outs = {s["key"]: {"id": s["obj"], "key": s["out"]} for s in self.ports_out}
+        for o in readers:
+            o.links = {k: (dict(outs[l.get("key")]) if l.get("id") == self.id and l.get("key") in outs else l)
+                       for k, l in o.links.items() if not (l.get("id") == self.id and l.get("key") not in outs)}
+            o.on_links_changed()
+
+        # Where the machine is (its parts kept the spot they had when it was made).
+        left, top, right, bottom = group_bounds(parts)
+        c = self.center
+        dx, dy = c[0] - (left + right) / 2, c[1] - (top + bottom) / 2
+        for o in parts:
+            if o.movable:
+                o.move(dx, dy)
+
+        # Swap: the machine off (no on_removed — its parts carry on), the parts in its place.
+        index = scene.objects.index(self)
+        scene.objects[index:index + 1] = parts
+        scene.by_id.pop(self.id, None)
+        for sel in scene.selections.values():
+            sel.discard(self.id)
+        for o in parts:
+            o.scene = scene
+            scene.by_id[o.id] = o
+        scene.sync_weights()
+        scene.save()
+        batch["added"] = [o.id for o in parts]
+        scene.push_undo(app.player.name, batch)
+        app.player.select_many(parts)
+
+    # --- Packaging a selection ----------------------------------------------------------
+    @classmethod
+    def package(cls, app, objs, name):
+        """Create machine…: take objs off the canvas into a new machine where
+        they sat, save it to the E menu ▸ Machines, and select it. Ctrl+Z puts
+        the objects back.
+
+        Ports, by where the objects sat — inputs on the left, outputs on the
+        right: every input of an object in the left half that isn't wired from
+        another part becomes a machine input, and every output of an object in
+        the right half that no other part reads becomes a machine output.
+        Wires crossing the edge always become ports, so nothing comes unplugged:
+        the outside source now feeds the machine's input, and outside readers
+        read the machine's output."""
+        scene = app.scene
+        objs = [o for o in objs if o in scene.objects]
+        if not objs:
+            return None
+        ids = {o.id for o in objs}
+        readers = [o for o in scene.objects
+                   if o.id not in ids and any(l.get("id") in ids for l in o.links.values())]
+        batch = scene._deleted_batch(objs)
+        batch["links"] = {o.id: copy.deepcopy(o.links) for o in readers}
+
+        xs = [o.center[0] for o in objs if o.center is not None] or [0.0]
+        mid, span = (min(xs) + max(xs)) / 2, max(xs) - min(xs)
+        on_left = lambda o: o.center is None or span < 1 or o.center[0] <= mid
+        on_right = lambda o: o.center is None or span < 1 or o.center[0] >= mid
+
+        ins, outs, moved_links = [], [], {}
+        for o in objs:
+            if stand_in(o) is not None:                       # a switch / button / slider: an input
+                c = o.center or (0, 0)
+                ins.append(((c[1], c[0]), o, None))
+            for take in o.takes():
+                link = o.links.get(take.key) or {}
+                src = link.get("id")
+                if src in ids:
+                    continue                                  # wired inside: stays inside
+                from_outside = src is not None and src in scene.by_id
+                if from_outside or on_left(o):
+                    p = o.input_point(take.key) or o.center or (0, 0)
+                    ins.append(((p[1], p[0]), o, take))
+                    if from_outside:
+                        moved_links[(o.id, take.key)] = dict(link)
+        for o in objs:
+            read_inside = {l.get("key") for p in objs for l in p.links.values() if l.get("id") == o.id}
+            read_outside = {l.get("key") for p in readers for l in p.links.values() if l.get("id") == o.id}
+            for i, give in enumerate(o.gives()):
+                if give.key in read_outside or (on_right(o) and give.key not in read_inside
+                                                and stand_in(o) is None):
+                    c = o.center or (0, 0)
+                    outs.append(((c[1], c[0], i), o, give))
+        ins.sort(key=lambda item: item[0])
+        outs.sort(key=lambda item: item[0])
+
+        def labels(items):
+            plain = [item[2].label if item[2] is not None else None for item in items]
+            return [f"{short_name(o)} {lab}" if lab is not None and plain.count(lab) > 1 else lab
+                    for (_k, o, _p), lab in zip(items, plain)]
+        ports_in = []
+        for n, ((_k, o, take), lab) in enumerate(zip(ins, labels(ins))):
+            if take is None:
+                ports_in.append(cls._stand_in_spec(f"i{n + 1}", o, ports_in, [i[1] for i in ins]))
+            else:
+                ports_in.append({"key": f"i{n + 1}", "label": lab, "kind": take.kind, "unit": take.unit,
+                                 "obj": o.id, "port": take.key})
+        ports_out = [{"key": f"o{n + 1}", "label": lab, "kind": give.kind, "unit": give.unit,
+                      "obj": o.id, "out": give.key}
+                     for n, ((_k, o, give), lab) in enumerate(zip(outs, labels(outs)))]
+
+        # Off the canvas (no on_removed: they keep running, inside) ...
+        for o in objs:
+            scene.objects.remove(o)
+            scene.by_id.pop(o.id, None)
+            for sel in scene.selections.values():
+                sel.discard(o.id)
+        # ... with the wires that came in from outside moved onto the machine.
+        machine_links = {}
+        for spec in ports_in:
+            link = moved_links.get((spec["obj"], spec.get("port")))
+            if link is not None:
+                machine_links[spec["key"]] = link
+                o = next(p for p in objs if p.id == spec["obj"])
+                o.links = {k: v for k, v in o.links.items() if k != spec["port"]}
+
+        definition = save_machine(name, objs, uid=new_id(), ports_in=ports_in, ports_out=ports_out,
+                                  hardware=is_hardware(objs))
+        left, top, right, bottom = group_bounds(objs)
+        machine = cls((left + right) / 2, (top + bottom) / 2, definition["name"], parts=objs)
+        machine.ports_in, machine.ports_out = ports_in, ports_out
+        machine.definition = definition["uid"]
+        machine.links = machine_links
+
+        by_port = {(s["obj"], s["out"]): s["key"] for s in ports_out}
+        for o in readers:
+            o.links = {k: ({"id": machine.id, "key": by_port[(l["id"], l.get("key"))]}
+                           if (l.get("id"), l.get("key")) in by_port else l)
+                       for k, l in o.links.items()}
+        scene.add_many([machine])
+        batch["added"] = [machine.id]
+        scene.push_undo(app.player.name, batch)
+        app.player.select_many([machine])
+        return machine
+
+    # --- Layout (world units at Size 1; shared by drawing, clicks and wires) ----------
+    def _measure(self):
+        """(width, chip width, screen-area height), re-measured when the ports change."""
+        key = (tuple(s["label"] for s in self.ports_in), tuple(s["label"] for s in self.ports_out), self.text)
+        if key != self._size_key:
+            font = get_font(100, "consolas", True)
+            text_w = lambda t: font.size(t)[0] * MC_TEXT / 100
+            chip_w = max((max(MC_CHIP_MIN_W, text_w(s["label"]) + 16) for s in self.ports_in), default=0)
+            label_w = max((text_w(s["label"]) for s in self.ports_out), default=0)
+            screen_w = max(MC_SCREEN_MIN_W, label_w + 110)
+            title_w = get_font(100, "bahnschrift").size(self.text or "Machine")[0] * 16 / 100 + 80
+            left = MC_PAD + (chip_w + 10 if self.ports_in else 0)
+            width = max(MC_MIN_W, min(900, max(left + screen_w + MC_PAD, title_w + 2 * MC_PAD)))
+            n_in, n_out = len(self.ports_in), max(1, len(self.ports_out))
+            chips_h = n_in * (MC_CHIP_H + MC_GAP) - MC_GAP if n_in else 0
+            area_h = max(chips_h, n_out * (MC_SCREEN_MIN_H + MC_GAP) - MC_GAP)
+            self._size_key, self._widths = key, (width, chip_w, area_h)
+        return self._widths
+
+    @property
+    def world_width(self):
+        return self._measure()[0] * self.scale
+
+    @property
+    def world_height(self):
+        return (MC_PAD + MC_TITLE + self._measure()[2] + MC_PAD) * self.scale
+
+    def _in_boxes(self):
+        """[(key, x, y, w, h)] of the input chips, world units at Size 1 from the top-left."""
+        _w, chip_w, _h = self._measure()
+        top = MC_PAD + MC_TITLE
+        return [(s["key"], MC_PAD, top + i * (MC_CHIP_H + MC_GAP), chip_w, MC_CHIP_H)
+                for i, s in enumerate(self.ports_in)]
+
+    def _out_boxes(self):
+        """[(key, x, y, w, h)] of the output screens, sharing the height beside the chips."""
+        width, chip_w, area_h = self._measure()
+        x = MC_PAD + (chip_w + 10 if self.ports_in else 0)
+        n = max(1, len(self.ports_out))
+        h = (area_h - (n - 1) * MC_GAP) / n
+        top = MC_PAD + MC_TITLE
+        return [(s["key"], x, top + i * (h + MC_GAP), width - MC_PAD - x, h) for i, s in enumerate(self.ports_out)]
+
+    def _to_world(self, x, y):
+        c = self.world_center
+        return (c.x - self.world_width / 2 + x * self.scale, c.y - self.world_height / 2 + y * self.scale)
+
+    def input_point(self, port):
+        for key, x, y, _w, h in self._in_boxes():
+            if key == port:
+                return self._to_world(x, y + h / 2)
+        return self.center
+
+    def output_point_of(self, key):
+        """Each output has its own nub, on the right edge level with its screen."""
+        width = self._measure()[0]
+        for k, _x, y, _w, h in self._out_boxes():
+            if k == key:
+                return self._to_world(width, y + h / 2)
+        return self.center
+
+    def output_point(self):
+        return self.output_point_of(self.ports_out[0]["key"]) if self.ports_out else self.center
+
+    def _rects(self, rect, boxes):
+        k = rect.width / self._measure()[0]          # screen px per layout unit
+        return [(key, pygame.Rect(rect.x + round(x * k), rect.y + round(y * k),
+                                  max(1, round(w * k)), max(1, round(h * k))))
+                for key, x, y, w, h in boxes], k
+
+    def take_at(self, pos, camera):
+        chips, _k = self._rects(self.screen_rect(camera), self._in_boxes())
+        return next((key for key, r in chips if r.inflate(6, 6).collidepoint(pos)), None)
+
+    def give_at(self, pos, camera):
+        for s in self.ports_out:
+            nub = pygame.Vector2(camera.world_to_screen(self.output_point_of(s["key"])))
+            if nub.distance_to(pos) <= max(8, 8 * self.scale * camera.zoom):
+                return s["key"]
+        return None
+
+    def on_click(self, pos, app):
+        key = self.take_at(pos, app.camera)
+        if key is not None:
+            self.pick(app, key)
+            return True
+        return False                # anywhere else selects it
+
+    # --- Panel ----------------------------------------------------------------------
+    def state_rows(self, app):
+        n = len(self.parts)
+        hw = " — has lab hardware, so it's placed once" if self.has_hardware() else ""
+        return [Row("Inside", f"{n} object{'' if n == 1 else 's'}{hw}")]
+
+    # --- Drawing ----------------------------------------------------------------------
+    def draw_shape(self, surface, rect, camera):
+        s = min(rect.width, rect.height)
+        radius = max(2, s // 8)
+        draw_rect(surface, (14, 14, 18), rect.move(0, max(1, s // 22)), border_radius=radius)
+        draw_rect(surface, INPUT_HOUSING, rect, border_radius=radius)
+        draw_rect(surface, shade(INPUT_HOUSING, 1.35), rect, width=max(1, s // 40), border_radius=radius)
+        if s < 16:
+            draw_rect(surface, shade(self.color, 0.5), rect.inflate(-max(1, s // 3), -max(1, s // 3)))
+            return
+        k = rect.width / self._measure()[0]          # screen px per layout unit
+
+        # The name, and "machine" beside it in its color.
+        size = round(16 * k)
+        if size >= 7:
+            font = get_font(size, "bahnschrift")
+            title = font.render(clip_text(self.text or "Machine", font, rect.width * 0.7), True, (226, 228, 236))
+            surface.blit(title, (rect.x + round(MC_PAD * k), rect.y + round(MC_PAD * k)))
+            tag = get_font(max(7, round(13 * k)), "consolas", True).render("machine", True, shade(self.color, 0.85))
+            room = rect.right - round(MC_PAD * k) - (rect.x + round(MC_PAD * k) + title.get_width() + round(8 * k))
+            if tag.get_width() <= room:
+                surface.blit(tag, tag.get_rect(midright=(rect.right - round(MC_PAD * k),
+                                                         rect.y + round(MC_PAD * k) + title.get_height() // 2)))
+
+        # Inputs: chips on the left — hollow until linked, filled once linked, brighter under the mouse.
+        mouse = pygame.mouse.get_pos() if self.is_hovered else None
+        csize = round(MC_TEXT * k)
+        chips, _k = self._rects(rect, self._in_boxes())
+        for (key, r), spec in zip(chips, self.ports_in):
+            linked = self.take_source(key) is not None
+            hot = mouse is not None and r.inflate(6, 6).collidepoint(mouse)
+            color = shade(self.color, 1.2) if hot else self.color
+            cr = max(2, r.height // 2)
+            if linked:
+                draw_rect(surface, color, r, border_radius=cr)
+            else:
+                draw_rect(surface, INPUT_WELL, r, border_radius=cr)
+                draw_rect(surface, color, r, width=max(1, round(2 * k)), border_radius=cr)
+            if csize >= 7:
+                font = get_font(csize, "consolas", True)
+                ts = font.render(clip_text(spec["label"], font, r.width - 6), True, INPUT_WELL if linked else color)
+                surface.blit(ts, ts.get_rect(center=r.center))
+
+        # Outputs: a screen each (its name small in the corner, the value big), each with its own nub.
+        if not self.ports_out:
+            _key, x, y, w, h = ("", *self._out_boxes_empty())
+            screen = pygame.Rect(rect.x + round(x * k), rect.y + round(y * k), round(w * k), round(h * k))
+            draw_rect(surface, shade(self.color, 0.07), screen, border_radius=max(2, round(6 * k)))
+            if csize >= 7:
+                ts = get_font(csize, "consolas", True).render("no outputs", True, (110, 114, 126))
+                surface.blit(ts, ts.get_rect(center=screen.center))
+            return
+        screens, _k = self._rects(rect, self._out_boxes())
+        pad = round(8 * k)
+        for (key, screen), spec in zip(screens, self.ports_out):
+            value = self.values.get(key)
+            corner = max(2, round(6 * k))
+            draw_rect(surface, shade(self.color, 0.07), screen, border_radius=corner)
+            draw_rect(surface, (8, 8, 10), screen, width=max(1, s // 45), border_radius=corner)
+            pygame.draw.circle(surface, self.color if value is not None else shade(self.color, 0.4),
+                               (rect.right, screen.centery), max(2, round(5 * k)))
+            lsize = round(13 * k)
+            if lsize >= 7:
+                lf = get_font(lsize, "consolas", True)
+                ls = lf.render(clip_text(spec["label"], lf, screen.width - 2 * pad), True, shade(self.color, 0.75))
+                surface.blit(ls, (screen.x + pad, screen.y + max(1, pad // 2)))
+            text = format_value(value, spec.get("unit", ""))
+            color = shade(self.color, 1.2) if value is not None else (110, 114, 126)
+            vsize = round(screen.height * 0.5)
+            while vsize > 7 and get_font(vsize, "consolas", True).size(text)[0] > screen.width - 2 * pad:
+                vsize = max(7, int(vsize * 0.9))
+            if vsize >= 7:
+                vs = get_font(vsize, "consolas", True).render(text, True, color)
+                surface.blit(vs, vs.get_rect(bottomright=(screen.right - pad, screen.bottom - max(1, pad // 2))))
+
+    def _out_boxes_empty(self):
+        """Where the (empty) screen goes when it has no outputs."""
+        width, chip_w, area_h = self._measure()
+        x = MC_PAD + (chip_w + 10 if self.ports_in else 0)
+        return x, MC_PAD + MC_TITLE, width - MC_PAD - x, area_h
