@@ -699,6 +699,7 @@ LINK_COLOR = (120, 220, 150)        # number wires (flowing dots)
 LINK_ONOFF_COLOR = (240, 200, 90)   # on/off and press wires
 LINK_DATA_COLOR = (110, 160, 255)   # data wires (flowing while the data is live)
 PRESS_FLASH = 0.35                  # seconds a press wire stays lit after it fires
+UNDO_DELETES = 20                   # deletes each player can undo with Ctrl+Z
 
 
 def format_value(value, unit=""):
@@ -2433,6 +2434,7 @@ class Scene:
         self.path = path        # where it saves; None = a player's copy of a world that lives elsewhere
         self.by_id = {o.id: o for o in objects}
         self.selections = {}    # player name -> set of selected ids
+        self.deleted = {}       # player name -> their deletes, oldest first (for Ctrl+Z; not saved)
         for o in objects:
             o.scene = self      # so connectors (Train) can resolve their nodes
         for o in objects:       # heal any legacy overhang corners in old trains
@@ -2527,7 +2529,15 @@ class Scene:
     def delete(self, obj):
         self.delete_many([obj])
 
-    def delete_many(self, objs):
+    def delete_many(self, objs, by=None):
+        """Remove objects. Given `by` (a player name), the delete is remembered
+        so that player's Ctrl+Z (undo_delete) can bring it back."""
+        if by is not None:
+            batch = self._deleted_batch([o for o in objs if o in self.objects])
+            if batch["objects"]:
+                stack = self.deleted.setdefault(by, [])
+                stack.append(batch)
+                del stack[:-UNDO_DELETES]
         removed = False
         for obj in objs:
             if obj in self.objects:
@@ -2540,6 +2550,42 @@ class Scene:
         if removed:
             self.sync_weights()
             self.save()
+
+    def _deleted_batch(self, objs):
+        """What undo needs to bring objs back: each one's saved data and place in
+        the draw order, plus the W's other neurons hold to the deleted neurons
+        (sync_weights drops those). Links *into* other objects need nothing:
+        they're kept by id and reconnect once the id is back."""
+        gone = {o.id for o in objs}
+        weights = {n.id: {k: w for k, w in n.weights.items() if k in gone}
+                   for n in self.neurons if n.id not in gone}
+        return {"objects": [(self.objects.index(o), o.to_dict()) for o in objs],
+                "weights": {i: ws for i, ws in weights.items() if ws}}
+
+    def undo_delete(self, by):
+        """Bring back `by`'s most recent delete. Returns the restored objects
+        ([] if there's nothing to undo)."""
+        stack = self.deleted.get(by)
+        if not stack:
+            return []
+        batch = stack.pop()
+        restored = []
+        for index, d in sorted(batch["objects"], key=lambda item: item[0]):
+            if d.get("id") in self.by_id:
+                continue                        # already back (e.g. pasted / re-added)
+            obj = object_from_dict(d)
+            obj.scene = self
+            self.objects.insert(min(index, len(self.objects)), obj)
+            self.by_id[obj.id] = obj
+            restored.append(obj)
+        for nid, ws in batch["weights"].items():
+            n = self.by_id.get(nid)
+            if isinstance(n, Neuron):
+                n.weights.update({k: w for k, w in ws.items() if k in self.by_id})
+        if restored:
+            self.sync_weights()
+            self.save()
+        return restored
 
     def tick(self, dt):
         """Move the world on by dt seconds. Each object's tick is guarded: one
@@ -4618,6 +4664,8 @@ class App:
                 self.copy(sel)                      # nothing for trains (not copyable)
         elif command == "delete_node":
             self.delete_objects(self.player.selection)    # works for any object (incl. trains)
+        elif command == "undo":
+            self.undo_delete()
         elif command == "goto":
             self.go_to(sel)
 
@@ -4638,11 +4686,15 @@ class App:
         self.save()
 
     def delete_objects(self, objs):
-        """Delete objects after one confirm."""
-        if not objs:
-            return
-        title = f"Delete '{objs[0].display_name}'?" if len(objs) == 1 else f"Delete {len(objs)} objects?"
-        self.confirm(title, "Are you sure you want to delete?", lambda: self.scene.delete_many(objs))
+        """Delete objects right away — no confirm; Ctrl+Z brings them back."""
+        if objs:
+            self.scene.delete_many(objs, by=self.player.name)
+
+    def undo_delete(self):
+        """Ctrl+Z: bring back this player's last delete, selected."""
+        restored = self.scene.undo_delete(self.player.name)
+        if restored:
+            self.player.select_many(restored)
 
     def copy(self, obj, at=None):
         """Drop a copy of obj (at a world point, or nudged beside it) and select it."""

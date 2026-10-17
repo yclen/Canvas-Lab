@@ -44,8 +44,9 @@ object connects.
 | Click | select, or use the object (press a button, drag a slider, …) |
 | Ctrl+click, drag a box | select without using it |
 | Right-click | menu for the selection (align, create machine, delete, …) |
-| Arrow keys | move the selection |
-| **C** / **Delete** | copy the selection at the mouse / delete it |
+| Arrow keys / **WASD** | move the selection |
+| **C** / **Delete** | copy the selection at the mouse / delete it (no confirm) |
+| **Ctrl+Z** | undo your last delete |
 | Shift+click while placing | keep placing more |
 | **Esc** | cancel placing, linking or building |
 

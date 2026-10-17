@@ -44,7 +44,7 @@
 
 - Level-of-detail draw (buttons shrink to a dot; no Button↔Rectangle swap machinery)
 - JSON persistence (`{"objects": [...]}`) behind `load_objects`/`save_objects`; stable ids, backfilled
-- Menu bar (Add / Edit / Go To) + unified modal slot (text input, confirm delete)
+- Menu bar (Add / Edit / Go To) + unified modal slot (text input, confirm)
 - Inspector side panel: view a node's data, **Set command…**, **Activate** (runs detached)
 - ACTIONS registry: `run_command` (shell, detached) + `goto` (internal camera jump)
 
@@ -68,8 +68,11 @@
 - Generalized selection + movement: any object can be selected/deleted; `movable`/`move()`
   capability (nodes + walls + agents move, trains don't); node-only actions guard for `Node`
 - **Drag-box multi-select**: left-drag on empty canvas selects every node whose center is in
-  the box (+ walls fully inside). Arrow keys move all of them; Edit ▸ Delete / **Delete** key
-  removes all after one confirm. `scene.selection` is the list; `scene.selected` is the single
+  the box (+ walls fully inside). Arrow keys (or WASD) move all of them; Edit ▸ Delete / **Delete** key
+  removes all at once — no confirm. **Ctrl+Z** brings back your last delete (selected again),
+  up to `UNDO_DELETES` (20) back: `Scene.delete_many(objs, by=player name)` keeps each player's
+  deletes (saved data + place in the draw order + other neurons' W's to them; not saved to disk),
+  `Scene.undo_delete(name)` restores them — links from other objects reconnect by id. `scene.selection` is the list; `scene.selected` is the single
   object or None when 0 or 2+, so rename/copy/goto/inspector only apply to one object
 - **Right-click menu**: a right-*click* (the mouse moves ≤ `RIGHT_CLICK_SLOP` px between press
   and release; more is a right-drag pan) opens a `ContextMenu` at the cursor for the selection
@@ -77,7 +80,7 @@
   object gets the same menu as its panel's ⋯ button. Several get *Align horizontally (same X)*
   — their centers line up in a column at their average X, each keeping its Y — and *Align
   vertically (same Y)* (a row), for the movable ones (`App.align`); then *Create machine…*
-  (below), then *Delete N objects* (red), which goes through the same confirm as the Delete key. `App.context_menu(pos, [(label, callback, style)])` opens
+  (below), then *Delete N objects* (red), which deletes at once like the Delete key (Ctrl+Z undoes). `App.context_menu(pos, [(label, callback, style)])` opens
   one; it's a modal, so a click elsewhere or Esc closes it. Not while a mode (placing, picking,
   building) is active
 - **Machines** (`canvas.py`, "Machines" section): a saved group of objects, placed again as a
@@ -254,7 +257,7 @@ or 1 (anything that isn't 0 counts as on). Text stays display-only. The one exce
   text values.
 
 **Dialogs are callbacks.** `app.ask(prompt, on_submit)` opens a text box and calls
-`on_submit(text)` on Enter; `app.confirm(message, sub, on_confirm)` is the delete dialog.
+`on_submit(text)` on Enter; `app.confirm(message, sub, on_confirm)` is the confirm dialog.
 That replaced a `purpose`-string switch in the loop that every new prompt had to extend.
 
 ---

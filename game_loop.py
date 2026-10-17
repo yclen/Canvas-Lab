@@ -298,7 +298,11 @@ def play(scene, player, link=None):
                     app.place(new)
 
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_DELETE and not app.building:
-                app.menu_command("delete_node")   # same confirm as Edit ▸ Delete
+                app.menu_command("delete_node")   # deletes at once, like Edit ▸ Delete
+
+            elif (event.type == pygame.KEYDOWN and event.key == pygame.K_z
+                    and event.mod & pygame.KMOD_CTRL and not app.building):
+                app.menu_command("undo")          # bring back the last delete
 
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
                 panning = True
@@ -346,12 +350,16 @@ def play(scene, player, link=None):
                             else:
                                 last_click_time, last_click_shape = now, clicked
 
-        # Arrow keys move every selected object (screen-space speed, so /zoom).
-        # Suspended while a modal is capturing keystrokes or a build mode is on.
+        # Arrow keys / WASD move every selected object (screen-space speed, so /zoom).
+        # Suspended while a modal is capturing keystrokes or a build mode is on;
+        # WASD also while Ctrl is down, so a Ctrl shortcut never moves anything.
         if app.modal is None and not app.building:
             keys = pygame.key.get_pressed()
-            move_dx = keys[pygame.K_RIGHT] - keys[pygame.K_LEFT]
-            move_dy = keys[pygame.K_DOWN] - keys[pygame.K_UP]
+            wasd = not pygame.key.get_mods() & pygame.KMOD_CTRL
+            move_dx = (bool(keys[pygame.K_RIGHT] or wasd and keys[pygame.K_d])
+                       - bool(keys[pygame.K_LEFT] or wasd and keys[pygame.K_a]))
+            move_dy = (bool(keys[pygame.K_DOWN] or wasd and keys[pygame.K_s])
+                       - bool(keys[pygame.K_UP] or wasd and keys[pygame.K_w]))
             movers = [o for o in player.selection if o.movable]
             is_moving = bool(move_dx or move_dy) and bool(movers)
             if is_moving:
