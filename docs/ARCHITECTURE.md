@@ -216,6 +216,53 @@ or 1 (anything that isn't 0 counts as on). Text stays display-only. The one exce
 **data**: a `Give(kind="data")` offers a dict (with a `"label"` for the panel) that only a
 `Take(kind="data")` takes — a Script's `runs` into a Graph.
 
+### The port rules — how inputs and outputs look and connect
+
+The Machine set these; every object with inputs or outputs should follow them, so a wire can be
+read at a glance (which output feeds which input) and linked by hand without menus.
+
+1. **Inputs on the left.** One chip per input down the left edge, labeled with its name —
+   hollow until linked, filled once linked, brighter under the mouse. A wire ends at its chip
+   (`input_point(port)`), and a wire dropped on a chip links that input (`take_at`).
+2. **Outputs on the right.** One screen per output showing its live value (its name small in
+   the corner, the value big), each with **its own dot on the right edge**, level with its
+   screen — lit while it has a value. An object with one output may use a single dot
+   (`output_point()`); with more, `output_point_of(key)` gives each output's dot.
+3. **A wire runs from its output's dot to its input's chip.** Never from an object's center,
+   and never two outputs from one point — so the wire itself says what it carries.
+4. **The dot is the handle.** Drag from a dot to lay that output's wire (`give_at` returns the
+   output under the mouse); while linking an input, click a dot to take that output with no menu
+   (the rubber band snaps to it and names it). Clicking the body still opens the menu.
+5. **Inside a machine, input objects become inputs.** A switch, push button or slider can't be
+   clicked in there, so it becomes an input chip that stands in for it ("Switch 1", …). When
+   packaging, the left side gives the inputs and the right side the outputs.
+6. **Kinds show on the wire, not the port:** number = green flowing dots, on/off = amber while on,
+   press = amber flash, data = thick blue (see *Wires* below).
+
+Built for it: the Machine (`things.py`) is the reference — chips, a screen and dot per output,
+per-output picking and dragging. **Exceptions by design:** the Data relay is a junction (a wire
+in and out at its center, fanned out); logic gates draw schematic pins instead of chips and
+screens, but keep inputs left and the output right.
+
+**Who follows the rules** (as of the Timer's two-output rework):
+
+| Object | Inputs | Outputs | Status |
+|---|---|---|---|
+| Machine, Timer | chips, left | a screen + dot each | follows |
+| Function, Counter, Sequence | chips, left | one output: screen + dot | follows |
+| AND gate | pins, left | pin, right | follows (schematic look) |
+| Data tag | hole, left ✓; *streaming* input is the icon top-right ✗ | dot, right | mostly |
+| Data collector | *collect* chip left ✓; columns on top of their headers ✗ | `rows` — no dot, center ✗ | partly |
+| Readout | `in` at its center ✗ | `value` — no dot, center ✗ | no |
+| Graph | *Runs from* at its center ✗ | — | no |
+| Push button, Switch, Slider, Lamp | — | one output, no dot, center ✗ | no |
+| Neuron | — | 3 outputs, center ✗ | no |
+| Script | RUN / STOP on the button, field chips beside it ✗ | 4 outputs (one data), center ✗ | no |
+| PDA45 | `gate`, at its center | a dot each for `count_rate` / `voltage`, right, level with its screen (no labels: the screens are the labels) | its own look, on purpose |
+| PM100D | `wavelength`, at its center | one dot (`power`), right, level with the LCD | its own look, on purpose |
+| Flip mirror, Filter wheel | one dot (`up` / `position`), left — a ring until linked | each reading + setting, center | its own look, on purpose |
+| Every other device (Zaber, SuperK, excitation filters, …) | each setting, at its center | each reading + setting, center | its own look, on purpose |
+
 - **Outputs:** `outputs()` → `{name: number or None}` is how values are read; `gives()`
   declares them (name, unit), so the panel and the pickers can list them even while a value is
   None. Every output is always listed — no value is `None`, never a missing key.
@@ -241,17 +288,26 @@ or 1 (anything that isn't 0 counts as on). Text stays display-only. The one exce
   `take_on(port)`, `link(port, src, key)`, `unlink(port)`, `unlink_all()`, `pick(app, port)`.
   The scene calls `watch_presses(dt)` every frame, which fires `on_press` — so no type keeps
   its own edge-tracking.
-- **Linking, one way everywhere:** click **link** on an input's row (or its chip on the
-  canvas), then click a source (`App.pick_link`, PickMode: rubber band + green ring; clicking
-  the object itself unlinks); if the source has several outputs, a menu at the cursor lists
-  them with live values (for press / on-off inputs `pressed`, `on`, `value` come first) — or
-  click right on one of its output dots (`give_at`: a Function's nub, each of a machine's) to
-  take that output with no menu: while picking, the rubber band snaps to a dot under the cursor
-  and names it (PickMode `on_give`; in a world the window's answer carries the output). Click
-  the output's name on a linked row to choose a different one. The other way round: click an
-  output in *Outputs / gives*, then the object to feed (`App.pick_target`, a menu of its
-  inputs), or **drag from an output nub** (Function, Counter, Tag — `give_at`) and let go on an
-  input chip (`take_at`) or anywhere on an object with inputs (`LinkDrag`).
+- **Linking, one way everywhere — a wire in hand** (`canvas.WireMode`, `App.hold_wire`): pick
+  up a wire from any port — press an output's dot (`give_at`), or click an input's chip / dot
+  (its `on_click` → `pick` → `App.pick_link`), or *link* on an input's row, or an output's row in
+  *Outputs / gives* (`App.pick_target`). **Drag** it and it links where you let go (over nothing,
+  it stays in hand); **click** (no drag, `WIRE_DRAG_SLOP`) and it stays in hand until the next
+  click: on the other end — an input while holding an output, an output's dot while holding an
+  input — or an object with one (a menu of its inputs / outputs, with live values) it links and
+  lets go; **Shift+click** keeps an output's wire in hand to feed more inputs. On **empty canvas**
+  it places a Data relay, wired in, and carries on from it (from an output the relay is fed by
+  the wire; from an input it feeds the input), so a path is laid hop by hop. A click on the
+  *same* end (an output holding an output, …) does nothing and the hint says why — an input only
+  ever takes an output, so the two ends can't be crossed; holding an input, a click on its own
+  object unlinks it. **Right-click** (or Esc) lets go; relays placed stay. While held, the wire's
+  dots flow the way the value will, its free end is a dot (an output's) or a ring (an input's),
+  it snaps to a valid port under the mouse, and the hint names what's held — or "Replaces …" over
+  an input that's already linked. **Hover:** a ring shows on the port under the mouse
+  (`draw_port_hover`); `PORT_REACH` (12 px) around a dot counts as on it, and an input's dot
+  just off its object's edge is found by `Scene.take_at`. In a world the window holds the wire:
+  the world's `pick_link` / `pick_target` send `ui` *wire*, links go as `choose_take`, relays as
+  `add`, an unlink as `unlink`. Click the output's name on a linked row to choose a different one.
 - **Wires** are drawn by the base class from `links`, from the source's output point to the
   reader's `input_point(port)` — `canvas.output_point(obj, key)`: the output's own nub when the
   source has one per output (`output_point_of(key)`, a Machine), else its `output_point()`, else

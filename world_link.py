@@ -41,6 +41,7 @@ Protocol: JSON, one object per line, both ways.
     {"op": "command", "command"}              menu bar (App.menu_command)
     {"op": "create", "type"} / {"op": "create_machine", "machine"}    E menu / Add menu
     {"op": "choose_take", "target", "src", "key", "port"}            a wire dropped on an input
+    {"op": "unlink", "id", "port"}            an input's wire let go of on its own object
     {"op": "add", "objects": [to_dict], "select"}                    made here (copy, train, wall)
     {"op": "move", "ids", "dx", "dy"} / {"op": "moved"}               arrow keys / let go (save)
     {"op": "answer", "token", ...}            the answer to a "ui" request (value / index / id /
@@ -58,6 +59,7 @@ Protocol: JSON, one object per line, both ways.
     {"op": "ui", "kind", "token", ...}        show something for object code running in the world:
         kind ask (prompt, value) / confirm (message, sub, ok_label) / menu (pos, items:
         [label, clickable, style, detail?]) / pick (prompt, accept: [ids], origin, empty) /
+        wire (end: in / out, id, key — the window holds that port's wire) /
         place (sample: {objects, name}) / place_done / inventory / train / wall —
         answered with {"op": "answer", "token"}; and, with no token, camera (camera, ride?)
         and select (ids): the world's App moved this player's camera / selection

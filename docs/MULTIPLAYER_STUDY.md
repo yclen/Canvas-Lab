@@ -42,7 +42,7 @@ events ──► App / modes / inspector / object.on_click ──► mutate obje
 | `Scene` | object list, `by_id`, selection, camera, save/load, the neuron mesh | **both** (camera + selection are view; objects are world) |
 | `CanvasObject` + 34 subclasses | each one holds its data, simulates (`tick`), draws, hit-tests, handles clicks, builds its panel | **all three in one class** |
 | `App` | what object code gets handed: `ask`, `confirm`, `context_menu`, `place`, `save`, linking pickers | view / controls, but its callbacks change the world |
-| Modes (`PlaceMode`, `PickMode`, `LinkDrag`, `TrainBuilder`, `WallBuilder`, `MarqueeSelect`), `InspectorPanel`, `MenuBar`, `InventoryPanel`, modals, `CameraRide` | UI | **view** — already separate classes, good |
+| Modes (`PlaceMode`, `PickMode`, `WireMode`, `TrainBuilder`, `WallBuilder`, `MarqueeSelect`), `InspectorPanel`, `MenuBar`, `InventoryPanel`, modals, `CameraRide` | UI | **view** — already separate classes, good |
 | `Nodes.json`, `machines.json` | saved world; machine library | world; library is debatable (shared or per player?) |
 | `instruments.client` → `instrument_server.py` | hardware on this PC | world-side (the hardware is in one place) |
 

@@ -60,8 +60,8 @@ import pygame
 import expressions
 import instruments
 import plotting
-from canvas import (OBJECT_TYPES, SAVES_DIR, WARN_COLOR, Btn, CanvasObject, Field, Give, Prop, Row, Scene,
-                    ScrollList, Section, Stepper, Take, Thing, _remap_ids, alpha_layer, clip_text, draw_arc,
+from canvas import (OBJECT_TYPES, PORT_REACH, SAVES_DIR, WARN_COLOR, Btn, CanvasObject, Field, Give, Prop, Row,
+                    Scene, ScrollList, Section, Stepper, Take, Thing, _remap_ids, alpha_layer, clip_text, draw_arc,
                     draw_rect, font_px, format_value, get_font, group_bounds, machines, new_id, object_from_dict,
                     panel_button, run_action, save_machine, short_name, _save_machines)
 from plotting import nice_step
@@ -2670,6 +2670,9 @@ TM_INPUTS = ("start", "reset")
 TM_DONE_COLOR = (110, 220, 130)
 TM_IDLE_COLOR = (150, 152, 166)
 TM_FLASH = 0.6                  # seconds the screen flares when it finishes
+TM_OUTPUTS = ("remaining", "done")   # a screen each, top to bottom, each with its own dot
+TM_SCREEN_H = 50                # each output's screen
+TM_SCREEN_GAP = 8
 TM_RETRIGGER = ("restarts", "is ignored")
 TM_UNITS = {"ms": 0.001, "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
             "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
@@ -2721,11 +2724,11 @@ class DurationProp(Prop):
 class Timer(Thing):
     """Counts down its Duration, then says it's done. A press on its `start` chip
     (a push button, another timer's `done`, … — a 0 → 1 change counts once)
-    starts it; `reset` stops it and clears done. Outputs `done` (1 from the end
-    until the next start / reset, so whatever it's linked to fires once),
-    `running`, `remaining`, `elapsed`, `progress`. Click a chip, then the
-    source; click the timer to start it (or reset it while it runs). Ctrl+click
-    selects it.
+    starts it; `reset` stops it and clears done. Two outputs, each with its own
+    screen and dot: `remaining` (seconds left; the Duration while idle) and
+    `done` (1 from the end until the next start / reset, so whatever it's
+    linked to fires once). Click a chip, then the source; click the timer to
+    start it (or reset it while it runs). Ctrl+click selects it.
 
     A run keeps the world-clock moment it started (`_started`, drawn with
     world_time() on every PC, so nothing changes per frame for the world to
@@ -2826,12 +2829,10 @@ class Timer(Thing):
             self.finish()
 
     def gives(self):
-        return [Give("done"), Give("running"), Give("remaining", unit="s"), Give("elapsed", unit="s"),
-                Give("progress")]
+        return [Give("remaining", unit="s"), Give("done")]
 
     def outputs(self):
-        return {"done": 1.0 if self.done else 0.0, "running": 1.0 if self.running() else 0.0,
-                "remaining": self.remaining(), "elapsed": self.elapsed(), "progress": self.progress()}
+        return {"remaining": self.remaining(), "done": 1.0 if self.done else 0.0}
 
     # --- Panel and clicks ---------------------------------------------------------------
     def on_click(self, pos, app):
@@ -2865,7 +2866,8 @@ class Timer(Thing):
 
     @property
     def world_height(self):
-        return (FN_PAD + CT_TITLE + 2 * FN_CHIP_H + FN_CHIP_GAP + FN_PAD) * self.scale
+        n = len(TM_OUTPUTS)
+        return (FN_PAD + CT_TITLE + n * TM_SCREEN_H + (n - 1) * TM_SCREEN_GAP + FN_PAD) * self.scale
 
     def _to_world(self, x, y):
         c = self.world_center
@@ -2876,10 +2878,12 @@ class Timer(Thing):
         return [(name, FN_PAD, top + i * (FN_CHIP_H + FN_CHIP_GAP), CT_CHIP_W, FN_CHIP_H)
                 for i, name in enumerate(TM_INPUTS)]
 
-    def _screen_box(self):
+    def _screen_boxes(self):
+        """[(output, x, y, w, h)]: a screen per output, beside the chips."""
         x = FN_PAD + CT_CHIP_W + 10
-        y = FN_PAD + CT_TITLE
-        return x, y, TM_W - FN_PAD - x, self.world_height / self.scale - FN_PAD - y
+        top = FN_PAD + CT_TITLE
+        return [(key, x, top + i * (TM_SCREEN_H + TM_SCREEN_GAP), TM_W - FN_PAD - x, TM_SCREEN_H)
+                for i, key in enumerate(TM_OUTPUTS)]
 
     def input_point(self, port):
         for n, x, y, _w, h in self._chip_boxes():
@@ -2887,9 +2891,22 @@ class Timer(Thing):
                 return self._to_world(x, y + h / 2)
         return self.center
 
+    def output_point_of(self, key):
+        """Each output's own dot, on the right edge level with its screen."""
+        for k, _x, y, _w, h in self._screen_boxes():
+            if k == key:
+                return self._to_world(TM_W, y + h / 2)
+        return self.center
+
     def output_point(self):
-        x, y, w, h = self._screen_box()
-        return self._to_world(x + w + FN_PAD, y + h / 2)
+        return self.output_point_of(TM_OUTPUTS[0])
+
+    def give_at(self, pos, camera):
+        for key in TM_OUTPUTS:
+            dot = pygame.Vector2(camera.world_to_screen(self.output_point_of(key)))
+            if dot.distance_to(pos) <= max(PORT_REACH, 8 * self.scale * camera.zoom):
+                return key
+        return None
 
     def _chip_rects(self, rect):
         k = rect.width / TM_W
@@ -2948,37 +2965,54 @@ class Timer(Thing):
                 ts = get_font(csize, "consolas", True).render(name, True, INPUT_WELL if linked else color)
                 surface.blit(ts, ts.get_rect(center=r.center))
 
-        # The screen: the countdown (DONE at the end, the duration while idle), a progress
-        # bar along its bottom, and the output nub on the right edge.
-        x, y, w, h = self._screen_box()
-        screen = pygame.Rect(rect.x + round(x * k), rect.y + round(y * k), round(w * k), round(h * k))
-        corner = max(2, round(6 * k))
+        # Two screens, each with its own dot: the time left (the duration while idle) over a
+        # progress bar, and done — YES (flaring as it finishes) or NO.
         flare = max(0.0, 1 - (world_time() - self._done_at) / TM_FLASH) if self.done else 0.0
-        draw_rect(surface, shade(state_color, 0.07 + 0.25 * flare), screen, border_radius=corner)
-        draw_rect(surface, (8, 8, 10), screen, width=max(1, s // 45), border_radius=corner)
-        pygame.draw.circle(surface, state_color, (rect.right, screen.centery), max(2, round(5 * k)))
+        corner = max(2, round(6 * k))
         pad = round(8 * k)
-        bar_h = max(2, round(5 * k))
-        bar = pygame.Rect(screen.x + pad, screen.bottom - pad - bar_h, screen.width - 2 * pad, bar_h)
-        if running or self.done:
-            draw_rect(surface, shade(state_color, 0.25), bar, border_radius=bar_h // 2)
-            filled = bar.copy()
-            filled.width = round(bar.width * self.progress())
-            if filled.width > 0:
-                draw_rect(surface, state_color, filled, border_radius=bar_h // 2)
-        if self.done:
-            text, color = "DONE", shade(TM_DONE_COLOR, 1.1 + 0.4 * flare)
-        elif running:
-            text, color = format_duration(self.remaining(), True), shade(self.color, 1.2)
-        else:
-            text, color = format_duration(self.duration, True), shade(TM_IDLE_COLOR, 0.9)
-        text_mid = (screen.centerx, (screen.top + bar.top) // 2)
-        size = round(h * 0.4 * k)
-        while size > 7 and get_font(size, "consolas", True).size(text)[0] > screen.width - 2 * pad:
-            size = max(7, int(size * 0.9))
-        if size >= 7:
-            ts = get_font(size, "consolas", True).render(text, True, color)
-            surface.blit(ts, ts.get_rect(center=text_mid))
+        lsize = round(12 * k)
+        for key, x, y, w, h in self._screen_boxes():
+            screen = pygame.Rect(rect.x + round(x * k), rect.y + round(y * k), round(w * k), round(h * k))
+            if key == "remaining":
+                color = state_color
+                glow = 0.07
+            else:
+                color = TM_DONE_COLOR if self.done else TM_IDLE_COLOR
+                glow = 0.07 + 0.25 * flare
+            draw_rect(surface, shade(color, glow), screen, border_radius=corner)
+            draw_rect(surface, (8, 8, 10), screen, width=max(1, s // 45), border_radius=corner)
+            lit = (running or self.done) if key == "remaining" else self.done
+            pygame.draw.circle(surface, color if lit else shade(color, 0.55),
+                               (rect.right, screen.centery), max(2, round(5 * k)))
+            if lsize >= 7:
+                ls = get_font(lsize, "consolas", True).render(key, True, shade(color, 0.75))
+                surface.blit(ls, (screen.x + pad, screen.y + max(1, pad // 2)))
+            bottom = screen.bottom - max(1, pad // 2)
+            if key == "remaining":
+                bar_h = max(2, round(4 * k))
+                bar = pygame.Rect(screen.x + pad, screen.bottom - pad - bar_h, screen.width - 2 * pad, bar_h)
+                if running or self.done:
+                    draw_rect(surface, shade(color, 0.25), bar, border_radius=bar_h // 2)
+                    filled = bar.copy()
+                    filled.width = round(bar.width * self.progress())
+                    if filled.width > 0:
+                        draw_rect(surface, color, filled, border_radius=bar_h // 2)
+                bottom = bar.top - max(1, pad // 3)
+                if running:
+                    text, ink = format_duration(self.remaining(), True), shade(self.color, 1.2)
+                elif self.done:
+                    text, ink = format_duration(0, True), shade(TM_DONE_COLOR, 1.1)
+                else:
+                    text, ink = format_duration(self.duration, True), shade(TM_IDLE_COLOR, 0.9)
+            else:
+                text = "YES" if self.done else "NO"
+                ink = shade(TM_DONE_COLOR, 1.1 + 0.4 * flare) if self.done else shade(TM_IDLE_COLOR, 0.75)
+            size = round(h * 0.5 * k)
+            while size > 7 and get_font(size, "consolas", True).size(text)[0] > screen.width - 2 * pad - round(40 * k):
+                size = max(7, int(size * 0.9))
+            if size >= 7:
+                ts = get_font(size, "consolas", True).render(text, True, ink)
+                surface.blit(ts, ts.get_rect(bottomright=(screen.right - pad, bottom)))
 
 
 # ---- Sequence: a list of numbers, stepped through like a for loop's i --------------------
@@ -4002,23 +4036,8 @@ class DataRelay(Thing):
             self._readers = [o for o in self.scene.objects if o is not self and links_to(o, self.id)]
             self._loop = self._in_loop()
 
-    # --- Linking ------------------------------------------------------------------------
-    def pick(self, app, port):
-        if port != "in":
-            super().pick(app, port)
-            return
-        app.pick_link(self, port, on_empty=lambda world: self.extend(app, world),
-                      note=" — empty canvas: place a relay fed by it")
-
+    # --- Linking (clicking it picks up its input's wire; empty canvas then lays relays) ---
     def on_links_changed(self):
-        self._recount = 0.0
-
-    def extend(self, app, world):
-        """A click on empty canvas while linking: a new relay there, fed by this one —
-        so a path can be laid down hop by hop (this one keeps its own source)."""
-        relay = DataRelay(*world)
-        relay.links = {"in": {"id": self.id, "key": "value"}}
-        app.place(relay)
         self._recount = 0.0
 
     def on_click(self, pos, app):
@@ -4694,6 +4713,17 @@ DEVICE_STATUS_TEXT = {"ok": "connected", "starting": "starting…", "connecting"
                       "error": "error", "missing": "not on the server", "offline": "server offline",
                       "off": "not connected"}
 DEVICE_RETRY_SECONDS = 3.0      # how often a driver-specific object re-asks the server to set it up
+DEVICE_IN_DOT = (120, 220, 150)   # an input dot: a ring until linked, filled once linked
+
+
+def draw_input_dot(surface, at, linked, s):
+    """A device's input dot at `at` (on its left edge); s = the object's on-screen size."""
+    r = max(2, s // 45)
+    if linked:
+        pygame.draw.circle(surface, DEVICE_IN_DOT, at, r)
+    else:
+        pygame.draw.circle(surface, INPUT_WELL, at, r)
+        pygame.draw.circle(surface, shade(DEVICE_IN_DOT, 0.7), at, r, max(1, r // 2))
 
 
 class Device(Thing):
@@ -5676,6 +5706,14 @@ class PowerMeter(Device):
             return None, None
         return info["values"].get("power"), info["params"].get("wavelength", {}).get("value")
 
+    def output_point(self):
+        """Its output dot: on the right edge, level with the LCD (draw_shape's layout, in world units)."""
+        c, w, h = self.world_center, self.world_width, self.world_height
+        s = min(w, h)
+        top = c.y - h / 2 + s * 0.07 * 1.5 + s * 0.14              # below the header
+        bottom = c.y + h / 2 - s * 0.07 * 2                         # above the red stripe
+        return (c.x + w / 2, (top + bottom) / 2)
+
     def draw_shape(self, surface, rect, camera):
         status = self.status()
         led_color = DEVICE_STATUS_COLORS.get(status, (110, 110, 120))
@@ -5718,6 +5756,8 @@ class PowerMeter(Device):
         glass = PM_LCD if live else shade(PM_LCD, 0.45)
         draw_rect(surface, (20, 20, 24), lcd.inflate(4, 4), border_radius=max(2, radius - 2))   # bezel
         draw_rect(surface, glass, lcd, border_radius=max(2, radius - 4))
+        pygame.draw.circle(surface, PM_LCD if watts is not None else shade(PM_LCD, 0.4),
+                           (rect.right, lcd.centery), max(2, s // 45))   # the output dot (power)
         ink = PM_LCD_INK if live else shade(PM_LCD, 0.3)
         inner = lcd.inflate(-2 * pad, -pad)
         if not live:
@@ -5768,6 +5808,7 @@ PDA_SCREEN = (10, 12, 16)
 PDA_COUNTS = (110, 200, 255)    # count rate (Time Tagger)
 PDA_VOLTS = (120, 230, 150)     # mean voltage (NI DAQ)
 PDA_HALF_COLORS = {"connected": (90, 220, 120), "connecting…": (240, 190, 60)}   # else: an error (red)
+PDA_DOTS = ("count_rate", "voltage")    # the outputs with a dot on the right edge, top to bottom
 
 
 def format_si(value, unit, digits=4):
@@ -5813,6 +5854,31 @@ class PDA45(Device):
 
     def device_options(self):
         return {"tagger": self.tagger or "auto", "daq": self.daq or "auto", "ai_range": self.ai_range}
+
+    # --- Output dots: count_rate's level with the Time Tagger screen, voltage's with the NI DAQ one ---
+    def output_point_of(self, key):
+        """A dot on the right edge, level with the screen that shows that output
+        (the same layout as draw_shape, in world units); the others: the center."""
+        if key not in PDA_DOTS:
+            return self.center
+        c, w, h = self.world_center, self.world_width, self.world_height
+        s = min(w, h)
+        pad = s * 0.06
+        top = c.y - h / 2 + pad + s * 0.13 + pad / 2              # the screens' top (below the header)
+        body_h = c.y + h / 2 - pad - s * 0.09 - top                # down to the footer
+        panel_h = (body_h - pad / 2) / 2
+        y = top + panel_h / 2 + PDA_DOTS.index(key) * (panel_h + pad / 2)
+        return (c.x + w / 2, y)
+
+    def output_point(self):
+        return self.output_point_of(PDA_DOTS[0])
+
+    def give_at(self, pos, camera):
+        for key in PDA_DOTS:
+            dot = pygame.Vector2(camera.world_to_screen(self.output_point_of(key)))
+            if dot.distance_to(pos) <= max(PORT_REACH, 8 * self.scale * camera.zoom):
+                return key
+        return None
 
     def draw_shape(self, surface, rect, camera):
         status = self.status()
@@ -5861,6 +5927,8 @@ class PDA45(Device):
         for panel, (label, status_key, key, unit, color, warning) in zip(panels, halves):
             self._draw_half(surface, panel, pad, label, live, status, values.get(status_key),
                             values.get(key), unit, color, warning)
+            dot_color = color if values.get(key) is not None else shade(color, 0.4)
+            pygame.draw.circle(surface, dot_color, (rect.right, panel.centery), max(2, s // 45))
 
         size = round(footer_h * 0.75)
         if size >= 8:
@@ -6752,8 +6820,25 @@ class FlipMirror(Device):
                     f"It will MOVE: flip down, then up, ending at {up}.",
                     lambda: self.run_action(app, "find_position"), ok_label="Flip it")
 
+    def _in_dot_y(self, top, h):
+        """The input dot's height: level with the beam (the hub, as in _mirror_spot)."""
+        return top + h * (0.08 * 1.5 + 0.16) + h * (1 - 0.08 * 2.5 - 0.16) * 0.62
+
+    def input_point(self, port):
+        if port != "up":
+            return self.center
+        c, w, h = self.world_center, self.world_width, self.world_height
+        return (c.x - w / 2, self._in_dot_y(c.y - h / 2, h))
+
+    def take_at(self, pos, camera):
+        dot = pygame.Vector2(camera.world_to_screen(self.input_point("up")))
+        return "up" if dot.distance_to(pos) <= max(PORT_REACH, 8 * self.scale * camera.zoom) else None
+
     def on_click(self, pos, app):
-        """A click on the mirror itself flips it (when its position is known)."""
+        """A click on the input dot links it; on the mirror itself flips it (when its position is known)."""
+        if self.take_at(pos, app.camera):
+            self.pick(app, "up")
+            return True
         if self.live() and self.mirror_state()[0] is not None:
             hub, reach = self._mirror_spot(self.screen_rect(app.camera))
             if (pygame.Vector2(pos) - hub).length() <= reach:
@@ -6806,6 +6891,8 @@ class FlipMirror(Device):
         draw_rect(surface, (12, 12, 16), rect.move(0, max(1, s // 30)), border_radius=radius)
         draw_rect(surface, FM_BODY, rect, border_radius=radius)
         draw_rect(surface, shade(FM_BODY, 1.45), rect, width=max(1, s // 70), border_radius=radius)
+        draw_input_dot(surface, (rect.x, round(self._in_dot_y(rect.y, rect.height))),
+                       self.take_source("up") is not None, s)
 
         pad = max(2, round(s * 0.08))
         header_h = round(s * 0.16)
@@ -7038,8 +7125,23 @@ class FilterWheel(Device):
             a = math.radians(90.0 + (slot - 1) * 360.0 / n + angle)
             yield slot, pygame.Vector2(center.x + orbit * math.cos(a), center.y - orbit * math.sin(a))
 
+    def input_point(self, port):
+        """The input dot: on the left edge, level with the wheel's center (as in _layout)."""
+        if port != "position":
+            return self.center
+        c, w, h = self.world_center, self.world_width, self.world_height
+        top = c.y - h / 2 + h * (0.07 * 1.5 + 0.15)
+        return (c.x - w / 2, (top + c.y + h / 2 - h * 0.07) / 2)
+
+    def take_at(self, pos, camera):
+        dot = pygame.Vector2(camera.world_to_screen(self.input_point("position")))
+        return "position" if dot.distance_to(pos) <= max(PORT_REACH, 8 * self.scale * camera.zoom) else None
+
     def on_click(self, pos, app):
-        """A click on a slot moves the wheel there (live, and not following a link)."""
+        """A click on the input dot links it; on a slot moves the wheel there (live, and not following a link)."""
+        if self.take_at(pos, app.camera):
+            self.pick(app, "position")
+            return True
         if not self.live() or "position" in self.links:
             return False
         rect = self.screen_rect(app.camera)
@@ -7064,6 +7166,7 @@ class FilterWheel(Device):
         draw_rect(surface, shade(FW_BODY, 1.45), rect, width=max(1, s // 70), border_radius=radius)
 
         header_h, pad, center, wheel_r, hole, orbit = self._layout(rect)
+        draw_input_dot(surface, (rect.x, round(center.y)), self.take_source("position") is not None, s)
         led_r = max(2, s // 28)
         led = (rect.right - pad - led_r, rect.y + pad + header_h // 2)
         if status in ("ok", "starting", "error", "missing", "connecting"):
@@ -8009,7 +8112,7 @@ class Machine(Thing):
     def give_at(self, pos, camera):
         for s in self.ports_out:
             nub = pygame.Vector2(camera.world_to_screen(self.output_point_of(s["key"])))
-            if nub.distance_to(pos) <= max(8, 8 * self.scale * camera.zoom):
+            if nub.distance_to(pos) <= max(PORT_REACH, 8 * self.scale * camera.zoom):
                 return s["key"]
         return None
 

@@ -120,16 +120,18 @@
   starts it, **reset** stops it and clears done. Clicking the timer starts it (or resets it while it
   runs); the panel has Start / Reset. **Start while running** (a choice): *restarts* (default) or *is
   ignored*. Duration is typed as `90`, `1:30`, `1:02:03`, `5m`, `1h 30m` or `250 ms` (`parse_duration`)
-  and shown as `45 s` / `1:30` / `2:00:00`. Outputs: **`done`** (1 from the end until the next start
-  or reset — latched, not a blip, so a press input fires once and an on/off input stays on),
-  `running`, `remaining` / `elapsed` (s), `progress` (0–1). Chain timers by linking one's `done` to
+  and shown as `45 s` / `1:30` / `2:00:00`. Two outputs, machine-style — a screen each with its own
+  dot (`output_point_of`, `give_at`): **`remaining`** (s; the Duration while idle, 0 when done) and
+  **`done`** (1 from the end until the next start or reset — latched, not a blip, so a press input
+  fires once and an on/off input stays on). (`running`, `elapsed` and `progress` were outputs too;
+  they're gone — elapsed still shows in the panel.) Chain timers by linking one's `done` to
   the next one's `start`. A run keeps the world-clock moment it started (`_started`, drawn with
   `world_time()`, so nothing changes per frame for the world to resend) and the wall-clock end
   (hidden `ends_at`, saved), so it keeps going across a restart; one that ran out while the world was
   closed loads as done, and doesn't fire what it's linked to (already on when first read). Looks:
-  Counter-style, names "Timer 1", "Timer 2", …, the duration beside the name; the screen shows the
-  duration (grey) while idle, an amber countdown with a progress bar while running, and a green DONE
-  that flares when it finishes. Link `done` to a Script's **RUN** to start a run a set time later
+  Counter-style, names "Timer 1", "Timer 2", …, the duration beside the name; the *remaining* screen
+  shows the duration (grey) while idle, an amber countdown over a progress bar while running, and a
+  green 0.0 at the end; the *done* screen says NO (grey) or YES (green, flaring as it finishes). Link `done` to a Script's **RUN** to start a run a set time later
 - **Sequence** (E menu ▸ Math, `things.py`): a list of numbers stepped through like the `i` of a for
   loop. Its output `value` is the selected number. Two *press* chips, linked like a Counter's:
   **next** moves to the next number, **reset** back to the first. It starts on the first, so the
@@ -198,12 +200,11 @@
   else: tried a value tag and port nozzles with arrows toward its source / readers — both cluttered
   the paths (the wires' flowing dots already show direction). The panel shows the value and what it
   **Feeds**: readers are found every 0.25 s by `links_to(obj, id)` (does one of obj's inputs
-  follow id?). **Laying a path:** while linking a relay (or a tag), a click on
-  *empty* canvas places a new relay there fed by it (`extend`) — the clicked one keeps its own
-  source, the new one is selected, and clicking it then empty canvas again adds the next hop. A
-  click on an object that can't be linked, or Esc, still just cancels. This is PickMode's
-  `on_empty(world point)` (via `App.pick_link(..., on_empty=)`), which draws a small ring at
-  the cursor over empty canvas; other picks (a function's chips, …) don't pass it
+  follow id?). **Laying a path:** with any wire in hand (see ARCHITECTURE.md, *Linking*), a click
+  on empty canvas places a relay there, wired in, and the wire carries on from it — so a path is
+  laid hop by hop from either end. From an output, each relay is fed by the wire (lit while a value
+  flows); from an input, each relay feeds it and waits for a source (hollow core) until you click
+  one. Clicking a relay picks up its input's wire, like any input.
 - **Data tag** (E menu ▸ Data, `things.py`): a named data point — a `DataRelay` subclass, so it passes
   its value through the same way (no delay, loop guard, any number of readers), but it has a body
   you can read. Named after SCADA/PLC "tags" (a named live value with units). Shaped like a luggage
@@ -483,7 +484,8 @@ Each one is a Device object for one driver in `drivers/`; how devices connect is
   sensor's correction range, starting at the meter's own setting — connecting never changes
   it). The object is a display: the handheld console with a backlit LCD, power auto-scaled to
   nW / µW / mW / W (4 significant digits, `format_power`), the wavelength, and a log level
-  bar from 1 nW to 1 W.
+  bar from 1 nW to 1 W. One small **output dot** on the right edge, level with the LCD
+  (`output_point`), lit while it has a reading: drag from it to link `power`.
 - **PDA45 photodetector** (`drivers/pda45.py`, canvas object *PDA45*): one detector, two
   instruments — wraps the lab drivers `../hardware drivers/timetagger.py` (Swabian, counts
   pulses) and `ni6363.py` (`NI6363`, analog in). Each reading starts both over the same
@@ -497,7 +499,10 @@ Each one is a Device object for one driver in `drivers/`; how devices connect is
   `daq` (`auto`, serial / device name, or `sim://`), `ai_range` (±V, default 0.5),
   `tt_channel` (2), `trigger_v` (2.5), `ai_channel` (ai0). The object has a status light
   per half (the header light is amber while only one is reading) and big SI-scaled numbers
-  (`format_si`: 295.6 k counts/s, -4.598 mV), with OVERFLOW / OVER RANGE flags. The
+  (`format_si`: 295.6 k counts/s, -4.598 mV), with OVERFLOW / OVER RANGE flags. Each half
+  has a small **output dot** on the right edge, level with its screen (`count_rate` top,
+  `voltage` bottom — `PDA_DOTS`), lit in its color while it has a value: drag from one to
+  link it, and its wire starts there (`output_point_of`, `give_at`). The
   `pda45.py` the lab drivers mention never existed; this is it, for the canvas.
 - **SuperK laser** (`drivers/superk_laser.py`, canvas object *SuperK laser*): wraps the lab driver
   `../hardware drivers/superk.py` (nkt_tools / NKT DLL). Safety rules from the Quantum Yield
@@ -547,7 +552,9 @@ Each one is a Device object for one driver in `drivers/`; how devices connect is
   *assumed*. Closing the device (server stop / restart / removal, or switching `mirror`) parks
   the line at 0 V, so the mirror lowers — flipper.py's deliberate end state. The object draws the
   beam: up = mirror at 45° reflecting to the up path, down = mirror flat and the beam straight on,
-  unknown = grey mirror and a "?".
+  unknown = grey mirror and a "?". A small **input dot** for `up` sits on the left edge, level
+  with the incoming beam — a ring until linked, filled once linked; click it (or drop a wire on
+  it) to link (`input_point`, `take_at`, `draw_input_dot`).
   **Names are canvas-side labels:** the object's name (click *Name* in the inspector; new ones
   are *Flipper 1*, *Flipper 2*, …) and its *Up path* / *Down path* names (default up / down)
   are its own Props — shown on the drawing, the Flip / It's at buttons and the confirm. The
@@ -587,6 +594,8 @@ Each one is a Device object for one driver in `drivers/`; how devices connect is
   unnamed / open), set from the panel. The object draws the wheel face-on with the slot in the
   beam at the top (it turns there, the short way); click a slot to go (amber ring until the wheel
   reports, as the flip mirror does), off while `position` is linked ("follows …" shown instead).
+  A small **input dot** for `position` sits on the left edge, level with the wheel's center —
+  a ring until linked, filled once linked; click it (or drop a wire on it) to link.
 - **Spectrometer** (`drivers/ccs200_spectrometer.py`, canvas object *Spectrometer*): wraps the lab
   driver `../hardware drivers/ccs200.py` (Thorlabs CCS200, TLCCS DLL over VISA; its amplitude
   correction, window and background are used as they are). Address `auto` / a VISA resource /

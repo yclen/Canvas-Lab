@@ -172,6 +172,12 @@ class WorldApp(canvas.App):
                 origin=list(origin) if origin is not None else None, empty=on_empty is not None,
                 gives=on_give is not None)
 
+    def pick_link(self, obj, port):
+        self.ui("wire", end="in", id=obj.id, key=port)       # the window holds the wire (WireMode)
+
+    def pick_target(self, src, key):
+        self.ui("wire", end="out", id=src.id, key=key)
+
     def start_placing(self, factory):
         """Something to place with the mouse: the window holds a see-through copy
         (a sample made here) and sends back where it was dropped."""
@@ -371,6 +377,10 @@ class World:
             target, src = scene.by_id.get(msg.get("target")), scene.by_id.get(msg.get("src"))
             if target is not None and src is not None:
                 app.run(lambda: app.choose_take(target, src, msg.get("key"), port=msg.get("port")), view)
+        elif op == "unlink":
+            obj = scene.by_id.get(msg.get("id"))
+            if obj is not None and msg.get("port") in obj.links:
+                app.run(lambda: obj.unlink(msg["port"], app), view)
         elif op == "add":
             objs = [canvas.object_from_dict(d) for d in msg.get("objects", [])
                     if isinstance(d, dict) and d.get("id") not in scene.by_id]

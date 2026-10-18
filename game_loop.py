@@ -199,13 +199,29 @@ def play(scene, player, link=None):
                         picker.click(scene, event.pos, camera)
                     continue
 
-            # A wire being dragged out of an output nub: let go on an input to link it.
-            if app.link_drag.active:
+            # A wire in hand (canvas.WireMode): dragged, it links where it's let go;
+            # clicked, the next click links it or lays a relay; right-click / Esc lets go.
+            wire = app.wire
+            if wire.active:
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    app.link_drag.cancel()
+                    wire.cancel()
                     continue
-                if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                    app.link_drag.finish(app, event.pos)
+                if event.type == pygame.MOUSEBUTTONUP and event.button == 1 and wire.press is not None:
+                    press, wire.press = wire.press, None
+                    if (pygame.Vector2(event.pos) - press).length() > canvas.WIRE_DRAG_SLOP:
+                        wire.release(app, event.pos)
+                    continue
+                if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                        and event.pos[1] > canvas.MENU_BAR_HEIGHT and not menubar.open_menu):
+                    if player.selected is not None and inspector.contains(event.pos, screen.get_size()):
+                        wire.cancel()                 # a click on the panel lets go of it
+                    else:
+                        wire.click(app, event.pos, keep=bool(pygame.key.get_mods() & pygame.KMOD_SHIFT))
+                    continue
+                if (event.type == pygame.MOUSEBUTTONUP and event.button == 3 and right_down is not None
+                        and (pygame.Vector2(event.pos) - right_down).length() <= RIGHT_CLICK_SLOP):
+                    wire.cancel()                     # a right-click lets go (a right-drag still pans)
+                    panning, right_down = False, None
                     continue
 
             # Place mode: left-click drops the held object (Shift = keep placing),
@@ -331,10 +347,15 @@ def play(scene, player, link=None):
                         # Ctrl+click just selects — e.g. an input you'd otherwise press.
                         interact = not pygame.key.get_mods() & pygame.KMOD_CTRL
                         nub = scene.give_at(event.pos, camera) if interact else None
+                        if clicked is None and interact:      # an input's dot, just off its object's edge
+                            dot = scene.take_at(event.pos, camera)
+                            clicked = dot[0] if dot is not None else None
                         if nub is not None:
-                            app.link_drag.begin(*nub)            # dragging a wire out of an output nub
+                            app.hold_wire("out", *nub)           # picked up an output's wire
                         elif clicked is not None and interact and app.click(clicked, event.pos):
-                            held = clicked    # it handled the click (e.g. a press): it gets drag/release
+                            # it handled the click (e.g. a press): it gets drag/release — unless
+                            # the click picked up a wire (an input's chip), which gets them instead
+                            held = None if app.wire.active else clicked
                         else:
                             player.select_only(clicked)   # deselects all if clicked is None
                             if clicked is None:
@@ -404,7 +425,10 @@ def play(scene, player, link=None):
         marquee.draw(screen, camera)
         placer.draw(screen, camera)
         picker.draw(screen, camera, scene, mouse_pos)
-        app.link_drag.draw(screen, camera, scene, mouse_pos)
+        app.wire.draw(screen, camera, scene, mouse_pos)
+        if app.modal is None and not app.building and not (player.selected is not None
+                                                           and inspector.contains(mouse_pos, screen.get_size())):
+            canvas.draw_port_hover(screen, camera, scene, mouse_pos)   # a ring on the port under the mouse
         menubar.draw(screen)
         inspector.draw(screen, player.selected, app)
         if link is not None:

@@ -702,6 +702,8 @@ LINK_COLOR = (120, 220, 150)        # number wires (flowing dots)
 LINK_ONOFF_COLOR = (240, 200, 90)   # on/off and press wires
 LINK_DATA_COLOR = (110, 160, 255)   # data wires (flowing while the data is live)
 PRESS_FLASH = 0.35                  # seconds a press wire stays lit after it fires
+PORT_REACH = 12                     # px around a port's dot that still counts as on it
+WIRE_DRAG_SLOP = 6                  # px a press on a port must move to be a drag (else a click)
 UNDO_DELETES = 20                   # deletes each player can undo with Ctrl+Z
 
 
@@ -967,7 +969,7 @@ class CanvasObject:
         if not gives:
             return None
         nub = pygame.Vector2(camera.world_to_screen(point()))
-        reach = max(8, 8 * getattr(self, "scale", 1.0) * camera.zoom)
+        reach = max(PORT_REACH, 8 * getattr(self, "scale", 1.0) * camera.zoom)
         return gives[0].key if nub.distance_to(pos) <= reach else None
 
     # --- Outputs (gives) ------------------------------------------------------------
@@ -2526,6 +2528,21 @@ class Scene:
                 return o, key
         return None
 
+    def take_at(self, pos, camera):
+        """(object, input) whose chip / dot is under a screen point, or None: on
+        the object, or within PORT_REACH of the input's end (a dot on its edge)."""
+        for o in reversed(sorted(self.objects, key=lambda o: o.draw_layer)):
+            rect = o.screen_rect(camera) if hasattr(o, "screen_rect") else None
+            if rect is None or not rect.inflate(2 * PORT_REACH, 2 * PORT_REACH).collidepoint(pos):
+                continue
+            port = o.take_at(pos, camera)
+            if port is None:
+                continue
+            end = pygame.Vector2(camera.world_to_screen(o.input_point(port)))
+            if o.hit(pos, camera) or end.distance_to(pos) <= PORT_REACH:
+                return o, port
+        return None
+
     def add(self, obj):
         self.add_many([obj])
 
@@ -4016,47 +4033,195 @@ class PickMode:
         draw_hint(surface, f"{self.prompt}     Esc: cancel")
 
 
-class LinkDrag:
-    """Dragging a wire out of an object's output nub (see give_at). Let go on
-    an input chip (take_at) to link that input, or anywhere else on an object
-    with inputs to choose one from a menu. Esc cancels."""
+class WireMode:
+    """A wire in hand, picked up from a port: an output's dot (pressed), or an
+    input (its chip or dot, or *link* on its row — App.pick_link). Pressed and
+    dragged, it links where it's let go; clicked, it stays in hand until the
+    next click, which
+    - on the other end — an input while holding an output, an output's dot
+      while holding an input — or an object that has one: links them (a menu
+      if there are several) and lets go. Shift+click keeps an output's wire in
+      hand, to feed more inputs (an input takes only one source);
+    - on empty canvas: places a relay there, wired in, and the wire carries on
+      from it — from an output, the relay is fed by it and you hold the relay's
+      output; from an input, the relay feeds it and you hold the relay's input
+      (its core hollow until a source is found). So a path is laid hop by hop;
+    - on the same end (another output while holding an output, …): nothing —
+      the hint says why. Holding an input, a click on its own object unlinks it.
+    Right-click or Esc lets go (relays already placed stay). Links go through
+    app.choose_take, relays through app.add, so a world window works the same."""
 
     def __init__(self):
-        self.src = None
+        self.end = None          # "out" (holding obj's output `key`) or "in" (obj's input `key`)
+        self.obj = None
         self.key = None
+        self.press = None        # screen pos of the press that picked it up, while the button is down
+        self.note = ""           # why the last click did nothing, shown for a moment
+        self.note_until = 0
 
     @property
     def active(self):
-        return self.src is not None
+        return self.obj is not None
 
-    def begin(self, src, key):
-        self.src, self.key = src, key
+    def hold(self, end, obj, key, press=None):
+        self.__init__()
+        self.end, self.obj, self.key, self.press = end, obj, key, press
 
     def cancel(self):
         self.__init__()
 
-    def target(self, scene, pos, camera):
-        obj = scene.hit_test(pos, camera)
-        return obj if obj is not None and obj is not self.src and obj.takes() else None
+    def kind(self):
+        if self.end == "out":
+            give = next((g for g in self.obj.gives() if g.key == self.key), None)
+            return give.kind if give is not None else "number"
+        take = self.obj.find_take(self.key)
+        return take.kind if take is not None else "number"
 
-    def finish(self, app, pos):
-        src, key = self.src, self.key
-        target = self.target(app.scene, pos, app.camera)
+    def anchor(self):
+        """World point the wire in hand starts from: the output's dot, or the input's end."""
+        return output_point(self.obj, self.key) if self.end == "out" else self.obj.input_point(self.key)
+
+    def target(self, scene, pos, camera):
+        """What a click at pos would do: ("port", obj, key) — that port of the other
+        end; ("obj", obj) — an object with one (a menu picks); ("empty",) — a
+        relay; ("no", why); or None (on the wire's own object)."""
+        kind = self.kind()
+        dot = scene.give_at(pos, camera)
+        if self.end == "out":
+            if dot is not None and dot[0] is not self.obj:
+                return ("no", "that's an output — click an input")
+            hit = scene.take_at(pos, camera)
+            obj = hit[0] if hit is not None else scene.hit_test(pos, camera)
+            if obj is None:
+                return ("empty",) if kind != "data" else ("no", "relays carry numbers — click an input")
+            if obj is self.obj:
+                return None
+            take = obj.find_take(hit[1]) if hit is not None else None
+            if take is not None and kinds_match(take.kind, kind):
+                return ("port", obj, take.key)
+            if any(kinds_match(t.kind, kind) for t in obj.takes()):
+                return ("obj", obj)
+            return ("no", f"{short_name(obj)} has no input for it")
+        if dot is not None and dot[0] is not self.obj:
+            give = next((g for g in dot[0].gives() if g.key == dot[1]), None)
+            if give is not None and kinds_match(kind, give.kind):
+                return ("port", *dot)
+        obj = scene.hit_test(pos, camera)
+        if obj is None:
+            return ("empty",) if kind != "data" else ("no", "relays carry numbers — click an output")
+        if obj is self.obj:
+            return None
+        if any(kinds_match(kind, g.kind) for g in obj.gives()):
+            return ("obj", obj)
+        return ("no", "that's an input — click an output" if obj.takes() else f"{short_name(obj)} has no output for it")
+
+    def click(self, app, pos, *, keep=False):
+        """A click with the wire in hand (keep: Shift — an output's wire stays in hand)."""
+        t = self.target(app.scene, pos, app.camera)
+        if t is None:
+            if self.end == "in" and self.obj.take_source(self.key) is not None:
+                app.unlink_input(self.obj, self.key)      # its own object: unlink it
+                self.cancel()
+            return
+        if t[0] == "no":
+            self.note, self.note_until = t[1], pygame.time.get_ticks() + 2000
+        elif t[0] == "empty":
+            self._relay(app, pos)
+        elif self.end == "out":
+            app.choose_take(t[1], self.obj, self.key, port=t[2] if t[0] == "port" else None)
+            if not keep:
+                self.cancel()
+        elif t[0] == "port":
+            app.choose_take(self.obj, t[1], t[2], port=self.key)
+            self.cancel()
+        else:
+            self._choose_give(app, t[1])
+
+    def release(self, app, pos):
+        """Let go after dragging: links if it's over the other end, else stays in hand."""
+        t = self.target(app.scene, pos, app.camera)
+        if t is not None and t[0] in ("port", "obj"):
+            self.click(app, pos)
+
+    def _choose_give(self, app, src):
+        """Holding an input, clicked a source with several outputs: a menu of them."""
+        obj, port, kind = self.obj, self.key, self.kind()
+        gives = [g for g in src.gives() if kinds_match(kind, g.kind)]
         self.cancel()
-        if target is not None:
-            app.choose_take(target, src, key, port=target.take_at(pos, app.camera))
+        if len(gives) == 1:
+            app.choose_take(obj, src, gives[0].key, port=port)
+            return
+        values = src.outputs()
+        items = [(f"'{port}' takes from {short_name(src)}:", None, "title")]
+        items += [(g.label, lambda g=g: app.choose_take(obj, src, g.key, port=port), None,
+                   format_value(values.get(g.key), g.unit)) for g in gives]
+        app.context_menu(pygame.mouse.get_pos(), items)
+
+    def _relay(self, app, pos):
+        """A relay at pos, wired in; the wire carries on from it."""
+        relay_type = OBJECT_TYPES.get("data_relay")
+        if relay_type is None:
+            return
+        relay = relay_type(*app.camera.screen_to_world(pos))
+        if self.end == "out":
+            relay.links = {"in": {"id": self.obj.id, "key": self.key}}
+            app.add([relay])
+            self.obj, self.key = relay, "value"
+        else:
+            app.add([relay])
+            app.choose_take(self.obj, relay, "value", port=self.key)
+            self.obj, self.key = relay, "in"
 
     def draw(self, surface, camera, scene, mouse):
         if not self.active:
             return
-        start = camera.world_to_screen(output_point(self.src, self.key))
-        pygame.draw.line(surface, LINK_COLOR, start, mouse, 2)
-        pygame.draw.circle(surface, LINK_COLOR, mouse, 4)
-        target = self.target(scene, mouse, camera)
-        if target is not None and hasattr(target, "screen_rect"):
-            pygame.draw.rect(surface, LINK_COLOR, target.screen_rect(camera).inflate(14, 14),
+        t = self.target(scene, mouse, camera)
+        start = pygame.Vector2(camera.world_to_screen(self.anchor()))
+        end, snapped = pygame.Vector2(mouse), False
+        if t is not None and t[0] == "port":
+            at = output_point(t[1], t[2]) if self.end == "in" else t[1].input_point(t[2])
+            end, snapped = pygame.Vector2(camera.world_to_screen(at)), True
+        a, b = (start, end) if self.end == "out" else (end, start)     # dots flow the way the value will
+        draw_wire(surface, camera, camera.screen_to_world(a), camera.screen_to_world(b), LINK_COLOR)
+        if snapped:
+            pygame.draw.circle(surface, LINK_COLOR, end, PORT_REACH - 2, 2)
+        elif self.end == "out":
+            pygame.draw.circle(surface, LINK_COLOR, end, 4)          # the free end: an output's dot …
+        else:
+            pygame.draw.circle(surface, LINK_COLOR, end, 5, 2)       # … or an input's ring
+        if t is not None and t[0] == "obj" and hasattr(t[1], "screen_rect"):
+            pygame.draw.rect(surface, LINK_COLOR, t[1].screen_rect(camera).inflate(14, 14),
                              width=3, border_radius=10)
-        draw_hint(surface, f"Drop '{self.key}' on an input     Esc: cancel")
+        elif t is not None and t[0] == "empty":
+            pygame.draw.circle(surface, tuple(int(c * 0.6) for c in LINK_COLOR), mouse, 12, 1)   # a relay goes here
+        name = short_name(self.obj)
+        if self.end == "out":
+            text = (f"Carrying '{self.key}' from {name} — click an input · empty canvas: a relay"
+                    f" · Shift+click: feed another · right-click: let go")
+            if t is not None and t[0] == "port":
+                old = t[1].take_source(t[2])
+                if old is not None and not (old is self.obj and t[1].links[t[2]].get("key") == self.key):
+                    text = f"Replaces {short_name(old)} on '{t[2]}' of {short_name(t[1])}     right-click: let go"
+        else:
+            text = (f"'{self.key}' of {name} needs a source — click an output · empty canvas: a relay"
+                    f" · right-click: let go")
+        if self.note and pygame.time.get_ticks() < self.note_until:
+            text = f"{self.note}     right-click: let go"
+        draw_hint(surface, text)
+
+
+def draw_port_hover(surface, camera, scene, mouse):
+    """A ring around the port under the mouse (an output's dot, or an input's
+    end), so a small one is easy to grab — PORT_REACH px around it counts."""
+    dot = scene.give_at(mouse, camera)
+    if dot is not None:
+        at = output_point(*dot)
+    else:
+        hit = scene.take_at(mouse, camera)
+        at = hit[0].input_point(hit[1]) if hit is not None else None
+        if at is None or pygame.Vector2(camera.world_to_screen(at)).distance_to(mouse) > PORT_REACH:
+            return
+    pygame.draw.circle(surface, LINK_COLOR, camera.world_to_screen(at), PORT_REACH - 2, 2)
 
 
 class TrainBuilder:
@@ -4522,7 +4687,7 @@ class App:
         self.wall_builder = WallBuilder()
         self.placer = PlaceMode()
         self.picker = PickMode()
-        self.link_drag = LinkDrag()
+        self.wire = WireMode()
         self.inventory = InventoryPanel(on_pick=lambda cls: cls.create(self),
                                         on_context=lambda machine, pos: self.machine_menu(machine, pos))
 
@@ -4530,14 +4695,14 @@ class App:
     def building(self):
         """True while a mode (train / wall / placing) is claiming the mouse."""
         return (self.train_builder.active or self.wall_builder.active
-                or self.placer.active or self.picker.active or self.link_drag.active)
+                or self.placer.active or self.picker.active or self.wire.active)
 
     def cancel_modes(self):
         self.train_builder.cancel()
         self.wall_builder.cancel()
         self.placer.cancel()
         self.picker.cancel()
-        self.link_drag.cancel()
+        self.wire.cancel()
 
     def start_picking(self, prompt, on_pick, accept=lambda obj: True, origin=None, on_empty=None,
                       on_give=None):
@@ -4588,34 +4753,20 @@ class App:
         self.modal = ContextMenu(pos, items)
 
     # --- Linking: an input (take) of one object follows an output (give) of another --
-    def pick_link(self, obj, port, *, on_empty=None, note=""):
-        """Link obj's input `port`: click a source, then choose which of its outputs
-        (a menu, if it has several). Clicking obj itself unlinks it. on_empty /
-        note: what a click on empty canvas does, and the hint saying so."""
-        take = obj.find_take(port)
-        label = take.label if take is not None else port
-        linked = obj.take_source(port) is not None
-        hint = f" — or click this {obj.type_name().lower()} to unlink" if linked else ""
+    def pick_link(self, obj, port):
+        """Link obj's input `port`: pick up its wire (see WireMode) — then click
+        a source, or empty canvas for relays on the way."""
+        self.hold_wire("in", obj, port)
 
-        def picked(src):
-            if src is obj:
-                obj.unlink(port, self)
-            else:
-                self.choose_give(obj, port, src)
+    def hold_wire(self, end, obj, key):
+        """Pick up a wire from obj's output (end "out") or input ("in") `key`. If
+        the mouse is down, it's a press: a drag links where it's let go."""
+        self.cancel_modes()
+        press = pygame.mouse.get_pos() if pygame.mouse.get_pressed()[0] else None
+        self.wire.hold(end, obj, key, press)
 
-        def picked_dot(src, key):                    # clicked right on an output's dot: that one
-            if src is obj:
-                return
-            give = next((g for g in src.gives() if g.key == key), None)
-            if give is not None and kinds_match(kind, give.kind):
-                obj.link(port, src, key, self)
-            else:
-                self.choose_give(obj, port, src)
-        kind = take.kind if take is not None else "number"
-        self.start_picking(f"Click what '{label}' takes from (or one of its output dots){hint}{note}", picked,
-                           accept=lambda o: (o is obj and linked) or (o is not obj and any(
-                               kinds_match(kind, g.kind) for g in o.gives())),
-                           origin=obj.input_point(port), on_empty=on_empty, on_give=picked_dot)
+    def unlink_input(self, obj, port):
+        obj.unlink(port, self)
 
     def choose_give(self, obj, port, src):
         """Link obj's input `port` to one of src's outputs: right away if it has
@@ -4637,16 +4788,8 @@ class App:
         self.context_menu(pygame.mouse.get_pos(), items)
 
     def pick_target(self, src, key):
-        """The other way round: link src's output `key` into an input of an
-        object you click (a menu, if it has several inputs)."""
-        give = next((g for g in src.gives() if g.key == key), None)
-        kind = give.kind if give is not None else "number"
-
-        def picked(target):
-            self.choose_take(target, src, key)
-        self.start_picking(f"Click what should take '{key}' from this {src.type_name().lower()}", picked,
-                           accept=lambda o: o is not src and any(kinds_match(t.kind, kind) for t in o.takes()),
-                           origin=output_point(src))
+        """The other way round: pick up the wire of src's output `key` (see WireMode)."""
+        self.hold_wire("out", src, key)
 
     def choose_take(self, target, src, key, port=None):
         """Link src's output `key` into target's input `port`, or into one picked
@@ -5212,6 +5355,9 @@ class JoinedApp(App):
     def choose_take(self, target, src, key, port=None):
         self.send({"op": "choose_take", "target": target.id, "src": src.id, "key": key, "port": port})
 
+    def unlink_input(self, obj, port):
+        self.send({"op": "unlink", "id": obj.id, "port": port})
+
     def menu_command(self, command):
         if command in ("goto", "inventory"):
             super().menu_command(command)   # just this window
@@ -5245,6 +5391,10 @@ class JoinedApp(App):
             for i, (label, active, style, *rest) in enumerate(msg["items"]):
                 items.append((label, (lambda i=i: answer(index=i)) if active else None, style, *rest))
             self.context_menu(tuple(msg["pos"]), items)
+        elif kind == "wire":
+            obj = self.scene.by_id.get(msg.get("id"))
+            if obj is not None and msg.get("end") in ("in", "out"):
+                self.hold_wire(msg["end"], obj, msg.get("key"))
         elif kind == "pick":
             ids = set(msg.get("accept", []))
             on_empty = (lambda point: answer(point=list(point))) if msg.get("empty") else None
