@@ -5434,29 +5434,6 @@ class ZaberStage(Device):
 
 
 # ---- Excitation filters: a color picker over the longpass / shortpass filters ---
-def wavelength_rgb(nm):
-    """Roughly the color of light at `nm` (Bruton's approximation); a dim deep
-    red past the visible, so the IR end of the strip still reads as 'there'."""
-    if nm < 380:
-        r, g, b = 0.38, 0.0, 0.55
-    elif nm < 440:
-        r, g, b = (440 - nm) / 60, 0.0, 1.0
-    elif nm < 490:
-        r, g, b = 0.0, (nm - 440) / 50, 1.0
-    elif nm < 510:
-        r, g, b = 0.0, 1.0, (510 - nm) / 20
-    elif nm < 580:
-        r, g, b = (nm - 510) / 70, 1.0, 0.0
-    elif nm < 645:
-        r, g, b = 1.0, (645 - nm) / 65, 0.0
-    else:
-        r, g, b = 1.0, 0.0, 0.0
-    # Fade toward the ends of what the eye sees.
-    fade = 0.35 + 0.65 * (nm - 380) / 40 if nm < 420 else 0.35 + 0.65 * (780 - nm) / 80 if nm > 700 else 1.0
-    fade = max(0.3, min(1.0, fade))
-    return tuple(round(255 * (c * fade) ** 0.8) for c in (r, g, b))
-
-
 BAND_DEFAULT_SPAN = (400.0, 800.0)     # the strip, until the driver says what the filters reach
 
 
