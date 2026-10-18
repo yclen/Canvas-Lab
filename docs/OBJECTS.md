@@ -78,6 +78,23 @@
   also the Spectrometer's): a cached image per run, one column per pixel, so zoom decides the
   detail; tick labels 1-2-5 on linear axes, decades (plus 2s and 5s when there's room) on log
   axes; blank when too small.
+- **Time series** (E menu ▸ Displays, `things.py`): a scrolling plot of one value over time, under
+  its name (new ones are *Time series 1*, *2*, …; click the name in the panel to change it). Its
+  input `in` (a small dot on the left edge — a ring until linked) takes any number: a function's
+  output, a device reading, … It samples it every **Sample every** frames (1 = every frame) and
+  plots the samples against time over the last **Window** (typed as a duration: `10`, `30 s`,
+  `5m`, `1:30`; default 10 s): the x axis runs from −window to 0 s, the newest sample at the right
+  edge, older ones sliding off the left (and dropped). A value the input doesn't have is a gap in
+  the line. **Auto-scale y** on fits the visible samples; off holds *Y from* / *Y to* (`YScale`,
+  as on the Graph and the Spectrometer). *Draw*: lines / points / both. **Y label** / **X label**
+  (blank by default) name the axes: the y one sideways, centered on the plot just left of its tick
+  numbers (it follows their width; the plot itself never shifts), the x one in its own row under
+  the time ticks (then the first tick drops its "s"); the plot makes room only for a label that's
+  set. The header shows the
+  latest value; the panel the latest, how many samples are shown and about how many a second;
+  **Clear** starts over. The samples aren't saved. They live in the world (`_Samples`, not plain,
+  so not sent as they are), timed by the world's clock so every window scrolls together, and are
+  packed (float32, `trace`) for the players' windows at most every 0.1 s; at most 20 000 are kept.
 
 ---
 

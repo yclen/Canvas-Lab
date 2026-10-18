@@ -3015,6 +3015,272 @@ class Timer(Thing):
                 surface.blit(ts, ts.get_rect(bottomright=(screen.right - pad, bottom)))
 
 
+# ---- Time series: one input, sampled every few frames, scrolling by ------------------
+TS_MAX_SAMPLES = 20000          # kept at most (a long window at every frame): the oldest go first
+TS_PUBLISH_S = 0.1              # how often the samples are packed for the players' windows
+TS_COLOR = (120, 200, 255)
+
+
+class _Samples:
+    """A TimeSeries' own (not sent to players as it is, not saved): the world's
+    samples and counters, and a window's decoded copy of what the world sent."""
+
+    def __init__(self):
+        self.t = np.zeros(0)         # world_time() of each sample
+        self.v = np.zeros(0)         # its value (NaN: the input had none)
+        self.frames = 0              # frames since the last sample
+        self.seq = 0                 # bumps on every change (the curve's cache key)
+        self.published = (-1, 0.0)   # (seq, monotonic time) last packed into `trace`
+        self.decoded = (None, np.zeros(0), np.zeros(0))
+        self.curve = plotting.CurveImage()
+
+
+class TimeSeries(YScale, Thing):
+    """A scrolling plot of one value over time: link its input (a function's
+    output, a device reading, …) and it samples it every *Sample every* frames
+    (1 = every frame), plotting the samples against time over the last
+    *Window* (10 s by default) — the newest at the right edge, older ones
+    sliding off to the left. Auto-scale y (or a fixed Y from / Y to) and
+    lines / points are Settings, as on the Graph; Clear starts over. A value
+    the input doesn't have (None) is a gap in the line.
+
+    The samples live in the world (not saved with the canvas): times are the
+    world's clock, so every window scrolls together; they're packed for the
+    players' windows TS_PUBLISH_S apart."""
+
+    TYPE = "time_series"
+    MENU_LABEL = "Add time series"
+    NAME = "Time series"
+    CATEGORY = "Displays"
+    TAKES = (Take("in", "Samples", verb="samples"),)
+    SIZE = (440, 250)
+    DOT_COLOR = TS_COLOR
+    PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
+                  prompt="Size (1 = normal, 2 = twice as big):"),
+             Prop("every", "Sample every", "int", 1, min=1, max=100000, unit=" frames",
+                  prompt="Sample the input every how many frames (1 = every frame):"),
+             DurationProp("window", "Window", "float", 10.0, min=0.1,
+                          prompt="How much time the graph shows (e.g. 10, 30 s, 5m, 1:30):"),
+             Prop("y_label", "Y label", "str", "", prompt="The y axis's name (e.g. power (mW)); blank for none:"),
+             Prop("x_label", "X label", "str", "", prompt="The x axis's name (e.g. time (s)); blank for none:"),
+             Prop("style", "Draw", "choice", "lines", choices=["lines", "points", "both"])]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.trace = None           # sent to players: {"t0", "t", "v", "n", "seq"} — t / v packed, t from t0
+        self._s = _Samples()
+
+    @classmethod
+    def create(cls, app):
+        """New ones are named Time series 1, 2, … (shown on top; click the name in the panel to change it)."""
+        def make(x, y):
+            used = {o.text for o in app.scene.objects if isinstance(o, TimeSeries)}
+            return cls(x, y, next(f"Time series {i}" for i in range(1, 1000) if f"Time series {i}" not in used))
+        app.start_placing(make)
+
+    @classmethod
+    def icon_sample(cls):
+        sample = cls(0, 0)
+        now = world_time()
+        t = np.linspace(now - sample.window, now, 60)
+        sample._s.t, sample._s.v = t, np.sin(np.linspace(0, 9, 60)) * np.exp(-np.linspace(0, 1.5, 60))
+        return sample
+
+    # --- Sampling (the world) ------------------------------------------------------------
+    def tick(self, dt):
+        s = self._s
+        s.frames += 1
+        if s.frames >= max(1, int(self.every)):
+            s.frames = 0
+            value = self.take("in")
+            self._add(world_time(), math.nan if value is None else float(value))
+        now = time.monotonic()
+        if s.published[0] != s.seq and now - s.published[1] >= TS_PUBLISH_S:
+            self._publish(now)
+
+    def _add(self, t, v):
+        """One sample; the ones that have slid out of the window go."""
+        s = self._s
+        keep = s.t > t - self.window
+        s.t = np.append(s.t[keep], t)[-TS_MAX_SAMPLES:]
+        s.v = np.append(s.v[keep], v)[-TS_MAX_SAMPLES:]
+        s.seq += 1
+
+    def _publish(self, now):
+        s = self._s
+        t0 = float(s.t[0]) if len(s.t) else 0.0
+        self.trace = {"t0": t0, "t": plotting.pack_floats(s.t - t0), "v": plotting.pack_floats(s.v),
+                      "n": len(s.t), "seq": s.seq}
+        s.published = (s.seq, now)
+
+    @panel_button("Clear")
+    def clear(self, app):
+        self._s.t, self._s.v = np.zeros(0), np.zeros(0)
+        self._s.seq += 1
+        self._publish(time.monotonic())
+
+    def on_links_changed(self):
+        self._s.frames = 0
+
+    # --- What's shown (the world's own samples, or what it sent) -------------------------
+    def samples(self):
+        """(seq, times, values): the world's samples, or — in a player's window — the
+        ones it packed."""
+        s, trace = self._s, self.trace
+        if len(s.t) or trace is None or s.published[0] >= 0:     # the world (it packs its own)
+            return s.seq, s.t, s.v
+        if s.decoded[0] != trace["seq"]:
+            s.decoded = (trace["seq"], plotting.unpack_floats(trace["t"]) + trace["t0"],
+                         plotting.unpack_floats(trace["v"]))
+        return s.decoded
+
+    def _visible(self, now):
+        seq, t, v = self.samples()
+        keep = t > now - self.window
+        return seq, t[keep] - now, v[keep]
+
+    def auto_y_range(self):
+        _seq, _t, v = self._visible(world_time())
+        return plotting.data_range(v)
+
+    def on_prop_changed(self, key):
+        super().on_prop_changed(key)
+        self.y_scale_changed(key)
+
+    def state_rows(self, app):
+        _seq, t, v = self._visible(world_time())
+        last = v[-1] if len(v) else None
+        # The rate from the samples' own time span (steady as old ones slide off), whole numbers.
+        rate = f"{(len(t) - 1) / (t[-1] - t[0]):.0f} / s" if len(t) > 1 and t[-1] > t[0] else "—"
+        return [Row("Latest", format_value(None if last is None or not math.isfinite(last) else float(last))),
+                Row("Shown", f"{len(t)} samples"),
+                Row("Rate", rate)]
+
+    # --- The input's dot: on the left edge, level with the plot -----------------------------
+    def input_point(self, port):
+        c = self.world_center
+        return (c.x - self.world_width / 2, c.y + self.world_height * 0.05)
+
+    def take_at(self, pos, camera):
+        dot = pygame.Vector2(camera.world_to_screen(self.input_point("in")))
+        return "in" if dot.distance_to(pos) <= max(PORT_REACH, 8 * self.scale * camera.zoom) else None
+
+    def on_click(self, pos, app):
+        """A click on the input dot picks up its wire (anywhere else selects)."""
+        if self.take_at(pos, app.camera):
+            self.pick(app, "in")
+            return True
+        return False
+
+    # --- Drawing ------------------------------------------------------------------------
+    def draw_shape(self, surface, rect, camera):
+        s = min(rect.width, rect.height)
+        radius = max(2, s // 14)
+        draw_rect(surface, (12, 12, 16), rect.move(0, max(1, s // 40)), border_radius=radius)
+        draw_rect(surface, GRAPH_BODY, rect, border_radius=radius)
+        draw_rect(surface, shade(GRAPH_BODY, 1.5), rect, width=max(1, s // 90), border_radius=radius)
+        if s < 24:
+            return
+        draw_input_dot(surface, camera.world_to_screen(self.input_point("in")), self.take_source("in") is not None, s)
+        pad = max(2, round(s * 0.045))
+        header_h = round(s * 0.11)
+        now = world_time()
+        seq, t, v = self._visible(now)
+        size = round(header_h * 0.8)
+        if size >= 8:
+            font = get_font(size, "bahnschrift")
+            ts = font.render(clip_text(self.text or "Time series", font, rect.width // 2), True, (200, 204, 218))
+            surface.blit(ts, (rect.x + pad, rect.y + pad + (header_h - ts.get_height()) // 2))
+            last = float(v[-1]) if len(v) and math.isfinite(v[-1]) else None
+            right = format_value(last) if last is not None else ("no input" if not self.links else "—")
+            small = get_font(max(8, round(size * 0.8)), "bahnschrift")
+            rs = small.render(clip_text(right, small, rect.width - ts.get_width() - 4 * pad), True,
+                              TS_COLOR if last is not None else (110, 116, 130))
+            surface.blit(rs, rs.get_rect(midright=(rect.right - pad, rect.y + pad + header_h // 2)))
+        screen = pygame.Rect(rect.x + pad, rect.y + pad + header_h, rect.width - 2 * pad,
+                             rect.height - 2 * pad - header_h)
+        draw_rect(surface, GRAPH_SCREEN, screen, border_radius=max(2, radius - 3))
+        prev_clip = surface.get_clip()
+        surface.set_clip(screen.clip(prev_clip))
+        try:
+            self._draw_plot(surface, screen, seq, t, v)
+        finally:
+            surface.set_clip(prev_clip)
+
+    def _draw_plot(self, surface, screen, seq, t, v):
+        inner = screen.inflate(-max(4, screen.width // 30), -max(4, screen.height // 22))
+        font_size = round(inner.height * 0.07)
+        labels = font_size >= 8
+        font = get_font(font_size, "bahnschrift") if labels else None
+        # Margins: the axis names (when set) in their own column / row, outside the tick labels.
+        y_name = self.y_label.strip() if labels else ""
+        x_name = self.x_label.strip() if labels else ""
+        name_w = round(font_size * 1.4) if y_name else 0
+        left = name_w + font.size("-0.0000")[0] + font_size if labels else 0
+        bottom = round(font_size * 1.8) + (round(font_size * 1.3) if x_name else 0) if labels else 0
+        top = round(font_size * 0.6) if labels else 0
+        plot = pygame.Rect(inner.x + left, inner.y + top, inner.width - left - (font_size if labels else 0),
+                           inner.height - bottom - top)
+        if plot.width < plotting.MIN_PLOT_PX or plot.height < 16:
+            return
+        x_range = (-float(self.window), 0.0)
+        y_range = self.y_range(plotting.data_range(v))
+        if y_range is None:
+            if labels:
+                text = "link an input to sample it" if not self.links else "waiting for values…"
+                ts = font.render(clip_text(text, font, plot.width), True, (90, 96, 110))
+                surface.blit(ts, ts.get_rect(center=plot.center))
+            y_range = (0.0, 1.0)
+        (xlo, xhi), (ylo, yhi) = x_range, y_range
+        to_x = lambda val: plot.x + (val - xlo) / (xhi - xlo) * (plot.width - 1)      # noqa: E731
+        to_y = lambda val: plot.y + (yhi - val) / (yhi - ylo) * (plot.height - 1)     # noqa: E731
+        x_ticks = plotting.linear_ticks(xlo, xhi, max(2, plot.width // 70))
+        y_ticks = plotting.linear_ticks(ylo, yhi, max(3, plot.height // 25))
+        name_color = (110, 116, 130)
+        if y_name:          # sideways, centered on the plot, just left of the widest tick label (the plot stays put)
+            widest = max((font.size(plotting.format_tick(val))[0] for _p, val in y_ticks), default=0)
+            ts = pygame.transform.rotate(font.render(clip_text(y_name, font, plot.height), True, name_color), 90)
+            x = max(inner.x + name_w // 2, plot.x - font_size // 2 - widest - round(font_size * 0.4) - name_w // 2)
+            surface.blit(ts, ts.get_rect(center=(x, plot.centery)))
+        if x_name:                                   # under the time ticks, centered on the plot
+            ts = font.render(clip_text(x_name, font, plot.width), True, name_color)
+            surface.blit(ts, ts.get_rect(midbottom=(plot.centerx, inner.bottom)))
+        pygame.draw.rect(surface, (40, 46, 60), plot, 1)
+        for pos, _v in x_ticks:
+            x = round(to_x(pos))
+            if plot.left < x < plot.right - 1:
+                pygame.draw.line(surface, GRAPH_GRID, (x, plot.y + 1), (x, plot.bottom - 2))
+        for pos, _v in y_ticks:
+            y = round(to_y(pos))
+            if plot.top < y < plot.bottom - 1:
+                pygame.draw.line(surface, GRAPH_GRID, (plot.x + 1, y), (plot.right - 2, y))
+        vis = plot.clip(surface.get_clip())
+        if len(t) and vis.width > 0 and vis.height > 0:
+            # The key holds the newest sample's time, so the image follows the scroll.
+            key = (seq, float(t[-1]) if len(t) else 0.0, self.style)
+            surf = self._s.curve.get(key, plot, vis, t, v, x_range, y_range, color=TS_COLOR, style=self.style,
+                                   sorted_x=True)
+            surface.blit(surf, vis.topleft)
+        if not labels:
+            return
+        for pos, value in x_ticks:
+            x = round(to_x(pos))
+            pygame.draw.line(surface, (90, 96, 110), (x, plot.bottom), (x, plot.bottom + font_size // 3))
+            ts = font.render(f"{plotting.format_tick(value)} s" if value == xlo and not x_name
+                             else plotting.format_tick(value),
+                             True, GRAPH_INK)
+            r = ts.get_rect(midtop=(x, plot.bottom + font_size // 3))
+            r.clamp_ip(pygame.Rect(inner.x, r.y, inner.width, r.height))
+            surface.blit(ts, r)
+        for pos, value in y_ticks:
+            y = round(to_y(pos))
+            pygame.draw.line(surface, (90, 96, 110), (plot.x - font_size // 3, y), (plot.x, y))
+            ts = font.render(plotting.format_tick(value), True, GRAPH_INK)
+            r = ts.get_rect(midright=(plot.x - font_size // 2, y))
+            r.clamp_ip(pygame.Rect(r.x, inner.y, r.width, inner.height))
+            surface.blit(ts, r)
+
+
 # ---- Sequence: a list of numbers, stepped through like a for loop's i --------------------
 SQ_W = 330                      # Sequence layout, in world units at Size 1 (Counter's chips / title)
 SQ_INPUTS = ("next", "reset")

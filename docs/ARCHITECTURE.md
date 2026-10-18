@@ -255,6 +255,7 @@ screens, but keep inputs left and the output right.
 | Data collector | *collect* chip left ✓; columns on top of their headers ✗ | `rows` — no dot, center ✗ | partly |
 | Readout | `in` at its center ✗ | `value` — no dot, center ✗ | no |
 | Graph | *Runs from* at its center ✗ | — | no |
+| Time series | `in`, a dot on the left | — | follows |
 | Push button, Switch, Slider, Lamp | — | one output, no dot, center ✗ | no |
 | Neuron | — | 3 outputs, center ✗ | no |
 | Script | RUN / STOP on the button, field chips beside it ✗ | 4 outputs (one data), center ✗ | no |
