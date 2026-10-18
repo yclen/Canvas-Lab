@@ -10,3 +10,6 @@ calibration/nd_filter/
 
 # experiment runs (scripts/detector_power_sweep.py: spreadsheets, CSVs, plots)
 experiments/
+
+# Obsidian vault settings (the docs are opened in Obsidian) — never committed
+.obsidian/
