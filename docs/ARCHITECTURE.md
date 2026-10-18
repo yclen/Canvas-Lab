@@ -249,7 +249,7 @@ screens, but keep inputs left and the output right.
 | Object | Inputs | Outputs | Status |
 |---|---|---|---|
 | Machine, Timer | chips, left | a screen + dot each | follows |
-| Function, Counter, Sequence | chips, left | one output: screen + dot | follows |
+| Function, Counter, Sequence, Random | chips, left | one output: screen + dot | follows |
 | AND gate | pins, left | pin, right | follows (schematic look) |
 | Data tag | hole, left ✓; *streaming* input is the icon top-right ✗ | dot, right | mostly |
 | Data collector | *collect* chip left ✓; columns on top of their headers ✗ | `rows` — no dot, center ✗ | partly |

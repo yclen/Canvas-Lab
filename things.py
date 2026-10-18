@@ -47,6 +47,7 @@ import csv
 import json
 import math
 import os
+import random
 import re
 import subprocess
 import sys
@@ -3279,6 +3280,310 @@ class TimeSeries(YScale, Thing):
             r = ts.get_rect(midright=(plot.x - font_size // 2, y))
             r.clamp_ip(pygame.Rect(r.x, inner.y, r.width, inner.height))
             surface.blit(ts, r)
+
+
+# ---- Random: a random number, drawn on a press, every frame, or on a timer -------------
+RN_W = 250                      # Random layout, in world units at Size 1 (Counter-style)
+RN_COLOR = (120, 220, 200)
+RN_RANGE = {"uniform": ("min", "max"), "integer": ("min", "max"), "normal": ("mean", "spread")}
+RN_DRAWS = ("on press", "every frame", "on a timer")
+RN_FLASH = 0.25                 # seconds the number stays bright after a draw
+RN_SETTING = {"min": "low", "max": "high", "mean": "mean", "spread": "spread"}   # range input -> its setting
+
+
+class _Dice:
+    """A Random's generator and timer (not plain: not sent to players, not saved)."""
+
+    def __init__(self, seed):
+        self.seed = seed
+        self.rng = random.Random(seed if seed != "" else None)
+        self.waited = 0.0            # seconds since the last timed draw
+
+
+class Random(Thing):
+    """A random number, as its `value` output. **Distribution**: uniform (any
+    number from min to max), integer (whole numbers min…max, both included —
+    1…6 is a die) or normal (a bell curve: mean ± spread, the standard
+    deviation). **Draws**: on press — each press on its `next` chip (only
+    there in this mode), a click on it, or the panel's Draw rolls a new one;
+    every frame — fresh noise each frame (feed a Time series, or add it to a
+    signal in a Function); on a timer — every *Every* seconds. The panel's
+    Reset starts the sequence over and draws its first number: with a
+    **Seed** set, the same numbers come in the same order every time (for
+    testing a script twice on identical data); blank, it's truly random. The range — min / max, or mean / spread — are inputs too:
+    set each in the panel's input rows, or link one (a Function into mean
+    makes a noisy signal). Ctrl+click selects it."""
+
+    TYPE = "random"
+    MENU_LABEL = "Add random number"
+    NAME = "Random"
+    CATEGORY = "Math"
+    DOT_COLOR = RN_COLOR
+    PROPS = [Prop("scale", "Size", "float", 1.0, min=0.25, max=50, unit="×",
+                  prompt="Size (1 = normal, 2 = twice as big):"),
+             Prop("color", "Color", "color", RN_COLOR),
+             Prop("distribution", "Distribution", "choice", "uniform", choices=list(RN_RANGE)),
+             Prop("draws", "Draws", "choice", "on press", choices=list(RN_DRAWS)),
+             DurationProp("every_s", "Every", "float", 1.0, min=0.01,
+                          prompt="Draw a new number every (e.g. 0.5, 2 s, 1m) — when Draws is on a timer:"),
+             Prop("seed", "Seed", "str", "", prompt="Seed (blank = truly random; set one to repeat the sequence):"),
+             Prop("value", kind="data", default=None, hidden=True),
+             Prop("low", kind="float", default=0.0, hidden=True),        # the range, when its input isn't linked
+             Prop("high", kind="float", default=1.0, hidden=True),
+             Prop("mean", kind="float", default=0.0, hidden=True),
+             Prop("spread", kind="float", default=1.0, hidden=True)]
+
+    @classmethod
+    def create(cls, app):
+        def make(x, y):
+            used = {o.text for o in app.scene.objects if isinstance(o, Random)}
+            return cls(x, y, next(f"Random {i}" for i in range(1, 1000) if f"Random {i}" not in used))
+        app.start_placing(make)
+
+    @classmethod
+    def icon_sample(cls):
+        sample = cls(0, 0)
+        sample.value = 0.42
+        return sample
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._flash = 0.0           # seconds the number stays bright after a draw
+        self._dice = None           # the generator (made on first use, remade when the seed changes)
+
+    @property
+    def title(self):
+        return self.text or "Random"
+
+    # --- The range: inputs that fall back on their own setting -----------------------------
+    def range_keys(self):
+        return RN_RANGE.get(self.distribution, RN_RANGE["uniform"])
+
+    def bound(self, key):
+        """A range input's value: what it's linked to (while that has one), else its setting."""
+        if self.take_source(key) is not None:
+            value = self.take(key)
+            if value is not None:
+                return float(value)
+        return float(getattr(self, RN_SETTING[key]))
+
+    def set_bound(self, app, key):
+        def submit(text):
+            try:
+                setattr(self, RN_SETTING[key], float(text))
+            except ValueError:
+                return
+            app.save()
+        app.ask(f"{key.capitalize()}:", submit, value=f"{getattr(self, RN_SETTING[key]):g}")
+
+    def takes(self):
+        presses = [Take("next", kind="press")] if self.draws == "on press" else []
+        bounds = [Take(key, current=lambda key=key: getattr(self, RN_SETTING[key]),
+                       set_by_hand=lambda app, key=key: self.set_bound(app, key))
+                  for key in self.range_keys()]
+        return presses + bounds
+
+    # --- Drawing a number ---------------------------------------------------------------
+    def dice(self):
+        if self._dice is None or self._dice.seed != self.seed.strip():
+            self._dice = _Dice(self.seed.strip())
+        return self._dice
+
+    def roll(self):
+        """One number from the distribution (the range as it is right now)."""
+        rng = self.dice().rng
+        if self.distribution == "normal":
+            return rng.gauss(self.bound("mean"), abs(self.bound("spread")))
+        lo, hi = sorted((self.bound("min"), self.bound("max")))
+        if self.distribution == "integer":
+            first, last = math.ceil(lo), math.floor(hi)
+            return float(rng.randint(first, last)) if first <= last else float(round(lo))
+        return rng.uniform(lo, hi)
+
+    def new_number(self, app=None):
+        """Roll a new value."""
+        self.value = self.roll()
+        if self.draws != "every frame":
+            self._flash = RN_FLASH
+
+    def reset(self, app=None):
+        """Back to the start of the sequence (the seed's first number, or a fresh random one)."""
+        self._dice = None
+        self.new_number()
+
+    def on_press(self, port):
+        self.new_number()                             # `next`, the only press input
+
+    def on_prop_changed(self, key):
+        super().on_prop_changed(key)
+        if key in ("seed", "distribution"):
+            self.reset()
+
+    def tick(self, dt):
+        self._flash = max(0.0, self._flash - dt)
+        if self.value is None:
+            self.new_number()                         # a new one starts with a number
+        elif self.draws == "every frame":
+            self.new_number()
+        elif self.draws == "on a timer":
+            dice, every = self.dice(), max(0.01, float(self.every_s))
+            dice.waited += dt
+            if dice.waited >= every - 1e-6:              # (frames of 1/60 s add up a hair short)
+                dice.waited = min(dice.waited - every, every)    # keeps the pace; no burst after a stall
+                self.new_number()
+
+    def outputs(self):
+        return {"value": self.value}
+
+    # --- Panel and clicks -----------------------------------------------------------------
+    def rename(self, app):
+        def submit(text):
+            if text.strip():
+                self.text = text.strip()
+                app.save()
+        app.ask("Name:", submit, value=self.title)
+
+    def on_click(self, pos, app):
+        """A chip starts linking it; anywhere else rolls a new number."""
+        name = self.chip_at(pos, app.camera)
+        if name is not None:
+            self.pick(app, name)
+        else:
+            self.new_number(app)
+        return True
+
+    def state_rows(self, app):
+        return [Row("Value", format_value(self.value))]
+
+    def actions(self, app):
+        return [Btn("Draw", self.new_number, style="go"), Btn("Reset", self.reset)]
+
+    def range_text(self):
+        if self.distribution == "normal":
+            return f"normal {self.bound('mean'):.4g} ± {abs(self.bound('spread')):.4g}"
+        lo, hi = sorted((self.bound("min"), self.bound("max")))
+        return f"{self.distribution} {lo:.4g}…{hi:.4g}"
+
+    # --- Layout (world units at Size 1 from the top-left; shared by drawing, clicks, wires) --
+    def _chip_names(self):
+        return (["next"] if self.draws == "on press" else []) + list(self.range_keys())
+
+    @property
+    def world_width(self):
+        return RN_W * self.scale
+
+    @property
+    def world_height(self):
+        n = len(self._chip_names())
+        return (FN_PAD + CT_TITLE + n * FN_CHIP_H + (n - 1) * FN_CHIP_GAP + FN_PAD) * self.scale
+
+    def _to_world(self, x, y):
+        c = self.world_center
+        return (c.x - self.world_width / 2 + x * self.scale, c.y - self.world_height / 2 + y * self.scale)
+
+    def _chip_boxes(self):
+        top = FN_PAD + CT_TITLE
+        return [(name, FN_PAD, top + i * (FN_CHIP_H + FN_CHIP_GAP), CT_CHIP_W, FN_CHIP_H)
+                for i, name in enumerate(self._chip_names())]
+
+    def _screen_box(self):
+        x = FN_PAD + CT_CHIP_W + 10
+        y = FN_PAD + CT_TITLE
+        return x, y, RN_W - FN_PAD - x, self.world_height / self.scale - FN_PAD - y
+
+    def input_point(self, port):
+        for n, x, y, _w, h in self._chip_boxes():
+            if n == port:
+                return self._to_world(x, y + h / 2)
+        return self.center
+
+    def output_point(self):
+        x, y, w, h = self._screen_box()
+        return self._to_world(x + w + FN_PAD, y + h / 2)
+
+    def _chip_rects(self, rect):
+        k = rect.width / RN_W
+        return [(name, pygame.Rect(rect.x + round(x * k), rect.y + round(y * k),
+                                   max(1, round(w * k)), max(1, round(h * k))))
+                for name, x, y, w, h in self._chip_boxes()], k
+
+    def chip_at(self, pos, camera):
+        chips, _k = self._chip_rects(self.screen_rect(camera))
+        return next((name for name, r in chips if r.inflate(6, 6).collidepoint(pos)), None)
+
+    def take_at(self, pos, camera):
+        return self.chip_at(pos, camera)
+
+    # --- Drawing ----------------------------------------------------------------------
+    def draw_shape(self, surface, rect, camera):
+        s = min(rect.width, rect.height)
+        radius = max(2, s // 8)
+        draw_rect(surface, (14, 14, 18), rect.move(0, max(1, s // 22)), border_radius=radius)
+        draw_rect(surface, INPUT_HOUSING, rect, border_radius=radius)
+        draw_rect(surface, shade(INPUT_HOUSING, 1.35), rect, width=max(1, s // 40), border_radius=radius)
+        if s < 16:
+            draw_rect(surface, shade(self.color, 0.5), rect.inflate(-max(1, s // 3), -max(1, s // 3)))
+            return
+        chips, k = self._chip_rects(rect)
+
+        # The name, and the distribution / range beside it.
+        size = round(16 * k)
+        if size >= 7:
+            font = get_font(size, "bahnschrift")
+            title = font.render(clip_text(self.title, font, rect.width * 0.45), True, (226, 228, 236))
+            surface.blit(title, (rect.x + round(FN_PAD * k), rect.y + round(FN_PAD * k)))
+            info_font = get_font(max(7, round(13 * k)), "consolas", True)
+            room = rect.right - round(FN_PAD * k) - (rect.x + round(FN_PAD * k) + title.get_width() + round(8 * k))
+            info = info_font.render(clip_text(self.range_text(), info_font, room), True, shade(self.color, 0.85))
+            if room > 0:
+                surface.blit(info, info.get_rect(midright=(rect.right - round(FN_PAD * k),
+                                                           rect.y + round(FN_PAD * k) + title.get_height() // 2)))
+
+        # Input chips: hollow until linked, filled once linked, brighter under the mouse.
+        mouse = pygame.mouse.get_pos() if self.is_hovered else None
+        csize = round(FN_CHIP_TEXT * k)
+        for name, r in chips:
+            linked = self.take_source(name) is not None
+            hot = mouse is not None and r.inflate(6, 6).collidepoint(mouse)
+            color = shade(self.color, 1.2) if hot else self.color
+            cr = max(2, r.height // 2)
+            if linked:
+                draw_rect(surface, color, r, border_radius=cr)
+            else:
+                draw_rect(surface, INPUT_WELL, r, border_radius=cr)
+                draw_rect(surface, color, r, width=max(1, round(2 * k)), border_radius=cr)
+            if csize >= 7:
+                font = get_font(csize, "consolas", True)
+                ts = font.render(clip_text(name, font, r.width - 6), True, INPUT_WELL if linked else color)
+                surface.blit(ts, ts.get_rect(center=r.center))
+
+        # The value, with the output dot on the right edge; it flares on each new draw.
+        x, y, w, h = self._screen_box()
+        screen = pygame.Rect(rect.x + round(x * k), rect.y + round(y * k), round(w * k), round(h * k))
+        corner = max(2, round(6 * k))
+        flare = self._flash / RN_FLASH
+        draw_rect(surface, shade(self.color, 0.07 + 0.08 * flare), screen, border_radius=corner)
+        draw_rect(surface, (8, 8, 10), screen, width=max(1, s // 45), border_radius=corner)
+        pygame.draw.circle(surface, self.color if self.value is not None else shade(self.color, 0.4),
+                           (rect.right, screen.centery), max(2, round(5 * k)))
+        pad = round(8 * k)
+        lsize = round(13 * k)
+        if lsize >= 7:
+            ls = get_font(lsize, "consolas", True).render(self.draws, True, shade(self.color, 0.6))
+            surface.blit(ls, (screen.x + pad, screen.y + max(1, pad // 2)))
+        if self.value is None:
+            text = "—"
+        elif self.distribution == "integer":
+            text = f"{self.value:.0f}"
+        else:
+            text = f"{self.value:.6g}"
+        color = shade(self.color, 1.2 + 0.4 * flare)
+        size = round(h * 0.36 * k)
+        while size > 7 and get_font(size, "consolas", True).size(text)[0] > screen.width - 2 * pad:
+            size = max(7, int(size * 0.9))
+        if size >= 7:
+            ts = get_font(size, "consolas", True).render(text, True, color)
+            surface.blit(ts, ts.get_rect(bottomright=(screen.right - pad, screen.bottom - pad)))
 
 
 # ---- Sequence: a list of numbers, stepped through like a for loop's i --------------------

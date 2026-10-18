@@ -149,6 +149,21 @@
   Counter-style, names "Timer 1", "Timer 2", …, the duration beside the name; the *remaining* screen
   shows the duration (grey) while idle, an amber countdown over a progress bar while running, and a
   green 0.0 at the end; the *done* screen says NO (grey) or YES (green, flaring as it finishes). Link `done` to a Script's **RUN** to start a run a set time later
+- **Random** (E menu ▸ Math, `things.py`): a random number, its output `value` (a dot on the right).
+  **Distribution**: *uniform* (any number from min to max), *integer* (whole numbers min…max, both
+  included — 1…6 is a die) or *normal* (mean ± spread, the standard deviation). **Draws**: *on
+  press* — each press on its `next` chip (a *press* input, there only in this mode; a link to it is
+  kept, just idle, in the others), a click on it, or the panel's Draw rolls one; *every frame* —
+  fresh noise each frame; *on a timer* — every *Every* (a duration; it keeps the pace, subtracting
+  the interval). The panel's **Reset** starts the sequence over and draws its first number: with a
+  **Seed** set the same numbers come in the same order every time (so a script can be tested twice
+  on identical data); blank, it's truly random. The range — `min` / `max`, or `mean` / `spread` —
+  are inputs too, chips on the left: each one's own value is set in its panel input row (like a
+  device param), and a link overrides it (a Function into `mean` + every frame = a noisy signal).
+  Switching distribution swaps those chips and redraws. Counter-style look, named
+  *Random 1*, *2*, …, the distribution and range printed beside the name; the screen says how it
+  draws and flares on each new number (not every frame). The value is saved; the generator
+  (`_Dice`, also the timer) isn't plain, so it stays in the world.
 - **Sequence** (E menu ▸ Math, `things.py`): a list of numbers stepped through like the `i` of a for
   loop. Its output `value` is the selected number. Two *press* chips, linked like a Counter's:
   **next** moves to the next number, **reset** back to the first. It starts on the first, so the
