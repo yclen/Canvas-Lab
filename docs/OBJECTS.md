@@ -477,6 +477,8 @@ Each one is a Device object for one driver in `drivers/`; how devices connect is
   re-targeting; connecting never moves (target starts at the current position). `sim://` is a
   built-in pretend 3-stage chain. The canvas object draws a stepper motor on a rail with the
   carriage at the real position, an orange target marker, a glow while moving, NOT HOMED.
+  A small **input dot** for `target` sits on the left edge, level with the motor — a ring until
+  linked, filled once linked; click it (or drop a wire on it) to link.
 - **PM100D power meter** (`drivers/pm100d_meter.py`, canvas object *PM100D*): wraps the lab
   driver `../hardware drivers/pm100d.py` (pyvisa / NI-VISA, USB — not a COM port). Option
   `address`: `auto` (the lab driver finds the Thorlabs VID 0x1313 resource), a VISA resource
@@ -581,6 +583,8 @@ Each one is a Device object for one driver in `drivers/`; how devices connect is
   a band is never half-applied. The object is a **color picker**: a spectrum strip — click / drag
   sets the center (unless center is linked), the passed band stays lit, the requested band shows
   as an orange outline while the stages move. Its panel says where the calibration lives.
+  A small **output dot** for `actual_center` sits on the right edge, level with the strip, in
+  the band's own color (grey with no value): drag from it, or click it, to link.
 - **Filter wheel** (`drivers/filter_wheel.py`, canvas object *Filter wheel*): wraps the lab driver
   `../hardware drivers/fw102c.py` (Thorlabs FW102C, 6 slots, USB serial). Param `position` (1 …
   slots, read from the unit; any number is rounded to a slot, so it can follow a slider or a

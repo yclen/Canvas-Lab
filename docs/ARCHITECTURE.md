@@ -260,8 +260,9 @@ screens, but keep inputs left and the output right.
 | Script | RUN / STOP on the button, field chips beside it ✗ | 4 outputs (one data), center ✗ | no |
 | PDA45 | `gate`, at its center | a dot each for `count_rate` / `voltage`, right, level with its screen (no labels: the screens are the labels) | its own look, on purpose |
 | PM100D | `wavelength`, at its center | one dot (`power`), right, level with the LCD | its own look, on purpose |
-| Flip mirror, Filter wheel | one dot (`up` / `position`), left — a ring until linked | each reading + setting, center | its own look, on purpose |
-| Every other device (Zaber, SuperK, excitation filters, …) | each setting, at its center | each reading + setting, center | its own look, on purpose |
+| Flip mirror, Filter wheel, Zaber | one dot (`up` / `position` / `target`), left — a ring until linked | each reading + setting, center | its own look, on purpose |
+| Excitation filters | `center` / `width`, at its center | one dot (`actual_center`), right, level with the strip | its own look, on purpose |
+| Every other device (servo, SuperK, spectrometer) | each setting, at its center | each reading + setting, center | its own look, on purpose |
 
 - **Outputs:** `outputs()` → `{name: number or None}` is how values are read; `gives()`
   declares them (name, unit), so the panel and the pickers can list them even while a value is

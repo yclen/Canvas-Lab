@@ -5316,6 +5316,25 @@ class ZaberStage(Device):
             rows.append(Row("Travel", f"{low:g} – {high:g} mm"))
         return rows
 
+    # --- Input dot: `target`, on the left edge level with the motor (draw_shape's layout) ---
+    def input_point(self, port):
+        if port != "target":
+            return self.center
+        c, w, h = self.world_center, self.world_width, self.world_height
+        top = c.y - h / 2 + h * (0.08 * 1.5 + 0.26)              # the stage area, below the header
+        return (c.x - w / 2, (top + c.y + h / 2 - h * 0.08) / 2)
+
+    def take_at(self, pos, camera):
+        dot = pygame.Vector2(camera.world_to_screen(self.input_point("target")))
+        return "target" if dot.distance_to(pos) <= max(PORT_REACH, 8 * self.scale * camera.zoom) else None
+
+    def on_click(self, pos, app):
+        """A click on the input dot links it (anywhere else selects)."""
+        if self.take_at(pos, app.camera):
+            self.pick(app, "target")
+            return True
+        return False
+
     def draw_shape(self, surface, rect, camera):
         status = self.status()
         led_color = DEVICE_STATUS_COLORS.get(status, (110, 110, 120))
@@ -5333,6 +5352,8 @@ class ZaberStage(Device):
         draw_rect(surface, shade(INPUT_HOUSING, 1.35), rect, width=max(1, s // 60), border_radius=radius)
         pad = max(2, round(s * 0.08))
         header_h = round(s * 0.26)
+        draw_input_dot(surface, (rect.x, round(rect.y + rect.height * (0.08 * 1.5 + 0.26 + 1 - 0.08) / 2)),
+                       self.take_source("target") is not None, s)
         led_r = max(2, s // 26)
         led = (rect.right - pad - led_r, rect.y + pad + header_h // 2)
         if status in ("ok", "starting", "error", "missing", "connecting"):
@@ -5497,6 +5518,13 @@ class FilterBand(Device):
         strip = pygame.Rect(rect.x + pad, top, rect.width - 2 * pad, rect.bottom - pad - label_h - top)
         return {"pad": pad, "header_h": header_h, "strip": strip, "label_h": label_h}
 
+    def output_point(self):
+        """Its output dot (actual_center, its first output): on the right edge,
+        level with the spectrum strip (as in _layout)."""
+        c, w, h = self.world_center, self.world_width, self.world_height
+        top = c.y - h / 2
+        return (c.x + w / 2, top + h * ((0.08 * 1.5 + 0.24) + (1 - 0.08 - 0.16)) / 2)
+
     def _x_to_nm(self, x, strip, band):
         t = max(0.0, min(1.0, (x - strip.x) / max(1, strip.width)))
         return band["lo"] + t * (band["hi"] - band["lo"])
@@ -5572,6 +5600,9 @@ class FilterBand(Device):
         layout = self._layout(rect)
         pad, header_h, strip = layout["pad"], layout["header_h"], layout["strip"]
         live = status == "ok"
+        center = self.outputs().get("actual_center")            # the output dot, in the band's color
+        pygame.draw.circle(surface, wavelength_rgb(center) if center is not None else (70, 72, 82),
+                           (rect.right, strip.centery), max(2, s // 32))
 
         # Header: name, the band (with a swatch of its color), the status light.
         led_r = max(2, s // 26)
