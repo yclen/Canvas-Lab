@@ -558,6 +558,20 @@ carries a `seq` and gets `{"op": "reply", "seq", "ok", ...}` (an `"error"` when 
 refuses everything else an agent sends (adding, linking, clicks, menus, commands: "it can look but
 not change anything"). It may still send presence (where its cursor is).
 
+**Working where you can see it — attach:** `python claude_world.py attach` (run in the background)
+joins once and **stays**: Claude in the player list, its view box around the zone it's working in,
+and its cursor. It listens on `ATTACH_PORT` (the world's port + 2, this PC only; `CANVAS_CLAUDE_PORT`
+overrides), and every other command finds it there (`attached()`) and goes through it
+(`AttachedLink`, the same request / send / close as a `WorldLink`) instead of joining for a moment.
+The attached Claude (`Presence`) keeps an up-to-date copy of the world (it applies the world's
+changes, like a window) and **choreographs** each request before making it: the cursor glides there
+(eased, `GLIDE_TIME` 0.2–0.8 s, 30 updates a second; windows smooth it further), presses (`down`, the
+click ring) to create or set, **drags** a move in `DRAG_STEPS` real moves so the object travels,
+draws a link from the source's output dot to the target's input, and goes to each thing it deletes,
+one at a time. Commands that render get a snapshot of its copy. `detach` says goodbye; it also leaves
+after 15 idle minutes or when the world stops. `sweep ID KEY V1 V2 … --read ID.KEY … [--hold 0.6]`
+is visible testing: it sets a control to each value in turn and reads the outputs after each.
+
 **Looking:**
 - `python claude_world.py status` — is a world running, who's in it (exit 2: none).
 - `zones` — every Claude zone: name, box, brief.

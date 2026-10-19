@@ -7,6 +7,15 @@ it never touches the save file. Claude builds only inside a Claude zone, only
 on what it made there, never lab hardware — the world refuses anything else
 and says why.
 
+Working where you can see it: start `attach` (in the background) first — Claude joins once and
+stays, and every command below goes through it: its cursor glides to each thing, clicks, drags
+what it moves, draws each wire from the output to the input. `detach` when done (or it leaves
+after 15 idle minutes). Without attach, each command joins for a moment (no cursor to watch).
+    python claude_world.py attach [--idle-minutes 15]
+    python claude_world.py detach
+    python claude_world.py sweep ID KEY V1 V2 ... [--read ID.KEY ...] [--hold 0.6]
+                                                   test: set KEY to each value, read outputs after each
+
 Looking:
     python claude_world.py status                  is a world running? who's in it?
     python claude_world.py zones                   the Claude zones: name, box, brief
@@ -50,7 +59,9 @@ code is 0 / 1 (2: no world running).
 
 import argparse
 import json
+import math
 import os
+import socket
 import sys
 import time
 
@@ -78,8 +89,13 @@ def emit(answer):
     return 0 if answer.get("ok") else 1
 
 
-def join():
-    """(link, welcome) for the running world, or raises LookupError / ConnectionError."""
+def join(direct=False):
+    """(link, welcome) for the running world, or raises LookupError / ConnectionError. While
+    `attach` runs (and not direct), through it: Claude's already there."""
+    if not direct:
+        through = attached()
+        if through is not None:
+            return through, through.snapshot()
     host, _status, _pc = world_link.find_world()
     if host is None:
         raise LookupError("no world is running — launch it from the canvas's home screen (Launch world)")
@@ -244,10 +260,309 @@ def render(welcome, zone_name, out, width, margin=RENDER_MARGIN, problems=True, 
             "problems": [f"{n}. {p['kind']}: {p['what']}" for n, p in enumerate(check["problems"], 1)]}
 
 
+# ---- Attached: Claude stays in the world while it works -------------------------------------
+# `attach` joins once and stays (cursor, name, view box), listening on ATTACH_PORT (this PC only);
+# every other command then goes through it instead of joining for a moment, so Claude never blinks
+# out, and its cursor glides to each thing it works on — pressing, dragging, wiring — before the
+# change is made. `detach` (or ATTACH_IDLE of nothing to do) says goodbye.
+ATTACH_PORT = int(os.environ.get("CANVAS_CLAUDE_PORT") or world_link.PORT + 2)
+ATTACH_IDLE = 15 * 60           # seconds with nothing to do before attach leaves by itself
+GLIDE_HZ = 30                   # cursor updates a second while it glides
+GLIDE_SPEED = 3500              # world units a second (longer trips take longer, within GLIDE_TIME)
+GLIDE_TIME = (0.2, 0.8)         # seconds a glide takes, at least / at most
+PRESS_S = 0.12                  # how long a click shows (the ring) before / after the change
+DRAG_STEPS = 10                 # a move is dragged there in this many steps (you see it travel)
+
+
+class AttachedLink:
+    """What a command talks to while `attach` runs: the same request / send / close as a
+    WorldLink, but through the attached Claude (which moves its cursor first)."""
+
+    def _call(self, payload, timeout=60.0):
+        with socket.create_connection(("127.0.0.1", ATTACH_PORT), timeout=timeout) as sock:
+            world_link.send_line(sock, payload)
+            replies = []
+            world_link.read_lines(sock, replies.append)
+        return replies[0] if replies else None
+
+    def request(self, message, timeout=60.0):
+        return self._call({"kind": "ask", "message": message}, timeout)
+
+    def send(self, message):
+        pass                                    # (attach moves the cursor itself)
+
+    def snapshot(self):
+        return self._call({"kind": "snapshot"})
+
+    def close(self):
+        pass
+
+
+def attached():
+    """An AttachedLink if `attach` is running on this PC, else None."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.2)
+        if s.connect_ex(("127.0.0.1", ATTACH_PORT)) != 0:
+            return None
+    return AttachedLink()
+
+
+class Presence:
+    """The attached Claude: its link, its up-to-date copy of the world, and its cursor."""
+
+    def __init__(self, link, welcome):
+        self.link = link
+        self.scene = world_copy(welcome)
+        self.scene.save = lambda: None             # a copy: never written
+        self.cursor = None
+        self.down = False
+
+    def pump(self):
+        """Take in what the world sent (changes): the copy stays current for cursor targets
+        and snapshots."""
+        for msg in self.link.poll():
+            if msg.get("op") == "changes":
+                world_link.apply_changes(self.scene, msg, canvas.object_from_dict)
+        if self.link.closed:
+            raise ConnectionError(self.link.reason or "the world closed the connection")
+
+    def _zone_box(self, at):
+        for z in self.scene.objects:
+            if isinstance(z, canvas.ClaudeZone) and z.contains(*at):
+                return [z.x, z.y, z.w, z.h]
+        return None
+
+    def show(self, at):
+        self.cursor = [float(at[0]), float(at[1])]
+        self.link.send({"op": "presence", "cursor": [round(v, 1) for v in self.cursor],
+                        "view": self._zone_box(self.cursor), "down": self.down})
+
+    def glide(self, to):
+        """Move the cursor to `to` smoothly (eased), the way a hand would."""
+        to = [float(to[0]), float(to[1])]
+        start = self.cursor or to
+        dist = math.hypot(to[0] - start[0], to[1] - start[1])
+        seconds = min(GLIDE_TIME[1], max(GLIDE_TIME[0], dist / GLIDE_SPEED)) if dist > 1 else 0
+        steps = max(1, round(seconds * GLIDE_HZ))
+        for k in range(1, steps + 1):
+            f = k / steps
+            f = f * f * (3 - 2 * f)                    # ease in and out
+            self.show((start[0] + (to[0] - start[0]) * f, start[1] + (to[1] - start[1]) * f))
+            time.sleep(seconds / steps if seconds else 0)
+            self.pump()
+
+    def press(self, down):
+        self.down = down
+        if self.cursor is not None:
+            self.show(self.cursor)
+        time.sleep(PRESS_S)
+        self.pump()
+
+    def ask(self, message):
+        reply = self.link.request(message, timeout=10.0)
+        self.pump()
+        if reply is None:
+            return {"ok": False, "error": "the world didn't answer"}
+        return {k: v for k, v in reply.items() if k not in ("op", "seq")}
+
+    def where(self, id):
+        obj = self.scene.by_id.get(id)
+        return None if obj is None or obj.center is None else tuple(obj.center)
+
+    def perform(self, message):
+        """Do one request the way you'd see a person do it: go there, click, drag, wire."""
+        op = message.get("op")
+        try:
+            if op == "create":
+                self.glide(message["at"])
+                self.press(True)
+                reply = self.ask(message)
+                self.press(False)
+                return reply
+            if op in ("set", "query") and message.get("id"):
+                at = self.where(message["id"])
+                if at is not None:
+                    self.glide(at)
+                if op == "set":
+                    self.press(True)
+                    reply = self.ask(message)
+                    self.press(False)
+                    return reply
+                return self.ask(message)
+            if op == "move":
+                return self._drag(message)
+            if op in ("link", "unlink"):
+                return self._wire(message)
+            if op == "delete":
+                return self._delete(message)
+            if op == "resize_zone":
+                zone = agent_api.find_zone(self.scene, message.get("zone"))
+                if zone is not None:
+                    self.glide((zone.x + zone.w, zone.y + zone.h))
+                self.press(True)
+                reply = self.ask(message)
+                self.press(False)
+                return reply
+            return self.ask(message)
+        finally:
+            if self.down:
+                self.press(False)
+
+    def _drag(self, message):
+        """Grab it, carry it there in steps (each one a real move, so you see it travel), let go."""
+        start = self.where(message["id"])
+        if start is None:
+            return self.ask(message)
+        to = [float(v) for v in message["to"]]
+        self.glide(start)
+        self.press(True)
+        for k in range(1, DRAG_STEPS):
+            f = k / DRAG_STEPS
+            f = f * f * (3 - 2 * f)
+            at = (start[0] + (to[0] - start[0]) * f, start[1] + (to[1] - start[1]) * f)
+            self.show(at)
+            step = self.ask({"op": "move", "id": message["id"], "to": list(at)})
+            if not step.get("ok"):
+                break                                  # the last step says why (below)
+            time.sleep(0.03)
+        self.show(to)
+        reply = self.ask(message)
+        self.press(False)
+        return reply
+
+    def _wire(self, message):
+        """From the source's output dot to the target's input (or, unlinking, to the input)."""
+        target = self.scene.by_id.get(message.get("target"))
+        src = self.scene.by_id.get(message.get("src"))
+        if message["op"] == "link" and src is not None:
+            self.glide(canvas.output_point(src, message.get("key")))
+            self.press(True)
+        if target is not None:
+            self.glide(target.input_point(message.get("port")))
+        if not self.down:
+            self.press(True)
+        reply = self.ask(message)
+        self.press(False)
+        return reply
+
+    def _delete(self, message):
+        """One at a time: go to each, click, gone."""
+        deleted, last = [], {"ok": True}
+        for id in message.get("ids") or []:
+            at = self.where(id)
+            if at is not None:
+                self.glide(at)
+            self.press(True)
+            last = self.ask({"op": "delete", "ids": [id]})
+            self.press(False)
+            if not last.get("ok"):
+                return dict(last, deleted=deleted)
+            deleted += last.get("deleted", [])
+        return {"ok": True, "deleted": deleted}
+
+    def snapshot(self):
+        self.pump()
+        return {"objects": [o.to_dict() for o in self.scene.objects],
+                "state": {o.id: world_link.object_state(o) for o in self.scene.objects}}
+
+
+def attach(idle=ATTACH_IDLE):
+    """Join the world as Claude and stay, doing what commands ask through ATTACH_PORT, until
+    `detach`, the world goes away, or `idle` seconds pass with nothing to do."""
+    link, welcome = join(direct=True)
+    me = Presence(link, welcome)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        server.bind(("127.0.0.1", ATTACH_PORT))
+    except OSError:
+        link.close()
+        return {"ok": False, "error": f"couldn't listen on port {ATTACH_PORT} — is Claude already attached?"}
+    server.listen()
+    server.settimeout(0.1)
+    emit({"ok": True, "attached": link.name, "port": ATTACH_PORT, "idle_minutes": round(idle / 60, 1)})
+    sys.stdout.flush()
+    last = time.monotonic()
+    reason = "detached"
+    try:
+        while True:
+            try:
+                me.pump()
+            except ConnectionError as e:
+                reason = str(e)
+                break
+            if time.monotonic() - last > idle:
+                reason = "left after being idle"
+                break
+            try:
+                conn, _addr = server.accept()
+            except socket.timeout:
+                continue
+            last = time.monotonic()
+            with conn:
+                conn.settimeout(10.0)
+                requests = []
+                buf = b""
+                while b"\n" not in buf:
+                    data = conn.recv(1 << 16)
+                    if not data:
+                        break
+                    buf += data
+                if buf.strip():
+                    requests.append(json.loads(buf.split(b"\n", 1)[0]))
+                for req in requests:
+                    kind = req.get("kind")
+                    try:
+                        if kind == "ask":
+                            out = me.perform(req.get("message") or {})
+                        elif kind == "snapshot":
+                            out = me.snapshot()
+                        elif kind == "bye":
+                            out = {"ok": True, "detached": True}
+                        else:
+                            out = {"ok": False, "error": f"unknown request {kind!r}"}
+                    except ConnectionError as e:
+                        out = {"ok": False, "error": str(e)}
+                    world_link.send_line(conn, out)
+                    try:
+                        conn.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    if kind == "bye":
+                        return {"ok": True, "detached": True}
+            last = time.monotonic()
+    finally:
+        server.close()
+        link.close()
+    return {"ok": True, "detached": True, "why": reason}
+
+
+def sweep(link, id, key, values, reads, hold):
+    """Visible testing: set `key` of one of Claude's objects to each value in turn and, after
+    `hold` seconds, read the outputs in `reads` ("ID.KEY") — the cursor goes to each as it does."""
+    rows = []
+    for value in values:
+        reply = ask(link, {"op": "set", "id": id, "settings": {key: value}})
+        if not reply.get("ok"):
+            return {"ok": False, "error": reply.get("error"), "rows": rows}
+        time.sleep(hold)
+        row = {key: reply.get("set", {}).get(key, value)}
+        for read in reads:
+            rid, out = port_of(read)
+            got = ask(link, {"op": "query", "id": rid})
+            outputs = {o["key"]: o["value"] for o in (got.get("objects") or [{}])[0].get("outputs", [])}
+            row[read] = outputs.get(out)
+        rows.append(row)
+    return {"ok": True, "rows": rows}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Claude's link to the running world.")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status", help="is a world running, and who's in it")
+    at = sub.add_parser("attach", help="join and stay (cursor and all) while working; run it in the background")
+    at.add_argument("--idle-minutes", type=float, default=ATTACH_IDLE / 60)
+    sub.add_parser("detach", help="the attached Claude says goodbye")
     sub.add_parser("zones", help="the Claude zones and their briefs")
     cat = sub.add_parser("catalog", help="what can be built")
     cat.add_argument("--type", help="just this type (e.g. function, time_series)")
@@ -291,11 +606,24 @@ def main(argv=None):
     bd.add_argument("plan")
     bd.add_argument("--pace", type=float, default=0.25, help="seconds between steps (to watch it build)")
     bd.add_argument("--render", help="then draw the plan's zone to this PNG")
+    sw = sub.add_parser("sweep", help="test: set a setting to each value in turn, reading outputs after each")
+    sw.add_argument("id")
+    sw.add_argument("key")
+    sw.add_argument("values", nargs="+", help="values, in order (JSON numbers or text)")
+    sw.add_argument("--read", nargs="*", default=[], metavar="ID.KEY", help="outputs to read after each")
+    sw.add_argument("--hold", type=float, default=0.6, help="seconds to wait before reading")
     bd.add_argument("--dry-run", action="store_true",
                     help="build on a private copy of the world instead: see the result (and --render it) "
                          "without changing anything")
     args = parser.parse_args(argv)
 
+    if args.command == "attach":
+        return emit(attach(max(60.0, args.idle_minutes * 60)))
+    if args.command == "detach":
+        through = attached()
+        if through is None:
+            return emit({"ok": True, "detached": False, "why": "Claude wasn't attached"})
+        return emit(through._call({"kind": "bye"}) or {"ok": True})
     if args.command == "status":
         host, status, pc = world_link.find_world()
         if host is None:
@@ -358,6 +686,9 @@ def main(argv=None):
             return emit(ask(link, {"op": "move", "id": args.id, "to": to}))
         if args.command == "delete":
             return emit(ask(link, {"op": "delete", "ids": args.ids}))
+        if args.command == "sweep":
+            return emit(sweep(link, args.id, args.key, [value_of(v) for v in args.values], args.read,
+                              max(0.0, args.hold)))
         if args.command == "build":
             with open(args.plan, encoding="utf-8") as f:
                 plan = json.load(f)

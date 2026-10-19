@@ -10,7 +10,25 @@ run from the repo root. Every command prints JSON (`{"ok": true, ...}` or `{"ok"
 exit code 2 means no world is running — tell the user, don't start one. Full reference:
 `docs/ARCHITECTURE.md`, "Claude in the world — agents".
 
-The goal is a clean build **the first time**: measure, plan, dry-run, look, fix, then build.
+**The user wants to watch Claude work** — live, in the zone: building a piece, looking at it,
+testing it, fixing it in place (moving, rewiring, deleting what didn't work), and leaving the
+finished product there. So work in the open, in stages, not in private: no dry run unless the user
+asks for one (see the end of section 3).
+
+## 0. Attach first, detach last
+
+```bash
+python claude_world.py attach        # run in the BACKGROUND (Bash run_in_background) — it stays
+...                                  # every command now goes through it
+python claude_world.py detach        # when the work is finished
+```
+
+While attached, Claude is in the world as a player: its name in the player list, its view box
+around the zone, and a cursor that **glides** to each thing before acting — clicking to create,
+dragging what it moves (you see it travel), drawing each wire from the output dot to the input,
+going to each thing it deletes. Without attach every command joins for a moment and there's
+nothing to watch, so always attach. If `attach` says it couldn't listen, Claude's already attached
+(use it). It leaves by itself after 15 idle minutes, or if the world stops.
 
 ## 1. Look
 
@@ -48,8 +66,8 @@ python claude_world.py catalog --type function
 - Write plans to the scratchpad, not the repo.
 
 Layout rules:
-- **Measure first.** Sizes differ a lot by type and settings: dry-run the parts alone (or `query`
-  existing ones, `size`) and use the real widths/heights before choosing positions.
+- **Measure first.** Sizes differ a lot by type and settings: create a part and `query --id` it
+  (`size`), or check the size in the build result's object, before placing its neighbours.
 - Lay out in **rows, left to right**: inputs on the left, outputs on the right, wires flowing
   right. One row per idea, with a Label heading above each row (and a title Label at the top).
 - No overlaps, and **generous gaps** — well over the 20-unit "crowded" limit (aim ~60+ between
@@ -57,32 +75,31 @@ Layout rules:
 - Center the whole design in the zone: the `used` box from `check` / the build result should
   have about equal space left/right and top/bottom.
 
-## 3. Dry-run, look, iterate — ALWAYS before building
+## 3. Build in stages: build, look, test, fix
+
+Work one idea at a time (one row / sub-circuit), each stage a small plan or a few commands:
 
 ```bash
-python claude_world.py build plan.json --dry-run --render dry.png
+python claude_world.py build stage1.json --pace 0.25        # create + wire one sub-circuit
+python claude_world.py render --zone "Zone 1" --out look.png  # LOOK: open the PNG (Read tool)
+python claude_world.py check --zone "Zone 1"                  # overlaps / crowding / poking out
 ```
 
-This runs the plan on a private copy of the world: same answers, `problems` and render, nothing
-changed. Then:
-1. Read the JSON: it stops at the first refused step (`error` says why). Read `problems`
-   (`overlap`, `crowded`, `out of zone`, with ids and boxes) and `used`.
-2. **Open the PNG and look at it** (Read tool). Problems are outlined in red and numbered;
-   also judge balance, alignment, and whether headings sit over their rows.
-3. Fix the plan and repeat until there are **zero problems** and it looks balanced.
+1. **Look** after every stage: open the render. Problems are outlined in red and numbered; also
+   judge balance, alignment, and whether headings sit over their rows.
+2. **Test** what you built, visibly — nudge its controls and read the results:
+   ```bash
+   python claude_world.py sweep SLIDER_ID value 0 2.5 5 10 --read READOUT_ID.value FN_ID.y --hold 0.5
+   ```
+   It sets the value in turn (the cursor on the control), waits, reads the outputs (the cursor goes
+   to each). Check the numbers make sense; `query --id` reads any one object's live values.
+   Leave controls at a sensible value afterwards.
+3. **Fix in place**: `move` it (it's dragged there), `set` it, re-`link` it, `delete` what didn't
+   work — the user sees each change. Then look again.
+4. Next stage. At the end: `check` shows **zero problems**, the render looks balanced (the `used`
+   box roughly centered), everything has been tested — then `detach`.
 
-Only then build for real (the user watches Claude's cursor):
-
-```bash
-python claude_world.py build plan.json --pace 0.25
-python claude_world.py render --zone "Zone 1" --out after.png   # --clean hides the red outlines
-python claude_world.py check --zone "Zone 1"
-```
-
-Look at `after.png` again. "No problems" plus a good-looking image is when it's done.
-
-Small changes afterwards can use single commands (positions with `--zone` are zone-relative;
-negative values as `--at=-5,10`):
+Single commands (positions with `--zone` are zone-relative centers; negative values as `--at=-5,10`):
 
 ```bash
 python claude_world.py create function --zone "Zone 1" --at 150,160 --name Wave --set expression=2*sin(t)
@@ -93,7 +110,9 @@ python claude_world.py move ID --zone "Zone 1" --to 300,200
 python claude_world.py delete ID [ID ...]
 ```
 
-For anything more than one or two changes, write a plan and dry-run it instead.
+**Dry run (only when asked, or before a big risky rearrangement):** `build plan.json --dry-run
+--render dry.png` runs a plan on a private copy of the world — same answers, `problems` and render,
+nothing changed, nothing to watch.
 
 ## 4. Rules the world enforces (and habits that avoid refusals)
 
@@ -119,5 +138,6 @@ For anything more than one or two changes, write a plan and dry-run it instead.
 
 ## 6. Report
 
-Tell the user what you built, how it's wired, any placeholders they need to fill (hardware),
-and show the final render (SendUserFile if they may be on another device).
+`detach`, then tell the user what you built, how it's wired, what you tested (the sweep numbers),
+any placeholders they need to fill (hardware), and show the final render (SendUserFile if they
+may be on another device).
