@@ -17,16 +17,19 @@ there (the zone's `made` list), never lab hardware (things.Device):
     {"op": "move", "id", "to": [x, y]}
     {"op": "delete", "ids": [...]}
     {"op": "resize_zone", "zone", "w", "h", "x"?, "y"?}   never cutting through anything
+    {"op": "weight", "from", "to", "value"}             a neuron's W to another (both Claude's)
+`set` also takes "name" (an object's name / a Label's words).
 A refused change answers why (`Refused`); anything else from an agent is refused.
 """
 
 import inspect
+import math
 
 import canvas
 import world_link
 
 AGENT_OPS = ("zones", "catalog", "query", "check", "create", "set", "link", "unlink", "move", "delete",
-             "resize_zone")
+             "resize_zone", "weight")
 AGENT_NAME = "Claude"
 
 
@@ -92,9 +95,11 @@ def type_info(cls):
                      for g in sample.gives()]
         except Exception:
             pass
+    state = [{"key": p.key, "kind": p.kind} for p in cls.props() if p.hidden and p.key not in ("links", "made")]
     return {"type": cls.TYPE, "name": cls.type_name(), "category": getattr(cls, "CATEGORY", None),
-            "hardware": is_hardware(cls), "about": _doc(cls), "settings": props, "inputs": takes,
-            "outputs": gives}
+            "hardware": is_hardware(cls), "about": _doc(cls), "settings": props,
+            "state": state,          # hidden settings `set` reaches too (an expression, an equation, …)
+            "inputs": takes, "outputs": gives}
 
 
 def catalog(type_name=None):
@@ -139,6 +144,8 @@ def object_info(obj, scene):
                  and z is not obj and z.contains(*c)), None)
     info["zone"] = zone.display_name if zone is not None else None
     info["hardware"] = is_hardware(type(obj))
+    if isinstance(obj, canvas.Neuron):
+        info["weights"] = {k: w for k, w in obj.weights.items() if w}   # its W to each other neuron (0s left out)
     return info
 
 
@@ -251,6 +258,14 @@ def _apply_settings(obj, settings, undo=None):
     each. undo (a dict), if given, collects each key's old value so the change can be taken back."""
     done = {}
     for key, value in (settings or {}).items():
+        if key == "name":                          # its name (a Label's words): not a Prop, but set the same way
+            if not hasattr(obj, "text"):
+                raise Refused(f"{obj.TYPE} has no name")
+            if undo is not None and "name" not in undo:
+                undo["name"] = obj.text
+            obj.text = str(value)
+            done["name"] = obj.text
+            continue
         if key in ("links", "made"):
             raise Refused(f"'{key}' isn't set this way (links: use link)")
         try:
@@ -286,6 +301,9 @@ def create(scene, type_name, at, name=None, settings=None):
     if name is not None and hasattr(obj, "text"):
         obj.text = str(name)
     _apply_settings(obj, settings)
+    problem = _setting_problem(obj)
+    if problem:
+        raise Refused(f"{problem} — not made")
     obj.scene = scene                              # (a size can depend on the scene: the zone check needs it)
     zone = zone_holding(scene, obj)
     if zone is None:
@@ -294,6 +312,23 @@ def create(scene, type_name, at, name=None, settings=None):
     zone.made = zone.made + [obj.id]
     scene.save()
     return obj, zone
+
+
+def _setting_problem(obj):
+    """Why obj's equation won't run (a neuron's firing equation or trigger, a function's
+    expression), or None."""
+    for attr, what in (("fire_error", "firing equation"), ("trigger_error", "clock trigger")):
+        if getattr(obj, attr, None):
+            return f"{what}: {getattr(obj, attr)}"
+    equation = getattr(obj, "equation", None)
+    if callable(equation):                          # a Function: equation() parses its expression
+        try:
+            error = equation().error
+        except Exception as e:                      # (anything odd: say so rather than crash)
+            error = str(e)
+        if error:
+            return f"expression: {error}"
+    return None
 
 
 def set_settings(scene, id, settings):
@@ -307,6 +342,10 @@ def set_settings(scene, id, settings):
     except Refused:
         _restore(obj, undo)
         raise
+    problem = _setting_problem(obj)
+    if problem:
+        _restore(obj, undo)
+        raise Refused(f"{problem} — nothing changed")
     if was_inside and zone_holding(scene, obj) is None:
         _restore(obj, undo)
         raise Refused("that would push it out of its zone, so nothing changed — move it somewhere with room first")
@@ -316,6 +355,9 @@ def set_settings(scene, id, settings):
 
 def _restore(obj, undo):
     for key, value in undo.items():
+        if key == "name":
+            obj.text = value
+            continue
         setattr(obj, key, value)
         obj.on_prop_changed(key)
 
@@ -375,6 +417,26 @@ def delete(scene, ids):
     return [o.id for o in objs]
 
 
+def set_weight(scene, from_id, to_id, value):
+    """Neuron from_id's W to neuron to_id (a synapse: > 0 excites, < 0 inhibits). Both must be
+    Claude's neurons in a Claude zone — never a W onto, or out of, one of yours."""
+    src, _zone = _mine(scene, from_id)
+    dst, _zone = _mine(scene, to_id)
+    if not (isinstance(src, canvas.Neuron) and isinstance(dst, canvas.Neuron)):
+        raise Refused("a weight joins two neurons")
+    if src is dst:
+        raise Refused("a neuron has no W to itself")
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise Refused(f"{value!r} isn't a number") from None
+    if not math.isfinite(value):
+        raise Refused("a W must be a finite number")
+    src.weights[dst.id] = value
+    scene.save()
+    return src, dst
+
+
 def change(scene, msg):
     """The reply body for an agent's change (op: create / set / link / unlink / move / delete)."""
     op = msg.get("op")
@@ -396,6 +458,9 @@ def change(scene, msg):
         return {"ok": True, "id": obj.id, "at": [round(c[0], 1), round(c[1], 1)]}
     if op == "delete":
         return {"ok": True, "deleted": delete(scene, msg.get("ids") or [])}
+    if op == "weight":
+        src, dst = set_weight(scene, msg.get("from"), msg.get("to"), msg.get("value"))
+        return {"ok": True, "from": src.id, "to": dst.id, "value": src.weights[dst.id]}
     return None
 
 

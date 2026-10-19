@@ -108,6 +108,8 @@ python claude_world.py link TARGET.PORT SRC.KEY
 python claude_world.py unlink TARGET.PORT
 python claude_world.py move ID --zone "Zone 1" --to 300,200
 python claude_world.py delete ID [ID ...]
+python claude_world.py set ID "name=New name"           # rename
+python claude_world.py weight FROM_NEURON TO_NEURON 1.5 # a synapse (> 0 excites, < 0 inhibits)
 ```
 
 **Dry run (only when asked, or before a big risky rearrangement):** `build plan.json --dry-run
@@ -128,7 +130,21 @@ nothing changed, nothing to watch.
 - If the zone's size or contents change mid-work (the user is editing too), run `zones` /
   `query` again and re-measure before the next build.
 
-## 5. Expression tips (Function objects)
+## 5. Native Neurons
+
+- Create with `{"create": "neuron", ..., "settings": {"equation": "poisson(4*I)", "trigger": "W > 0.5",
+  "spike_frames": 3}}`. The **firing equation** is a rate (fires/s) or true/false per frame; helpers
+  `every(s)`, `poisson(rate)`, `random()`, `t`, `dt`, math. **I** is the neuron's drive input — link
+  a slider / function / random to its `I`.
+- The **clock trigger** (may use `W`, the summed W of neurons firing right now) restarts the clock
+  each time it becomes true. A relay neuron: trigger `W > 0.5`, equation `t < 0.02` — fires once per
+  incoming spike.
+- Connect neurons with `weight` (both must be yours). Non-zero W's are drawn green (> 0) / red (< 0)
+  over a faint line between every pair within 2000 units.
+- Outputs: `firing`, `clock t`, `input W` — plot `firing` on a Time series. Give spikes ≥ 2–3
+  `spike_frames` so they're seen at 60 frames/s.
+
+## 6. Expression tips (Function objects)
 
 - `t` is time in **seconds**.
 - A clock / square wave at F Hz: `1 if (t*F % 1) < 0.5 else 0`.
@@ -136,7 +152,7 @@ nothing changed, nothing to watch.
 - Values are sampled about **60 frames/s**: a pulse narrower than ~3 frames (~50 ms) can be
   missed — make pulses at least that wide.
 
-## 6. Report
+## 7. Report
 
 `detach`, then tell the user what you built, how it's wired, what you tested (the sweep numbers),
 any placeholders they need to fill (hardware), and show the final render (SendUserFile if they

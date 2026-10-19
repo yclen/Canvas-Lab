@@ -44,7 +44,7 @@ def _on_crash(exc_type, exc, tb):
     canvas.report_error("crash", exc)
     try:
         if current_scene is not None:
-            current_scene.save()
+            current_scene.flush()               # (saves are batched: write what's pending now)
     except Exception:
         pass
     sys.__excepthook__(exc_type, exc, tb)
@@ -81,7 +81,7 @@ def play(scene, player, link=None):
     wall_builder = app.wall_builder     # drag-to-draw wall placement mode
     placer = app.placer                 # holding a picked object, to drop with a click
     picker = app.picker                 # waiting for a click on an object (e.g. a readout's source)
-    menubar = canvas.MenuBar()
+    menubar = canvas.MenuBar(player)
     inspector = canvas.InspectorPanel()
     marquee = canvas.MarqueeSelect()    # left-drag on empty canvas selects many
     presence = canvas.OtherPlayers(link.name) if link else None    # their cursors / views, drawn
@@ -458,7 +458,7 @@ while True:
         scene = canvas.Scene.load()              # this window owns the world: loads, ticks, saves it
         instruments.client.start()               # connects to instrument_server.py in the background
         play(scene, canvas.Player(scene, choice[1]))
-        scene.save()
+        scene.flush()                            # (saves are batched: write what's pending now)
         lock.close()
         break                                    # closing the window closes the app, as always
     _, link, welcome = choice                    # joined the world

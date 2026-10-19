@@ -44,7 +44,7 @@
 
 - Level-of-detail draw (buttons shrink to a dot; no Button↔Rectangle swap machinery)
 - JSON persistence (`{"objects": [...]}`) behind `load_objects`/`save_objects`; stable ids, backfilled
-- Menu bar (Add / Edit / Go To) + unified modal slot (text input, confirm)
+- Menu bar (Add / Edit / View / Go To) + unified modal slot (text input, confirm)
 - Inspector side panel: view a node's data, **Set command…**, **Activate** (runs detached)
 - ACTIONS registry: `run_command` (shell, detached) + `goto` (internal camera jump)
 
@@ -613,6 +613,13 @@ one as `--at=-200,100`):
   changed: try a layout there until it has no problems, then build it for real.
 - `resize-zone --zone NAME --size W,H [--at X,Y]` — refused if the new box would cut through
   anything (Claude's or yours) or be under `ZONE_MIN` (200) a side.
+- `weight FROM TO VALUE` — a neuron's W to another (> 0 excites, < 0 inhibits); both must be
+  Claude's neurons in a zone (never a W onto, or out of, one of yours). In a plan:
+  `{"weight": "a", "to": "b", "value": 1.5}`; attached, the cursor draws it from one to the other.
+  `query` lists a neuron's non-zero `weights`; `catalog` lists each type's hidden `state` keys
+  (a neuron's `equation`, `trigger`, `spike_frames`, `t_end`; a function's `expression`).
+- `set` also takes `name=...` (renames it; a Label's words), and refuses an equation that won't
+  run (a neuron's firing equation or trigger, a function's expression) — nothing changes.
 
 **The rules** (checked in the world, `agent_api`): Claude may change an object only if it made it
 (the zone's `made`) and its center is still inside that zone — drag one out and it's yours; one that

@@ -299,7 +299,7 @@ class World:
                     self.broadcast(dict(snap, op="instruments"))
             time.sleep(max(0.0, last + 1 / TICK_HZ - time.monotonic()))
         self.broadcast({"op": "stopping"})
-        self.scene.save()
+        self.scene.flush()                      # (saves are batched: write what's pending now)
         for p in list(self.players):
             p.close()
 
@@ -566,7 +566,7 @@ def main():
     def on_crash(exc_type, exc, tb):
         canvas.report_error("world crash", exc)
         try:
-            world.scene.save()
+            world.scene.flush()
         except Exception:
             pass
         sys.__excepthook__(exc_type, exc, tb)

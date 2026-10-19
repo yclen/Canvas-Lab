@@ -2081,7 +2081,7 @@ NEURON_FIRE_FRAMES = 1              # default spike duration: frames a fire stay
 FIRE_MATH = {name: getattr(math, name) for name in
              ("sin", "cos", "tan", "exp", "log", "sqrt", "floor", "ceil", "pi", "e")}
 FIRE_MATH.update(abs=abs, min=min, max=max)
-FIRE_NAMES = set(FIRE_MATH) | {"t", "dt", "every", "poisson", "random"}
+FIRE_NAMES = set(FIRE_MATH) | {"t", "dt", "every", "poisson", "random", "I"}   # I: the drive input
 # Clock-trigger equations may also use W (= this neuron's Input W), e.g. "W > 3".
 TRIGGER_NAMES = FIRE_NAMES | {"W", "w"}
 FIRE_NODES = (ast.Expression, ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare,
@@ -2126,6 +2126,13 @@ class Neuron(Agent):
     MENU_LABEL = "Add neuron"
     DOT_COLOR = NEURON_COLOR
     COPY_SKIP = ("weights",)        # a copied neuron starts with fresh (0) W's
+    # Its settings are Props (saved under the same keys as before; hidden, since the State rows
+    # edit them) so anything that sets Props — a copy, an agent's `set` — can reach them.
+    PROPS = [Prop("equation", "Firing equation", "str", "", hidden=True),
+             Prop("trigger", "Clock trigger", "str", "", hidden=True),
+             Prop("spike_frames", "Spike duration", "int", NEURON_FIRE_FRAMES, min=1, max=600, hidden=True),
+             Prop("t_end", "Clock end", "float", math.inf, min=0, hidden=True)]
+    TAKES = (Take("I", "Drive I", verb="drives"),)   # a number the equations can use as I
 
     def __init__(self, x, y, text="", *, id=None, equation="", trigger="",
                  spike_frames=NEURON_FIRE_FRAMES, weights=None, t_end=math.inf, **kwargs):
@@ -2203,8 +2210,25 @@ class Neuron(Agent):
         return sum(n.weights.get(self.id, 0.0) for n in self.scene.neurons
                    if n is not self and n.is_firing)
 
+    def drive(self):
+        """The drive input I: what it's linked to (0 while unlinked or without a value)."""
+        value = self.take("I")
+        return float(value) if value is not None else 0.0
+
+    def on_prop_changed(self, key):
+        """A setting changed (an agent's set, an undo, …): install it the way the panel does."""
+        if key == "equation":
+            self.set_equation(self.equation or "")
+        elif key == "trigger":
+            self.set_trigger(self.trigger or "")
+        elif key == "spike_frames":
+            self.spike_frames = max(1, int(self.spike_frames))
+        elif key == "t_end":
+            self.t_end = max(0.0, float(self.t_end))
+
     def _evaluate(self, code, dt, **extra):
         t = self.t
+        extra.setdefault("I", self.drive())
         def every(s):
             return s > 0 and math.floor(t / s) != math.floor((t - dt) / s)
         def poisson(rate):
@@ -2351,15 +2375,12 @@ class Neuron(Agent):
         app.save()
 
     def to_dict(self):
-        d = super().to_dict()
-        if self.equation:
-            d["equation"] = self.equation
-        if self.trigger:
-            d["trigger"] = self.trigger
-        if self.spike_frames != NEURON_FIRE_FRAMES:
-            d["spike_frames"] = self.spike_frames
-        if not math.isinf(self.t_end):
-            d["t_end"] = self.t_end              # INF (the default) isn't written
+        d = super().to_dict()                    # (the Props, written by the base: tidied below)
+        for key, default in (("equation", ""), ("trigger", ""), ("spike_frames", NEURON_FIRE_FRAMES)):
+            if d.get(key) == default:
+                d.pop(key, None)                 # defaults aren't written, as before
+        if math.isinf(self.t_end):
+            d.pop("t_end", None)                 # INF (the default) isn't written
         if self.weights:
             d["weights"] = dict(self.weights)
         return d
@@ -2380,17 +2401,24 @@ def new_weight():
     return NEURON_W_DEFAULT
 
 
-NEURON_LINK_COLOR = (48, 48, 56)    # barely lighter than BG_COLOR — meant to be subtle
+NEURON_MESH_RANGE = 2000            # world units, center to center: a faint line only reaches this far
+                                    # (a 10 x 10 grid of neurons ~150 apart is ~1900 corner to corner)
+NEURON_LINK_COLOR = (48, 48, 56)       # a W = 0 pair: barely lighter than BG_COLOR (View ▸ Neuron mesh)
+NEURON_EXCITE_COLOR = (70, 130, 90)    # a connection whose (stronger) W excites (> 0)
+NEURON_INHIBIT_COLOR = (150, 70, 74)   # … or inhibits (< 0)
 
 
 class NeuronMesh:
-    """Every neuron is linked to every other. The links aren't stored anywhere —
-    they follow entirely from neuron positions: one thin line per pair (i < j,
-    so no pair is drawn twice). That's n(n-1)/2 lines, so they're drawn onto a
-    cached layer covering the network (cut to the window plus a margin), and
+    """The network's connections. Every neuron holds a W to every other, so with
+    `faint` on (View ▸ Neuron mesh, the default) each pair within
+    NEURON_MESH_RANGE of each other gets a barely-there 1 px line; on top, each pair with a W that isn't 0 either way gets a 2 px
+    line — green-ish where the stronger W excites (> 0), red-ish where it
+    inhibits (< 0). They're drawn onto a cached layer covering the drawn
+    neurons (cut to the window plus a margin), and
     panning just moves it. It's redrawn when the zoom changes, a neuron moves /
-    comes / goes, or a pan runs past the margin. The layer's memory is reused
-    between redraws. Drawn before the objects, so lines sit under the neurons."""
+    comes / goes, a W changes, or a pan runs past the margin. The layer's memory
+    is reused between redraws. Drawn before the objects, so lines sit under the
+    neurons."""
 
     MARGIN = 0.5                # extra layer around the window, in window sizes (cheap panning)
 
@@ -2400,14 +2428,34 @@ class NeuronMesh:
         self._size = (0, 0)
         self._world_tl = (0.0, 0.0)   # world point at the layer's top-left
         self._world_box = None        # the network's world bounds (minx, miny, maxx, maxy)
+        self.faint = True             # also draw the W = 0 pairs (faintly)
+
+    @staticmethod
+    def connections(neurons, faint=False):
+        """[(a, b, sign)] for each pair with a W that isn't 0 either way (sign of the stronger:
+        1 / -1, at any distance); with faint, every other pair within NEURON_MESH_RANGE too, as
+        sign 0 — listed first, so drawn under."""
+        reach = NEURON_MESH_RANGE * NEURON_MESH_RANGE
+        silent, real = [], []
+        for i, a in enumerate(neurons):
+            for b in neurons[i + 1:]:
+                ab, ba = a.weights.get(b.id, 0.0), b.weights.get(a.id, 0.0)
+                if ab or ba:
+                    real.append((a, b, 1 if (ab if abs(ab) >= abs(ba) else ba) > 0 else -1))
+                elif faint and (a.world_center - b.world_center).length_squared() <= reach:
+                    silent.append((a, b, 0))
+        return silent + real
 
     def draw(self, surface, camera, neurons):
-        if len(neurons) < 2:
+        links = self.connections(neurons, self.faint) if len(neurons) >= 2 else []
+        if not links:
+            self._key = None
             return
         key = (camera.zoom, surface.get_size(),
-               tuple((n.world_center.x, n.world_center.y) for n in neurons))
+               tuple((a.id, b.id, sign, a.world_center.x, a.world_center.y, b.world_center.x, b.world_center.y)
+                     for a, b, sign in links))
         if key != self._key or not self._covers_visible(surface, camera):
-            self._rebuild(surface, camera, neurons, key)
+            self._rebuild(surface, camera, links, key)
         tl = camera.world_to_screen(self._world_tl)
         w, h = self._size
         if w > 0 and h > 0:
@@ -2424,8 +2472,9 @@ class NeuronMesh:
         layer = pygame.Rect(round(tl[0]), round(tl[1]), *self._size)
         return needed.width == 0 or needed.height == 0 or layer.contains(needed)
 
-    def _rebuild(self, surface, camera, neurons, key):
+    def _rebuild(self, surface, camera, links, key):
         sw, sh = surface.get_size()
+        neurons = list({id(n): n for a, b, _s in links for n in (a, b)}.values())
         points = [camera.world_to_screen(n.world_center) for n in neurons]
         xs, ys = [p[0] for p in points], [p[1] for p in points]
         # The network's box, cut to the window plus a margin on every side.
@@ -2444,10 +2493,13 @@ class NeuronMesh:
         self._buffer.fill((0, 0, 0), area)
         prev_clip = self._buffer.get_clip()
         self._buffer.set_clip(area)
-        local = [(p[0] - left, p[1] - top) for p in points]
-        for i, a in enumerate(local):
-            for b in local[i + 1:]:
-                pygame.draw.line(self._buffer, NEURON_LINK_COLOR, a, b)
+        to_local = lambda n: tuple(v - o for v, o in zip(camera.world_to_screen(n.world_center), (left, top)))  # noqa: E731
+        for a, b, sign in links:
+            if sign == 0:
+                pygame.draw.line(self._buffer, NEURON_LINK_COLOR, to_local(a), to_local(b))
+            else:
+                color = NEURON_EXCITE_COLOR if sign > 0 else NEURON_INHIBIT_COLOR
+                pygame.draw.line(self._buffer, color, to_local(a), to_local(b), 2)
         self._buffer.set_clip(prev_clip)
         self._size = (w, h)
         self._world_tl = camera.screen_to_world((left, top))
@@ -2562,6 +2614,9 @@ def load_view(path):
         return None
 
 
+SAVE_EVERY = 1.0                 # seconds: the world is written at most this often (Scene.save)
+
+
 def save_objects(objects, path=NODES_FILE, view=None):
     """Write the world. `view` only carries an old Nodes.json's view through
     load_objects' one-time rewrite, so the player can still pick it up."""
@@ -2590,6 +2645,8 @@ class Scene:
         self.by_id = {o.id: o for o in objects}
         self.selections = {}    # player name -> set of selected ids
         self.deleted = {}       # player name -> their deletes, oldest first (for Ctrl+Z; not saved)
+        self._unsaved = False   # a change since the last write (see save / flush)
+        self._saved_at = 0.0    # time.monotonic() of the last write
         for o in objects:
             o.scene = self      # so connectors (Train) can resolve their nodes
         for o in objects:       # heal any legacy overhang corners in old trains
@@ -2638,7 +2695,20 @@ class Scene:
         return scene
 
     def save(self):
-        if self.path is not None:
+        """Ask for the world to be written. Batched: a change only marks it unsaved, and it's
+        written at most every SAVE_EVERY seconds (tick does it) — a counter stepping ten times a
+        second would otherwise rewrite the whole file ten times a second. flush() writes now."""
+        if self.path is None:
+            return
+        self._unsaved = True
+        if time.monotonic() - self._saved_at >= SAVE_EVERY:
+            self.flush()
+
+    def flush(self):
+        """Write the world now if anything's unsaved (closing, crashing, …)."""
+        if self.path is not None and self._unsaved:
+            self._unsaved = False
+            self._saved_at = time.monotonic()
             save_objects(self.objects, self.path)
 
     def selected_by_anyone(self, obj):
@@ -2787,6 +2857,8 @@ class Scene:
                 o.watch_presses(dt)
             except Exception as e:
                 report_error(f"{o.TYPE}.tick", e)
+        if self._unsaved and time.monotonic() - self._saved_at >= SAVE_EVERY:
+            self.flush()                         # a batched save (see save) that's now due
 
 
 # ============================================================================
@@ -2849,7 +2921,7 @@ class Player:
         self.name = name
         self.path = path
         self.camera = Camera()
-        self.mesh = NeuronMesh()    # the faint all-to-all lines between neurons (a cached drawing)
+        self.mesh = NeuronMesh()    # the lines between neurons (a cached drawing; View ▸ Neuron mesh)
         self._selected = set()      # ids
         self.view = None
         if path is None:            # the world's own record of a player: nothing to load or save
@@ -3182,10 +3254,12 @@ MENU_TEXT = (230, 230, 235)
 
 
 EDIT_MENU = [("Edit Name", "edit_name"), ("Copy", "copy"), ("Delete Node", "delete_node")]
+# View: this window only. Each entry: ((label when on, label when off), command, is it on? (player)).
+VIEW_MENU = [(("Neuron mesh: on", "Neuron mesh: off"), "toggle_mesh", lambda p: p.mesh.faint)]
 
 
 class MenuBar:
-    """The top strip: Add / Edit dropdowns + a flat Go To action. Owns its own
+    """The top strip: Add / Edit / View dropdowns + a flat Go To action. Owns its own
     layout, open/closed state, and hit-testing. `handle_click(pos, screen_size)`
     returns (consumed, command): `consumed` tells the loop to skip canvas
     selection for this click; `command` (or None) is the chosen action.
@@ -3194,12 +3268,14 @@ class MenuBar:
     the order they were defined), giving "add:<type>" commands; it wraps into
     more columns when it's taller than the window."""
 
-    def __init__(self):
-        self.open_menu = None  # None / "add" / "edit"
+    def __init__(self, player=None):
+        self.open_menu = None  # None / "add" / "edit" / "view"
+        self.player = player   # whose View settings the View menu shows
         h = MENU_BAR_HEIGHT
         self.add_rect = pygame.Rect(0, 0, 70, h)
         self.edit_rect = pygame.Rect(self.add_rect.right, 0, 70, h)
-        self.goto_rect = pygame.Rect(self.edit_rect.right, 0, 80, h)
+        self.view_rect = pygame.Rect(self.edit_rect.right, 0, 70, h)
+        self.goto_rect = pygame.Rect(self.view_rect.right, 0, 80, h)
         self.objects_rect = pygame.Rect(self.goto_rect.right, 0, 110, h)   # opens the E menu
 
     def _items(self, menu, screen_size):
@@ -3211,6 +3287,10 @@ class MenuBar:
             left = self.add_rect.left
         elif menu == "edit":
             entries, left = EDIT_MENU, self.edit_rect.left
+        elif menu == "view":
+            entries = [(labels[0] if self.player is None or is_on(self.player) else labels[1], command)
+                       for labels, command, is_on in VIEW_MENU]
+            left = self.view_rect.left
         else:
             return []
         font = get_font(MENU_FONT_SIZE)
@@ -3228,6 +3308,9 @@ class MenuBar:
             return True, None
         if self.edit_rect.collidepoint(pos):
             self.open_menu = None if self.open_menu == "edit" else "edit"
+            return True, None
+        if self.view_rect.collidepoint(pos):
+            self.open_menu = None if self.open_menu == "view" else "view"
             return True, None
         if self.goto_rect.collidepoint(pos):
             self.open_menu = None
@@ -3249,6 +3332,7 @@ class MenuBar:
         pygame.draw.rect(surface, MENU_BG, (0, 0, surface.get_width(), MENU_BAR_HEIGHT))
         for rect, label, key in ((self.add_rect, "Add", "add"),
                                  (self.edit_rect, "Edit", "edit"),
+                                 (self.view_rect, "View", "view"),
                                  (self.goto_rect, "Go To", "goto"),
                                  (self.objects_rect, "Objects (E)", "inventory")):
             color = MENU_HOVER if self.open_menu == key else MENU_BG
@@ -5048,6 +5132,8 @@ class App:
             self.undo_delete()
         elif command == "goto":
             self.go_to(sel)
+        elif command == "toggle_mesh":              # View ▸ Neuron mesh (this window's drawing)
+            self.player.mesh.faint = not self.player.mesh.faint
 
     def align(self, objs, axis):
         """Line up the movable objects' centers on one axis (0: same X, so they
@@ -5507,7 +5593,7 @@ class JoinedApp(App):
         self.send({"op": "unlink", "id": obj.id, "port": port})
 
     def menu_command(self, command):
-        if command in ("goto", "inventory"):
+        if command in ("goto", "inventory", "toggle_mesh"):
             super().menu_command(command)   # just this window
         else:
             self.send({"op": "command", "command": command})

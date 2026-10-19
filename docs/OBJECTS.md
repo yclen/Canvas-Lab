@@ -465,14 +465,26 @@ animation plumbing the design had flagged as missing; animated *connectors* can 
   may use `W` (= Input W), e.g. `W > 3` (a leading `if` is ignored). With one set, the clock
   waits at t = 0 until it's true, then runs to Clock end. Every trigger — the condition
   going false → true (edge, so a multi-frame spike counts once) — restarts the clock from 0,
-  even mid-run. Empty = no trigger, runs freely. Helpers: `every(s)`, `poisson(rate)`, `random()`, `dt`, math funcs. Firing =
+  even mid-run. Empty = no trigger, runs freely. Helpers: `every(s)`, `poisson(rate)`, `random()`, `dt`, math funcs,
+  and **`I`** — the neuron's **Drive I** input (a number input: link a slider, a function, a
+  random, …; 0 while unlinked), usable in both equations, e.g. `poisson(4*I)`. Firing =
   yellow body for the neuron's **spike duration** (`spike_frames`, default 1, ◀ ▶ stepper in
   the inspector, saved per neuron); max one fire per frame. Parsed with an `ast`
   whitelist (no attributes/imports); `2t`→`2*t`, `^`→`**`. Errors show in the inspector
-- **Neuron mesh**: every neuron is linked to every other by a faint 1px line
-  (`NEURON_LINK_COLOR`). Links aren't stored — derived from positions each frame, one per
-  pair — and `NeuronMesh` caches the drawn layer, redrawing only when a neuron's screen
-  position or the window size changes. Cost is n²: ~100 neurons stays smooth while panning.
+- **Settings as Props:** the firing equation, clock trigger, spike duration and clock end are
+  Props (`equation`, `trigger`, `spike_frames`, `t_end`; hidden — the State rows above edit
+  them), saved under the same keys as before (defaults left out), so a copy or an agent's `set`
+  reaches them; `on_prop_changed` installs a new one the way the panel does.
+- **Neuron mesh**: every neuron to every other, in two layers. Underneath, a barely-there
+  1 px line (`NEURON_LINK_COLOR`) for each pair whose W's are both 0 — connected, but silent —
+  if they're within `NEURON_MESH_RANGE` (2000 world units, center to center: room for a ~100-
+  neuron network) of each other, so far-apart networks don't draw lines across the world.
+  On top, a 2 px line for each pair with a W that isn't 0 either way — green-ish
+  (`NEURON_EXCITE_COLOR`) where the stronger W excites, red-ish (`NEURON_INHIBIT_COLOR`)
+  where it inhibits, at any distance (a real synapse always shows). **View ▸ Neuron mesh** turns the faint layer off (this window only;
+  `NeuronMesh.faint`, on at start), leaving just the real connections.
+  `NeuronMesh.connections` finds the pairs; the drawn layer is cached, redrawn when a neuron
+  moves, a W changes, the faint layer is toggled, or the zoom / window changes.
 - **Neuron W's**: each neuron holds `weights = {other_id: W}` — its outgoing W to every other
   neuron (directed: A→B lives on A, B→A on B). `Scene.sync_weights()` runs on load/add/delete:
   new pairs get W = `NEURON_W_DEFAULT` (0), W's to deleted neurons are dropped,

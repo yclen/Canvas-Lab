@@ -31,11 +31,12 @@ Looking:
 Building (--zone NAME: --at / --to are from the zone's top-left corner; a negative one
 needs the = form, --at=-200,100):
     python claude_world.py create TYPE --at X,Y [--zone NAME] [--name N] [--set key=value ...]
-    python claude_world.py set ID key=value ...    a setting or state (e.g. expression=2*sin(t))
+    python claude_world.py set ID key=value ...    a setting or state (e.g. expression=2*sin(t)); name=... renames
     python claude_world.py link TARGET.PORT SRC.KEY     TARGET's input PORT follows SRC's output KEY
     python claude_world.py unlink TARGET.PORT
     python claude_world.py move ID --to X,Y [--zone NAME]
     python claude_world.py delete ID [ID ...]
+    python claude_world.py weight FROM TO VALUE    neuron FROM's W to neuron TO (> 0 excites, < 0 inhibits)
     python claude_world.py resize-zone --zone NAME --size W,H [--at X,Y]   never cutting through anything
     python claude_world.py build PLAN.json [--pace 0.25] [--render out.png] [--dry-run]
         a whole design in one go, step by step (you see Claude's cursor at each), e.g.
@@ -47,6 +48,7 @@ needs the = form, --at=-200,100):
             {"set": "noise", "settings": {"spread": 0.2}},
             {"move": "wave", "to": [200, 300]},
             {"unlink": "noise.mean"},
+            {"weight": "n1", "to": "n2", "value": 1.5},
             {"delete": ["wave"]}]}
         "as" names an object for later steps (an id works too); with "zone", positions are
         from the zone's top-left. It stops at the first step the world refuses. After it, the
@@ -188,9 +190,11 @@ def build(link, plan, pace, send=None):
         elif "delete" in step:
             names = step["delete"] if isinstance(step["delete"], list) else [step["delete"]]
             message = {"op": "delete", "ids": [ref(n) for n in names]}
+        elif "weight" in step:
+            message = {"op": "weight", "from": ref(step["weight"]), "to": ref(step["to"]), "value": step["value"]}
         else:
             return {"ok": False, "error": f"step {i + 1}: not a step I know: {step}", "done": results, "refs": refs}
-        cursor = message.get("at") or message.get("to")
+        cursor = {"create": message.get("at"), "move": message.get("to")}.get(message["op"])   # (a weight's "to" is a neuron)
         if cursor is not None and link is not None:
             show_cursor(link, cursor, zone)
         reply = send(message)
@@ -393,6 +397,16 @@ class Presence:
                 return self._drag(message)
             if op in ("link", "unlink"):
                 return self._wire(message)
+            if op == "weight":
+                start, end = self.where(message.get("from")), self.where(message.get("to"))
+                if start is not None:
+                    self.glide(start)
+                self.press(True)
+                if end is not None:
+                    self.glide(end)
+                reply = self.ask(message)
+                self.press(False)
+                return reply
             if op == "delete":
                 return self._delete(message)
             if op == "resize_zone":
@@ -606,6 +620,10 @@ def main(argv=None):
     bd.add_argument("plan")
     bd.add_argument("--pace", type=float, default=0.25, help="seconds between steps (to watch it build)")
     bd.add_argument("--render", help="then draw the plan's zone to this PNG")
+    wt = sub.add_parser("weight", help="a neuron's W to another neuron (both Claude's): > 0 excites, < 0 inhibits")
+    wt.add_argument("source")
+    wt.add_argument("target")
+    wt.add_argument("value", type=float)
     sw = sub.add_parser("sweep", help="test: set a setting to each value in turn, reading outputs after each")
     sw.add_argument("id")
     sw.add_argument("key")
@@ -686,6 +704,8 @@ def main(argv=None):
             return emit(ask(link, {"op": "move", "id": args.id, "to": to}))
         if args.command == "delete":
             return emit(ask(link, {"op": "delete", "ids": args.ids}))
+        if args.command == "weight":
+            return emit(ask(link, {"op": "weight", "from": args.source, "to": args.target, "value": args.value}))
         if args.command == "sweep":
             return emit(sweep(link, args.id, args.key, [value_of(v) for v in args.values], args.read,
                               max(0.0, args.hold)))
