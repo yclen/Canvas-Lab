@@ -397,7 +397,7 @@ so selecting a train can't crash them. That's the groundwork for selecting any f
 
 ## Walls — the first area object
 
-- **Wall** object: outline-only rectangular zone, drag-to-draw, fixed-size corner name tag,
+- **Wall** object: outline-only rectangular zone, drag-to-draw, corner name tag (fixed size, capped at the wall's width),
   border scales with zoom
 
 A **Wall** is a rectangular zone drawn around a group of nodes to organize the map. It's the
@@ -405,7 +405,10 @@ third anchoring family (after point-nodes and relationship-trains): area-anchore
 `(x, y, w, h)`, no single center.
 
 - **Look:** outline only (no fill); the border scales with zoom like a node, but the title is
-  a **fixed-size name tag pinned to the top-left corner** (never scales, like a NameTag).
+  a **fixed-size name tag pinned to the top-left corner** (like a NameTag) — but never wider
+  than the wall on screen: zoomed out, once the wall gets narrower than its tag, the tag shrinks
+  with it (so tags don't spill over their neighbours), and hides when its text would be under
+  `WALL_TITLE_MIN_FONT` (9 px). Hit-testing and `screen_bounds` use the same shrunken tag.
 - **Create:** Add ▸ Add wall → **drag** a box (press-move-release) → name it. (The mouse-up
   handler ignores the menu-click's own release, so the mode doesn't self-cancel.)
 - **Hit-test on the border/title only**, not the interior — so nodes inside stay clickable.

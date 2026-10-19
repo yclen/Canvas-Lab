@@ -1680,13 +1680,16 @@ WALL_COLOR = (120, 180, 240)          # border + title color (blue)
 WALL_SELECT_COLOR = (255, 210, 60)
 WALL_WORLD_BORDER = 8                  # border thickness in world units (scales w/ zoom)
 WALL_MIN_WORLD = 40                    # min drag size to create one
-WALL_TITLE_FONT_SIZE = NAMETAG_FONT_SIZE   # fixed screen size — title never scales
+WALL_TITLE_FONT_SIZE = NAMETAG_FONT_SIZE   # the title's screen size while it fits over its wall
+WALL_TITLE_MIN_FONT = 9                # smaller than this (zoomed far out) and the title hides
 
 
 class Wall(CanvasObject):
     """A rectangular 'wall'/zone drawn around a group of nodes. Outline only (no
     fill); the border scales with zoom like nodes, but the title is a fixed-size
-    name tag pinned to the top-left corner (never scales, like a NameTag). Draws
+    name tag pinned to the top-left corner (like a NameTag) — until, zoomed out,
+    it would be wider than the wall: then it shrinks with the wall, and hides
+    once its text is under WALL_TITLE_MIN_FONT. Draws
     under everything; selectable on its border or title for move/rename/delete.
     Purely visual — it doesn't own or contain the nodes inside it."""
 
@@ -1749,15 +1752,29 @@ class Wall(CanvasObject):
                            max(1, round(self.w * camera.zoom)),
                            max(1, round(self.h * camera.zoom)))
 
-    def _title_rect(self, camera):
-        """Fixed-size name-tag box sitting just above the top edge, left-aligned
-        with the box (its bottom-left corner at the wall's top-left corner)."""
+    def _title(self, camera):
+        """(name-tag box, font size), or None: the box sits just above the top edge,
+        left-aligned with it (its bottom-left corner at the wall's top-left corner).
+        Full size while that fits the wall's width on screen; narrower walls (zoomed
+        out) get a tag scaled down to their width, so tags never spill over their
+        neighbours — None once the text would be too small to read."""
         if not self._text:
             return None
         tw, th = get_font(WALL_TITLE_FONT_SIZE).size(self._text)
-        rect = pygame.Rect(0, 0, tw + NAMETAG_PADDING[0], th + NAMETAG_PADDING[1])
+        full_w = tw + NAMETAG_PADDING[0]
+        scale = min(1.0, self.w * camera.zoom / full_w)
+        size = WALL_TITLE_FONT_SIZE if scale >= 1 else math.floor(WALL_TITLE_FONT_SIZE * scale)
+        if size < WALL_TITLE_MIN_FONT:
+            return None
+        if size != WALL_TITLE_FONT_SIZE:
+            tw, th = get_font(size).size(self._text)
+        rect = pygame.Rect(0, 0, tw + round(NAMETAG_PADDING[0] * scale), th + round(NAMETAG_PADDING[1] * scale))
         rect.bottomleft = tuple(round(v) for v in camera.world_to_screen((self.x, self.y)))
-        return rect
+        return rect, size
+
+    def _title_rect(self, camera):
+        title = self._title(camera)
+        return title[0] if title else None
 
     def screen_bounds(self, camera):
         rect = self.screen_rect(camera)
@@ -1781,12 +1798,14 @@ class Wall(CanvasObject):
                       width=max(1, border), border_radius=8)
         draw_rect(surface, self.color, r, width=border, border_radius=8)
 
-        title = self._title_rect(camera)
+        title = self._title(camera)
         if title is not None:
-            draw_rect(surface, (45, 45, 55), title, border_radius=6)
-            draw_rect(surface, self.color, title, width=2, border_radius=6)
-            ts = get_font(WALL_TITLE_FONT_SIZE).render(self._text, True, self.color)
-            surface.blit(ts, ts.get_rect(center=title.center))
+            box, size = title
+            radius = max(2, round(6 * size / WALL_TITLE_FONT_SIZE))
+            draw_rect(surface, (45, 45, 55), box, border_radius=radius)
+            draw_rect(surface, self.color, box, width=2 if size > 14 else 1, border_radius=radius)
+            ts = get_font(size).render(self._text, True, self.color)
+            surface.blit(ts, ts.get_rect(center=box.center))
 
     def to_dict(self):
         d = super().to_dict()                    # type, id, color
