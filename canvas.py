@@ -1842,7 +1842,8 @@ class ClaudeZone(Wall):
     NAME = "Claude zone"
     BUILD_NOUN = "Claude zone"
     PROPS = [Prop("brief", "Brief", "str", "",
-                  prompt="What should Claude build here? (it reads this when you ask it to build the zone)")]
+                  prompt="What should Claude build here? (it reads this when you ask it to build the zone)"),
+             Prop("made", kind="data", default=[], hidden=True)]   # ids of what Claude built here (only those it may change)
 
     def __init__(self, x, y, w, h, name="", *, id=None, color=None):
         super().__init__(x, y, w, h, name, id=id)
@@ -1931,15 +1932,11 @@ class ClaudeZone(Wall):
             for k in (4, 8, 12):
                 pygame.draw.line(surface, CLAUDE_COLOR, (h.centerx - k, h.centery), (h.centerx, h.centery - k), 2)
 
-    def to_dict(self):
-        d = super().to_dict()
-        d["brief"] = self.brief
-        return d
-
     @classmethod
     def from_dict(cls, d):
         zone = cls(d["x"], d["y"], d["w"], d["h"], d.get("name", ""), id=d.get("id"), color=d.get("color"))
         zone.brief = d.get("brief", "")
+        zone.made = [i for i in d.get("made", []) if isinstance(i, str)]
         return zone
 
 

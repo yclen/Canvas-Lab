@@ -558,7 +558,7 @@ carries a `seq` and gets `{"op": "reply", "seq", "ok", ...}` (an `"error"` when 
 refuses everything else an agent sends (adding, linking, clicks, menus, commands: "it can look but
 not change anything"). It may still send presence (where its cursor is).
 
-**Milestone 1 (now): read-only.**
+**Looking:**
 - `python claude_world.py status` — is a world running, who's in it (exit 2: none).
 - `zones` — every Claude zone: name, box, brief.
 - `catalog [--type T]` — every placeable type (E / Add menu) from the classes themselves: settings
@@ -568,12 +568,47 @@ not change anything"). It may still send presence (where its cursor is).
   hidden props: a function's expression, a random's range, …), inputs (and what each is linked to),
   outputs with live values, the zone it's in. `query` alone: a summary of everything (type, id, name,
   where) — an agent may read your whole layout, not change it.
-- `render --zone NAME [--out file.png] [--width 1600]` — draws the zone and what's in it, from the
-  world's snapshot (the welcome), off screen, to a PNG — how Claude checks its work.
+- `render --zone NAME [--out file.png] [--width 1600] [--margin 0.2] [--clean]` — draws the zone
+  and a margin around it (a fifth of its size: what pokes out shows), from the world's snapshot,
+  off screen, to a PNG, with the layout check's problems outlined in red and numbered (`--clean`:
+  not) — how Claude checks its work.
+- `check --zone NAME` — the zone's layout problems (`agent_api.layout_check`): objects that overlap,
+  that nearly touch (closer than `LAYOUT_GAP`, 20), and ones poking out of the zone — anything
+  touching the zone, plus everything on its `made` list wherever it's wandered — and `used`, the box
+  the objects take up. A build ends with it; "no problems" is when a layout is done.
 
-**Next (milestone 2):** create / set / link / move / delete for agents, each checked by the world:
-inside a Claude zone, on objects the agent made there, never hardware types or Connect. `agent_api.py`
-is in `world_link.CODE_FILES`, so a client and a world with different copies are turned away.
+**Building** (`agent_api.change`; positions with `--zone` are from the zone's top-left, a negative
+one as `--at=-200,100`):
+- `create TYPE --at X,Y [--zone Z] [--name N] [--set key=value ...]` — any buildable type (not
+  hardware, not zones / walls / trains / launchers), wholly inside a Claude zone; its id goes on that
+  zone's `made` list (saved with the zone). A Label's words are its name.
+- `set ID key=value ...` — any setting or hidden state (an expression, a range; not links, not
+  `made`), typed values parsed the panel's way, numbers clamped, choices checked;
+  `on_prop_changed` runs.
+- `link TARGET.PORT SRC.KEY` / `unlink TARGET.PORT` — the target must be Claude's; the source may be
+  anything inside a Claude zone (a slider you put there, say), never outside — wiring a design to
+  your layout is yours to do. Kinds must match.
+- `move ID --to X,Y` — must land wholly inside a zone (into another zone moves it to that zone's
+  list); a refused move puts it back.
+- `delete ID ...` — Claude's own only (`delete_many(by="Claude")`).
+- `build PLAN.json [--pace 0.25] [--render out.png] [--dry-run]` — a whole design as steps (`create`
+  with `as` names, `set`, `link` / `from`, `unlink`, `move`, `delete`), run in order with Claude's
+  cursor shown at each (presence), stopping at the first refusal, then the layout check; `--render`
+  draws the zone from a fresh snapshot. `--dry-run` runs the same plan against a private copy of the
+  world (the welcome, `agent_api.answer` on it) — the same answers, problems and render, nothing
+  changed: try a layout there until it has no problems, then build it for real.
+- `resize-zone --zone NAME --size W,H [--at X,Y]` — refused if the new box would cut through
+  anything (Claude's or yours) or be under `ZONE_MIN` (200) a side.
+
+**The rules** (checked in the world, `agent_api`): Claude may change an object only if it made it
+(the zone's `made`) and its center is still inside that zone — drag one out and it's yours; one that
+only pokes out (a zone made smaller) stays Claude's to repair. New places must be wholly inside: a
+create or move that wouldn't be is refused, and a `set` that would grow an object past the edge is
+taken back whole and refused. Never a
+`Device` (or the instrument server): those are yours to place and connect. A refused change answers
+`{"ok": false, "refused": true, "error": why}`; everything else an agent sends (clicks, menus,
+commands, add) is refused. `agent_api.py` is in `world_link.CODE_FILES`, so a client and a world with
+different copies are turned away.
 
 **Testing without touching yours:** `CANVAS_WORLD_PORT`, `CANVAS_NODES_FILE`, `CANVAS_WORLD_FILE`,
 `CANVAS_PLAYER_FILE` and `CANVAS_WORLD_LISTEN=127.0.0.1` run a throwaway world on its own port and
