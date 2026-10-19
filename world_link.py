@@ -22,7 +22,8 @@ There's no password: anyone on the network who can reach the port can join.
 Protocol: JSON, one object per line, both ways.
   player -> world
     {"op": "status"}                          -> {"op": "status", players, objects} (then it hangs up)
-    {"op": "hello", "name": "Yaakov", "version": "<code hash>"}   (refused unless both run the same code)
+    {"op": "hello", "name": "Yaakov", "version": "<code hash>", "role"?}   (refused unless both run the
+                                              same code; role "agent": Claude — see agent_api.py)
                                               -> {"op": "welcome", name, objects: [to_dict],
                                                   state: {id: attrs}, players, instruments}
     {"op": "select", "ids": [...]}            what this player has selected (the world reacts:
@@ -92,7 +93,8 @@ THIS_PC = socket.gethostname()
 # The code a window and the world must agree on: the version is a hash of these
 # files, so a window running other code (another PC whose copy hasn't synced yet,
 # or one opened before an edit) is turned away instead of half-working.
-CODE_FILES = ("canvas.py", "things.py", "world_link.py", "world_server.py", "game_loop.py", "expressions.py")
+CODE_FILES = ("canvas.py", "things.py", "world_link.py", "world_server.py", "game_loop.py", "expressions.py",
+              "agent_api.py")
 
 
 def _code_version():
@@ -402,9 +404,10 @@ class WorldLink:
     messages into `inbox`; the game loop takes them out (poll()) and applies
     them on its own thread, so the world copy is only touched there."""
 
-    def __init__(self, name, host=HOST):
+    def __init__(self, name, host=HOST, role=None):
         self.name = name                # the world may change it ("Yaakov 2") — see welcome
         self.host = host                # where the world is: this PC, or another on the network
+        self.role = role                # None: a player's window; "agent": Claude (see agent_api.py)
         self.inbox = queue.Queue()
         self.closed = False
         self.reason = ""                # why it closed, for the player
@@ -420,7 +423,8 @@ class WorldLink:
         """Join: returns the welcome message, or raises OSError / ValueError."""
         sock = socket.create_connection((self.host, PORT), timeout=timeout)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        send_line(sock, {"op": "hello", "name": self.name, "version": VERSION})
+        send_line(sock, {"op": "hello", "name": self.name, "version": VERSION,
+                         **({"role": self.role} if self.role else {})})
         sock.settimeout(10.0)
         buf = b""
         while b"\n" not in buf:                 # the welcome (the whole world) comes first

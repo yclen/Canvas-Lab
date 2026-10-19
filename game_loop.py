@@ -276,11 +276,13 @@ def play(scene, player, link=None):
                     # only finish if an actual drag was started.
                     if wall_builder.start is None:
                         continue
-                    box = wall_builder.rect()
+                    box, kind = wall_builder.rect(), wall_builder.made_type()
                     wall_builder.cancel()
-                    if box is not None:
-                        app.ask("Wall name:",
-                                lambda text, box=box: app.add([canvas.Wall(*box, text.strip() or "Wall")]))
+                    if box is not None:                 # a wall, or a Claude zone
+                        noun = getattr(kind, "BUILD_NOUN", "wall")
+                        app.ask(f"{noun[0].upper()}{noun[1:]} name:",
+                                lambda text, box=box, kind=kind, noun=noun:
+                                app.add([kind(*box, text.strip() or noun.capitalize())]))
                     continue
                 # wheel-zoom falls through so you can zoom while sizing a box
 

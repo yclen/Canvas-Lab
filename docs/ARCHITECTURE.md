@@ -548,6 +548,37 @@ with. How a window finds it (`world_link.find_world`, every half second on the h
 - **World icon:** the world window uses `world.ico` (or `world.png`) from `assets/`
   if there is one, else the canvas's icon.ico.
 
+### Claude in the world — agents
+
+Claude works in the **running** world (there's one world; it's infinite), never on the save file.
+`claude_world.py` joins it as a player named **Claude** with `"role": "agent"` in its hello, asks
+one thing, prints the answer as JSON, and leaves; it has Claude's orange (`canvas.CLAUDE_COLOR`) in
+the player list. The world answers an agent's requests with `agent_api.answer` — each request
+carries a `seq` and gets `{"op": "reply", "seq", "ok", ...}` (an `"error"` when ok is false) — and
+refuses everything else an agent sends (adding, linking, clicks, menus, commands: "it can look but
+not change anything"). It may still send presence (where its cursor is).
+
+**Milestone 1 (now): read-only.**
+- `python claude_world.py status` — is a world running, who's in it (exit 2: none).
+- `zones` — every Claude zone: name, box, brief.
+- `catalog [--type T]` — every placeable type (E / Add menu) from the classes themselves: settings
+  (non-hidden props), inputs, outputs, its category, a one-line "about" from the docstring, and
+  `hardware: true` for devices (a `Device` or the instrument server).
+- `query --zone NAME | --id ID | --near X,Y,R` — objects with where they are, settings, `state` (the
+  hidden props: a function's expression, a random's range, …), inputs (and what each is linked to),
+  outputs with live values, the zone it's in. `query` alone: a summary of everything (type, id, name,
+  where) — an agent may read your whole layout, not change it.
+- `render --zone NAME [--out file.png] [--width 1600]` — draws the zone and what's in it, from the
+  world's snapshot (the welcome), off screen, to a PNG — how Claude checks its work.
+
+**Next (milestone 2):** create / set / link / move / delete for agents, each checked by the world:
+inside a Claude zone, on objects the agent made there, never hardware types or Connect. `agent_api.py`
+is in `world_link.CODE_FILES`, so a client and a world with different copies are turned away.
+
+**Testing without touching yours:** `CANVAS_WORLD_PORT`, `CANVAS_NODES_FILE`, `CANVAS_WORLD_FILE`,
+`CANVAS_PLAYER_FILE` and `CANVAS_WORLD_LISTEN=127.0.0.1` run a throwaway world on its own port and
+files; give the client the same `CANVAS_WORLD_PORT` / `CANVAS_WORLD_FILE`.
+
 ---
 
 ## Devices and the instrument server

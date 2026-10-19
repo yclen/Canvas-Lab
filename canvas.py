@@ -1799,6 +1799,150 @@ class Wall(CanvasObject):
                    id=d.get("id"), color=d.get("color"))
 
 
+# ---- Claude zone: a wall-like area where Claude may build ----------------------
+CLAUDE_COLOR = (217, 119, 87)          # Claude's orange: the zone's border, title and badge
+CLAUDE_ZONE_FILL = 22                  # the tint's alpha (0-255)
+CLAUDE_ZONE_HANDLE = 14                # px: the bottom-right corner you drag to resize it
+CLAUDE_ZONE_MIN = 120                  # world units: the smallest it resizes to
+CLAUDE_BRIEF_FONT = 16                 # the brief, shown faintly inside (fixed screen size, like the title)
+CLAUDE_BRIEF_LINES = 4
+
+
+def wrap_text(text, font, width, max_lines):
+    """Text broken into lines that fit `width` px (the last one clipped with … if there's more)."""
+    lines, line = [], ""
+    for word in text.split():
+        trial = f"{line} {word}".strip()
+        if font.size(trial)[0] <= width or not line:
+            line = trial
+        else:
+            lines.append(line)
+            line = word
+        if len(lines) == max_lines:
+            break
+    if line and len(lines) < max_lines:
+        lines.append(line)
+    if lines and " ".join(lines) != " ".join(text.split()):
+        lines[-1] = clip_text(lines[-1] + " …", font, width)
+    return [clip_text(l, font, width) for l in lines]
+
+
+class ClaudeZone(Wall):
+    """An area where Claude may build — the permission is the zone: Claude's
+    tools (claude_world.py, joining the running world as an agent) may only
+    work inside a Claude zone, on what Claude made there, and never with lab
+    hardware. Place as many as you like (drag a box, like a wall, then name
+    it); drag the bottom-right corner to resize. Its **Brief** (a panel
+    setting, shown faintly inside) is what you'd like built there — tell
+    Claude "build the <name> zone" and it reads it. Styled in Claude's
+    orange: a tinted area, an orange border and name tag, a "Claude" badge."""
+
+    TYPE = "claude_zone"
+    MENU_LABEL = "Add Claude zone"
+    NAME = "Claude zone"
+    BUILD_NOUN = "Claude zone"
+    PROPS = [Prop("brief", "Brief", "str", "",
+                  prompt="What should Claude build here? (it reads this when you ask it to build the zone)")]
+
+    def __init__(self, x, y, w, h, name="", *, id=None, color=None):
+        super().__init__(x, y, w, h, name, id=id)
+        self.color = tuple(color) if color else CLAUDE_COLOR
+        self._resizing = False
+
+    @classmethod
+    def create(cls, app):
+        app.cancel_modes()
+        app.player.select_only(None)
+        app.wall_builder.begin(cls.TYPE)       # drag a box; the loop then asks for its name
+
+    @classmethod
+    def draw_icon(cls, surface):
+        w, h = surface.get_size()
+        box = pygame.Rect(w * 0.1, h * 0.28, w * 0.8, h * 0.6)
+        tint = pygame.Surface(box.size, pygame.SRCALPHA)
+        tint.fill((*CLAUDE_COLOR, 50))
+        surface.blit(tint, box.topleft)
+        draw_rect(surface, CLAUDE_COLOR, box, width=max(2, w // 20), border_radius=6)
+        tag = pygame.Rect(box.x, box.y - h * 0.18, w * 0.42, h * 0.18)
+        draw_rect(surface, (45, 45, 55), tag, border_radius=3)
+        draw_rect(surface, CLAUDE_COLOR, tag, width=2, border_radius=3)
+
+    @property
+    def display_name(self):
+        return self._text or "Claude zone"
+
+    def contains(self, x, y):
+        """Is world point (x, y) inside the zone?"""
+        return self.x <= x <= self.x + self.w and self.y <= y <= self.y + self.h
+
+    # --- Resizing: drag the bottom-right corner ------------------------------------
+    def _handle(self, camera):
+        r = self.screen_rect(camera)
+        return pygame.Rect(r.right - CLAUDE_ZONE_HANDLE, r.bottom - CLAUDE_ZONE_HANDLE,
+                           CLAUDE_ZONE_HANDLE * 2, CLAUDE_ZONE_HANDLE * 2)
+
+    def hit(self, pos, camera):
+        return super().hit(pos, camera) or self._handle(camera).collidepoint(pos)
+
+    def on_click(self, pos, app):
+        if self._handle(app.camera).collidepoint(pos):
+            self._resizing = True
+            return True                        # it holds the mouse: drags resize it
+        return False
+
+    def on_drag(self, pos, app):
+        if self._resizing:
+            x, y = app.camera.screen_to_world(pos)
+            self.w, self.h = max(CLAUDE_ZONE_MIN, x - self.x), max(CLAUDE_ZONE_MIN, y - self.y)
+
+    def on_release(self, pos, app):
+        if self._resizing:
+            self._resizing = False
+            app.save()
+
+    # --- Drawing ----------------------------------------------------------------------
+    def draw(self, surface, camera):
+        r = self.screen_rect(camera)
+        layer, area = alpha_layer(surface, r)
+        if layer is not None:                      # the tint, only over the part on screen
+            layer.fill((*CLAUDE_COLOR, CLAUDE_ZONE_FILL))
+            surface.blit(layer, area)
+        super().draw(surface, camera)              # border, selection ring, name tag
+        inset = max(1, round(WALL_WORLD_BORDER * camera.zoom)) + 6       # clear of the border
+        badge_font = get_font(14, "bahnschrift")
+        badge_text = badge_font.render("Claude", True, (30, 22, 18))
+        badge = badge_text.get_rect().inflate(12, 4)
+        badge.topright = (r.right - inset, r.y + inset)
+        if r.width > badge.width + 24 and r.height > badge.height + 24:
+            draw_rect(surface, CLAUDE_COLOR, badge, border_radius=badge.height // 2)
+            surface.blit(badge_text, badge_text.get_rect(center=badge.center))
+            if self.brief and r.width > 140 and r.height > 60:
+                font = get_font(CLAUDE_BRIEF_FONT, "bahnschrift")
+                room = r.width - 2 * inset - badge.width - 12
+                y = r.y + inset
+                for line in wrap_text(self.brief, font, room, CLAUDE_BRIEF_LINES):
+                    if y + font.get_height() > r.bottom - 8:
+                        break
+                    ts = font.render(line, True, tuple(int(c * 0.75) for c in CLAUDE_COLOR))
+                    surface.blit(ts, (r.x + inset, y))
+                    y += font.get_height() + 2
+        if getattr(self, "is_hovered", False) or self.is_selected:     # the resize grip
+            h = self._handle(camera)
+            for k in (4, 8, 12):
+                pygame.draw.line(surface, CLAUDE_COLOR, (h.centerx - k, h.centery), (h.centerx, h.centery - k), 2)
+
+    def to_dict(self):
+        d = super().to_dict()
+        d["brief"] = self.brief
+        return d
+
+    @classmethod
+    def from_dict(cls, d):
+        zone = cls(d["x"], d["y"], d["w"], d["h"], d.get("name", ""), id=d.get("id"), color=d.get("color"))
+        zone.brief = d.get("brief", "")
+        return zone
+
+
 # ---- Thing: the easy base for simple drawn objects -------------------------
 THING_DOT_PX = 4                    # at/below this on-screen size, draw a plain dot (LOD)
 
@@ -4360,10 +4504,15 @@ class WallBuilder:
         self.active = False
         self.start = None        # world Vector2 of the first corner
         self.current = None      # world Vector2 under the cursor
+        self.type_name = "wall"  # what it makes: a wall, or a Claude zone (OBJECT_TYPES key)
 
-    def begin(self):
+    def begin(self, type_name="wall"):
         self.__init__()
         self.active = True
+        self.type_name = type_name if type_name in OBJECT_TYPES else "wall"
+
+    def made_type(self):
+        return OBJECT_TYPES[self.type_name]
 
     def cancel(self):
         self.__init__()
@@ -4388,7 +4537,9 @@ class WallBuilder:
     def draw(self, surface, camera):
         if not self.active:
             return
-        draw_hint(surface, "Add wall — drag to draw the box    (Esc to cancel)")
+        kind = self.made_type()
+        noun = getattr(kind, "BUILD_NOUN", "wall")
+        draw_hint(surface, f"Add {noun} — drag to draw the box    (Esc to cancel)")
 
         if self.start is None or self.current is None:
             return
@@ -4397,7 +4548,7 @@ class WallBuilder:
         tl = camera.world_to_screen((x, y))
         r = pygame.Rect(round(tl[0]), round(tl[1]),
                         max(1, round(w * camera.zoom)), max(1, round(h * camera.zoom)))
-        pygame.draw.rect(surface, WALL_COLOR, r,
+        pygame.draw.rect(surface, CLAUDE_COLOR if kind is not Wall else WALL_COLOR, r,
                          width=max(1, round(WALL_WORLD_BORDER * camera.zoom)), border_radius=8)
 
 # ---- Drag-box (marquee) multi-select ---------------------------------------
@@ -5418,10 +5569,14 @@ class JoinedApp(App):
             self.placer.cancel()
         elif kind == "inventory":
             self.open_inventory()
-        elif kind in ("train", "wall"):
+        elif kind == "train":
             self.cancel_modes()
             self.player.select_only(None)
-            (self.train_builder if kind == "train" else self.wall_builder).begin()
+            self.train_builder.begin()
+        elif kind == "wall":
+            self.cancel_modes()
+            self.player.select_only(None)
+            self.wall_builder.begin(msg.get("type", "wall"))
         elif kind == "camera":
             cam = self.camera
             cam.offset.x, cam.offset.y, cam.zoom = msg["camera"]

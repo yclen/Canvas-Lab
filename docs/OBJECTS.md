@@ -416,6 +416,15 @@ third anchoring family (after point-nodes and relationship-trains): area-anchore
 Adding it drove the **movement generalization** (a `movable` flag + `move(dx, dy)` on objects,
 so the loop moves anything movable) — the clean way to let a non-node object be dragged around.
 
+**Claude zone** (Add menu, `canvas.ClaudeZone`, a `Wall` subclass): an area where Claude may build.
+Placed like a wall — drag a box, then name it ("Claude zone name:"; `WallBuilder.begin(type)` makes
+either kind) — in Claude's orange: a faint orange tint, an orange border and name tag, and a small
+**Claude** badge in the top-right corner. Its **Brief** (a panel setting) is what you'd like built
+there; it shows faintly along the top inside the zone. Drag the bottom-right corner to resize it
+(a grip shows while it's hovered or selected; at least 120 × 120). Place as many as you like,
+anywhere — the zone is the permission: Claude's tools (`claude_world.py`, see ARCHITECTURE.md, *Claude
+in the world*) may only build inside one, on what it made there, never with lab hardware.
+
 ---
 
 ## Agents — the first animated object

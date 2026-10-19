@@ -37,6 +37,7 @@ from tkinter import messagebox
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import pygame  # noqa: E402
 
+import agent_api  # noqa: E402
 import canvas  # noqa: E402
 import instruments  # noqa: E402
 import things  # noqa: E402,F401 — defining the catalog's classes registers them
@@ -70,8 +71,8 @@ class RemoteMode:
     def __init__(self, app, kind):
         self.app, self.kind = app, kind
 
-    def begin(self):
-        self.app.ui(self.kind)
+    def begin(self, type_name=None):
+        self.app.ui(self.kind, **({"type": type_name} if type_name else {}))
 
     def cancel(self):
         pass
@@ -214,6 +215,7 @@ class Connection:
         self.sock, self.addr = sock, addr
         self.name = None            # set once it's joined (hello)
         self.color = None           # theirs, given when they join
+        self.role = "player"        # or "agent" (Claude, through claude_world.py): may only ask (agent_api)
         self.presence = {}          # where they are: {"cursor", "view", "down"} (see world_link)
         self._lock = threading.Lock()
 
@@ -321,10 +323,13 @@ class World:
                                                        "restart the world and this window."})
                 conn.close()
                 return
-            conn.name = self._free_name(str(msg.get("name") or "Player").strip()[:40] or "Player")
+            conn.role = "agent" if msg.get("role") == "agent" else "player"
+            default = agent_api.AGENT_NAME if conn.role == "agent" else "Player"
+            conn.name = self._free_name(str(msg.get("name") or default).strip()[:40] or default)
             taken = {p.color for p in self.players}
-            conn.color = next((c for c in PLAYER_COLORS if c not in taken),
-                              PLAYER_COLORS[len(self.players) % len(PLAYER_COLORS)])
+            conn.color = (canvas.CLAUDE_COLOR if conn.role == "agent" else
+                          next((c for c in PLAYER_COLORS if c not in taken),
+                               PLAYER_COLORS[len(self.players) % len(PLAYER_COLORS)]))
             pending, objects, states = self.mirror.snapshot()
             if pending:
                 self.broadcast(pending)             # the players already here catch up first
@@ -336,6 +341,11 @@ class World:
             self._players_changed()
         elif op in ("bye", "gone"):
             self._leave(conn)
+        elif conn.role == "agent":                  # it may only ask (agent_api), and show where it's looking
+            if op == "presence":
+                self._on_action(self.apps[conn], conn, msg)
+            elif "seq" in msg:
+                conn.send({"op": "reply", "seq": msg["seq"], **agent_api.answer(self.scene, msg)})
         elif conn in self.apps:
             self._on_action(self.apps[conn], conn, msg)
 
